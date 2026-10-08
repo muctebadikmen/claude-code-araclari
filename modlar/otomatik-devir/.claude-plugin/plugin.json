@@ -1,0 +1,19 @@
+{
+  "name": "otomatik-devir",
+  "version": "0.1.0",
+  "description": "Bağlam doluluğunu durum satırında gösterir; eşik aşılınca işi güvenli bir noktada bitirtir, devam notu yazdırır ve sorarak yeni sohbete geçer (/devir).",
+  "author": {
+    "name": "Mustafa Dikmen",
+    "url": "https://github.com/muctebadikmen"
+  },
+  "keywords": [
+    "mods",
+    "context",
+    "handoff",
+    "turkce"
+  ],
+  "types": "./types/index.d.ts",
+  "homepage": "https://github.com/muctebadikmen/claude-code-araclari",
+  "repository": "https://github.com/muctebadikmen/claude-code-araclari",
+  "license": "MIT"
+}

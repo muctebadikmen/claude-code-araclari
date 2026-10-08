@@ -1,0 +1,22 @@
+{
+  "name": "muctebadikmen",
+  "owner": {
+    "name": "Mustafa Dikmen",
+    "url": "https://github.com/muctebadikmen"
+  },
+  "metadata": {
+    "description": "Mustafa Dikmen'in Claude Code araçları: kendi kullandığım modlar (ve ileride skill'ler)."
+  },
+  "plugins": [
+    {
+      "name": "otomatik-devir",
+      "source": "./modlar/otomatik-devir",
+      "description": "Bağlam dolmaya yaklaşınca işi güvenli bir noktada bitirtir, devam notu yazdırır ve sorarak yeni sohbete geçer (/devir)."
+    },
+    {
+      "name": "ilerleme-cubugu",
+      "source": "./modlar/ilerleme-cubugu",
+      "description": "Süren işin ilerlemesini (görev listesi ya da PLAN.md / STATE.md planı) prompt kutusunun üstünde çubuk olarak gösterir (/ilerleme)."
+    }
+  ]
+}

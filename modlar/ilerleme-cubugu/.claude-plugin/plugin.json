@@ -1,0 +1,19 @@
+{
+  "name": "ilerleme-cubugu",
+  "version": "0.2.0",
+  "description": "Süren geliştirme işinin ilerlemesini (Claude'un görev listesi ya da PLAN.md / STATE.md planı) prompt kutusunun üstünde çubuk olarak gösterir: biten adım sayısı, yüzde ve şu anki adım.",
+  "author": {
+    "name": "Mustafa Dikmen",
+    "url": "https://github.com/muctebadikmen"
+  },
+  "keywords": [
+    "mods",
+    "progress",
+    "plan",
+    "turkce"
+  ],
+  "types": "./types/index.d.ts",
+  "homepage": "https://github.com/muctebadikmen/claude-code-araclari",
+  "repository": "https://github.com/muctebadikmen/claude-code-araclari",
+  "license": "MIT"
+}

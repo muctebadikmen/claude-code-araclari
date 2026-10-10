@@ -5,7 +5,7 @@
     "url": "https://github.com/muctebadikmen"
   },
   "metadata": {
-    "description": "Mustafa Dikmen'in Claude Code araçları: kendi kullandığım modlar (ve ileride skill'ler)."
+    "description": "Mustafa Dikmen'in Claude Code araçları: kendi kullandığım modlar ve skill'ler."
   },
   "plugins": [
     {
@@ -17,6 +17,11 @@
       "name": "ilerleme-cubugu",
       "source": "./modlar/ilerleme-cubugu",
       "description": "Süren işin ilerlemesini (görev listesi ya da PLAN.md / STATE.md planı) prompt kutusunun üstünde çubuk olarak gösterir (/ilerleme)."
+    },
+    {
+      "name": "my-skills",
+      "source": "./skilller/my-skills",
+      "description": "İş akışı skill'leri: init → audit/research → masterplan → execute → ship, araya handoff; orchestrate hepsini alt ajanlarla yönetir."
     }
   ]
 }

@@ -1,0 +1,13 @@
+{
+  "name": "my-skills",
+  "version": "0.1.0",
+  "description": "Mustafa Dikmen'in iş akışı skill'leri: init, audit, research, masterplan, execute, handoff, ship ve hepsini yöneten orchestrate.",
+  "author": {
+    "name": "Mustafa Dikmen",
+    "url": "https://github.com/muctebadikmen"
+  },
+  "keywords": ["skills", "workflow", "orchestrate", "turkce"],
+  "homepage": "https://github.com/muctebadikmen/claude-code-araclari",
+  "repository": "https://github.com/muctebadikmen/claude-code-araclari",
+  "license": "MIT"
+}

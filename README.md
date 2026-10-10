@@ -37,6 +37,32 @@ claude plugin list
 
 İsterseniz yalnız birini kurabilirsiniz; iki mod birbirinden bağımsız çalışır.
 
+## Skill'ler: my-skills
+
+Her gün kullandığım iş akışı skill'leri. Ana sohbet işi yönetir, alt ajanlar işi yapar; durum `.workflow/` klasöründe tutulur, böylece iş yeni bir sohbette kaldığı yerden sürer.
+
+| Skill | Ne yapar |
+|---|---|
+| **my-skill-orchestrate** | Diğer tüm skill'lerin uyduğu kurallar: işi alt ajanlara dağıtır, `.workflow/STATE.md`'yi güncel tutar |
+| **my-skill-init** | Projeyi başlatır: `STATE.md`, `AGENTS.md` kuralları, `.gitignore` |
+| **my-skill-audit** | Koddaki gerçek sorunları bulur ve önem sırasına dizer |
+| **my-skill-research** | Kodu ve web'i araştırıp tek bir öneri çıkarır |
+| **my-skill-masterplan** | Doğrulanmış, paralel adımlara bölünmüş plan yazar |
+| **my-skill-execute** | Planı alt ajanlarla uygular, her işi geri dönüşte kontrol eder |
+| **my-skill-handoff** | İlerlemeyi dondurur, yeni sohbet için devam prompt'u yazar |
+| **my-skill-ship** | Gizli bilgi taraması, doğrulama, commit ve push |
+
+**Akışlar:** Hata için `audit → masterplan → execute → ship`. Yeni özellik için `research → masterplan → execute → ship`. `handoff` her an kullanılabilir.
+
+Kurmak için:
+
+```bash
+claude plugin marketplace add muctebadikmen/claude-code-araclari
+claude plugin install my-skills@muctebadikmen --scope user
+```
+
+Kullanmak için Claude'a doğrudan yazın: "projeyi başlat", "bu projeyi denetle", "şunu araştır", "bunun planını yap" gibi. Ya da `/my-skills:my-skill-audit` şeklinde çağırın.
+
 ## Güncelleme
 
 Modları geliştirdikçe buraya yüklüyorum. Yeni sürümü almak için:
@@ -45,6 +71,7 @@ Modları geliştirdikçe buraya yüklüyorum. Yeni sürümü almak için:
 claude plugin marketplace update muctebadikmen
 claude plugin update otomatik-devir@muctebadikmen
 claude plugin update ilerleme-cubugu@muctebadikmen
+claude plugin update my-skills@muctebadikmen
 ```
 
 Sonra Claude Code'u yeniden başlatın.
@@ -95,6 +122,7 @@ Videodaki gibi başlatmak için örnek mesaj:
 ```bash
 claude plugin uninstall otomatik-devir@muctebadikmen --scope user
 claude plugin uninstall ilerleme-cubugu@muctebadikmen --scope user
+claude plugin uninstall my-skills@muctebadikmen --scope user
 claude plugin marketplace remove muctebadikmen
 ```
 

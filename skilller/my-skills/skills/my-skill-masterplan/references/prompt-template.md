@@ -9,7 +9,7 @@ Goal: <one line from PLAN.md>
 Definition of done: <from PLAN.md>
 Global verify: `<from PLAN.md>` → expected: <from PLAN.md>
 
-Invoke the `my-skill-execute` skill and run non-stop: do not pause for confirmation between tasks; only stop on a blocking failure as defined in that skill. Follow `my-skill-orchestrate`: sub-agents do the work with `model` set, `.workflow/STATE.md` updated after every merge. Implementers run in the background, every runnable task at once, each reviewed on return. Never dispatch a fable sub-agent.
+Invoke the `my-skill-execute` skill and run non-stop: do not pause for confirmation between tasks; only stop on a blocking failure as defined in that skill. Follow `my-skill-orchestrate`: sub-agents do the work with `model` set, the ledger `.workflow/plans/<name>/PROGRESS.md` and `.workflow/STATE.md` updated after every merge. Implementers run in the background, every runnable task at once, each reviewed on return. Never dispatch a fable sub-agent.
 
 Decisions already made (final, do not re-ask):
 <Decisions from PLAN.md, one each: "N. <question> → <answer>">

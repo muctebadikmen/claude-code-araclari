@@ -19,6 +19,8 @@ declare module 'claude-code' {
       isExpanded: boolean
       /** the session id of the conversation that engaged the plan-file bar */
       engagedSid: string | null
+      /** execute runs a plan whose STATE.md Done names no plan id and that has no PROGRESS.md */
+      isUnread: boolean
     }
   }
 }

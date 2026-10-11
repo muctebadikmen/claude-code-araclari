@@ -2,9 +2,12 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   genericSteps,
+  ledgerUnread,
   leadIds,
+  mergeProgress,
   mySkillSteps,
   parseMsPlan,
+  parseProgress,
   parseState,
   planDirsFromState,
 } from '../hooks/progress'
@@ -176,4 +179,90 @@ test('inceleme: iç içe kutucuklar sayılır, "tamamlanmadı" bitti sayılmaz',
   })
   const plan = parseMsPlan('- id: T1\n  status: tamamlanmadı\n- id: T2\n  status: tamamlandı\n- id: T3\n  status: DONE (abc1234)')
   expect([...(plan?.done ?? [])]).toEqual(['T2', 'T3'])
+})
+
+const sorted = (set: Set<string>) => [...set].sort()
+
+test('PROGRESS.md defteri: [x] [~] [>] [/] [!] [-] [ ], yalnız planın kimlikleri', async () => {
+  const ids = new Set(['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T12'])
+  const ledger = [
+    '# progress',
+    '## Phase 0',
+    '- [x] T1 — 97e8e0eb — dev: none',
+    '  - [x] T12 — 92c9f37d — nested, any indent',
+    '- [~] T2 — running',
+    '- [>] T3 — running',
+    '- [/] T4 — running',
+    '- [!] T5 — BLOCKED on owner',
+    '- [-] T6 — retired',
+    '- [ ] T7 —',
+    '- [x] T99 — not in the plan',
+    '- [x] T1a — another id',
+    '- [x] T5–T7 — a range names no id',
+    '- [x] AT2 — other prefix',
+  ].join('\n')
+  const got = parseProgress(ledger, ids)
+  expect(sorted(got.done)).toEqual(['T1', 'T12'])
+  expect(sorted(got.inProgress)).toEqual(['T2', 'T3', 'T4'])
+  expect(sorted(got.blocked)).toEqual(['T5'])
+  expect(sorted(got.dropped)).toEqual(['T6'])
+  expect(got.marksRunning).toBe(true)
+  // marked twice: done beats running
+  expect(sorted(parseProgress('- [~] T2 — a\n- [x] T2 — b', ids).inProgress)).toEqual([])
+  expect(parseProgress('- [x] T1 — a\n- [ ] T2 —', ids).marksRunning).toBe(false)
+})
+
+test('PROGRESS.md defteri: notlardaki "; T4" kuyruğu T4\'ü bitirmez', async () => {
+  const ids = new Set(['T3', 'T4', 'T12'])
+  const got = parseProgress('- [x] T3 — abc123 — dev: none; T4\n- [x] **T12** — def456', ids)
+  expect(sorted(got.done)).toEqual(['T12', 'T3'])
+})
+
+test('PROGRESS + STATE: düşen görev toplamdan çıkar, geçiş dönemi STATE koşanları', async () => {
+  const plan = parseMsPlan(PLAN)
+  if (!plan) throw new Error('plan not parsed')
+  const ids = new Set(plan.ids)
+  const state = parseState(
+    'Active skill: my-skill-execute\n## Done\n- (ledger: PROGRESS.md)\n## In progress\n- Running: T0, T2 (x); T3 (y)\n',
+    ids,
+  )
+  // no running mark in the ledger: STATE's In progress less the ledger's done / dropped / blocked
+  const ledger = parseProgress('- [x] T0 — abc1234\n- [-] G1 — retired\n- [!] T3 — owner\n', ids)
+  expect(summary(mySkillSteps(plan, mergeProgress(ledger, state)))).toEqual({
+    done: 2, // T0 from the ledger, T1 from PLAN.md's own status: DONE
+    total: 4,
+    running: ['T2'],
+    current: 'T2 · Geri al görünümü',
+  })
+  // a running mark in the ledger: STATE's In progress no longer counts
+  const marked = parseProgress('- [x] T0 — abc1234\n- [~] T3 — now\n', ids)
+  expect(summary(mySkillSteps(plan, mergeProgress(marked, state))).running).toEqual(['T3'])
+  // terminal phase with nothing running still hides the bar, as without a ledger
+  const finished = parseState('Phase: TAMAMLANDI\nActive skill: none\n', ids)
+  expect(mySkillSteps(plan, mergeProgress(ledger, finished))).toEqual([])
+})
+
+test('In progress: noktalı virgülden sonraki çıplak liste, etiket notu, BLOCKED satırı', async () => {
+  const ids = new Set(['T21', 'T23', 'T24', 'T65', 'T90', 'T134', 'T175', 'T241', 'T244', 'T245', 'T253', 'T260', 'T267', 'T269', 'T300'])
+  const state = [
+    '## In progress',
+    '- Implementers running: T65, T244, T21, T23 (from session 2); T90, T300, T267, T269, T260 (base e92bb69c).',
+    '- Session 4 in flight (ids in .workflow/dispatch/agents-v3.txt): implementers T134, T175, T241 (base 38a40fc0); fix/doc-echo (T24 residual gaps).',
+    '- BLOCKED on owner: T245, T253',
+    '- Gate blockers: G1 (T24) needs owner decisions T245 + T253',
+  ].join('\n')
+  expect(sorted(parseState(state, ids).inProgress)).toEqual(
+    ['T21', 'T23', 'T65', 'T90', 'T134', 'T175', 'T241', 'T244', 'T260', 'T267', 'T269', 'T300'].sort(),
+  )
+  // a later clause with prose is no list: "T2 … ; T15 bekliyor" stays T2
+  expect(leadIds('T2 — BLOCKING: S2 timer; T15 bekliyor', new Set(['T2', 'T15']))).toEqual(['T2'])
+})
+
+test('güvenlik ağı: execute koşuyor, Done dolu ama planın kimliği yok', async () => {
+  const ids = new Set(['T1', 'T2'])
+  const unread = parseState('Active skill: my-skill-execute\n## Done\n- (ledger elsewhere)\n## In progress\n- T2 — x\n', ids)
+  expect(ledgerUnread(unread)).toBe(true)
+  expect(ledgerUnread(parseState('Active skill: my-skill-execute\n## Done\n- [x] T1 — abc1234\n', ids))).toBe(false)
+  expect(ledgerUnread(parseState('Active skill: my-skill-execute\n## Done\n\n## In progress\n', ids))).toBe(false)
+  expect(ledgerUnread(parseState('Active skill: none\n## Done\n- (ledger elsewhere)\n', ids))).toBe(false)
 })

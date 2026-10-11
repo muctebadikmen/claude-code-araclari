@@ -28,7 +28,8 @@ Project root = `git rev-parse --show-toplevel`, else the current folder. Before 
 - A step is done only with evidence: a passing test or a commit.
 - Plans: `my-skill-masterplan` tasks (`- id: T1`), or checkbox steps with ids (`- [ ] T1 — <step>`) for small hand-written plans. No tables.
 - Keep STATE.md ≤80 lines; details go in linked files.
-- `.workflow/PLAN.md`, `STATE.md`, `HANDOFF.md` and `.workflow/plans/*/PLAN.md`, `PROMPT.md` are committed. Scratch (`.workflow/research/`, `dispatch/`, `audit/`, `runs/`, plan `check-*.md`, `.worktrees/`) is not.
+- Plan task status: `.workflow/plans/<name>/PROGRESS.md` (`[ ]`/`[~]`/`[x]`/`[!]`/`[-]`), never task lists in STATE.md; small `.workflow/PLAN.md` plans keep checkboxes.
+- `.workflow/PLAN.md`, `STATE.md`, `HANDOFF.md` and `.workflow/plans/*/PLAN.md`, `PROMPT.md`, `PROGRESS.md` are committed. Scratch (`.workflow/research/`, `dispatch/`, `audit/`, `runs/`, plan `check-*.md`, `.worktrees/`) is not.
 - For multi-step work, follow the `my-skill-orchestrate` skill.
 <!-- my-skills:end -->
 ```

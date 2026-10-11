@@ -87,7 +87,7 @@ test('görev listesi çubuğu, tamamlanma, gizleme', async ($, on) => {
 
   await $.tool.call(todos(['pending', 'pending']) as never)
   const again = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  expect((await again.find({ key: 'toggle' }))?.text).toBe('░░ 0/2 · %0 · Şu an: Adım 1')
+  expect((await again.find({ key: 'toggle' }))?.text).toBe('░░ 0/2 · %0 · Sıradaki: Adım 1')
   await again.unmount()
 
   const hidden = await $.command.run(command('gizle'))
@@ -125,7 +125,7 @@ test('görev listesi yokken PLAN.md kutucukları', async ($, on) => {
 
   await $.tool.call({ tool: 'Edit', file_path: 'PLAN.md', old_string: 'a', new_string: 'b' } as never)
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect((await ui.find({ key: 'toggle' }))?.text).toBe('▓▓░░ 2/4 · %50 · Şu an: Form doğrulaması')
+  expect((await ui.find({ key: 'toggle' }))?.text).toBe('▓▓░░ 2/4 · %50 · Sıradaki: Form doğrulaması')
   expect((await ui.find({ key: 'toggle' }))?.text).not.toContain(' dk')
   await ui.unmount()
 
@@ -133,7 +133,7 @@ test('görev listesi yokken PLAN.md kutucukları', async ($, on) => {
   mtimeMs = 2
   await $.tool.call({ tool: 'Edit', file_path: 'PLAN.md', old_string: 'a', new_string: 'b' } as never)
   const next = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  expect((await next.find({ key: 'toggle' }))?.text).toBe('▓▓▓░ 3/4 · %75 · Şu an: Testler')
+  expect((await next.find({ key: 'toggle' }))?.text).toBe('▓▓▓░ 3/4 · %75 · Sıradaki: Testler')
   await next.unmount()
 })
 
@@ -161,6 +161,15 @@ test('TaskCreate / TaskUpdate', async ($, on) => {
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await ui.find({ key: 'toggle' }))?.text).toBe('░░ 0/2 · %0 · Şu an: Model yazılıyor')
   await ui.unmount()
+
+  // two at once (parallel sub-agents): a count, and both marked running in the list
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '2', status: 'in_progress' } as never)
+  const both = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await both.find({ key: 'toggle' }))?.text).toBe('░░ 0/2 · %0 · Şu an 2 iş üzerinde çalışılıyor')
+  await both.press({ key: 'toggle' })
+  expect((await both.find({ text: /^● Model/ }))?.text).toBe('● Model')
+  expect((await both.find({ text: /^● Görünüm/ }))?.text).toBe('● Görünüm')
+  await both.unmount()
 
   await $.tool.call({ tool: 'TaskUpdate', taskId: '2', status: 'deleted' } as never)
   await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'completed' } as never)
@@ -257,7 +266,7 @@ test('alt ajan: TaskUpdate sayılır, TodoWrite ana listeyi ezmez', async ($, on
   await $.tool.call({ ...todos(['pending']), agentId: 'alt-1' } as never)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect((await ui.find({ key: 'toggle' }))?.text).toBe('▓░ 1/2 · %50 · Şu an: Görünüm')
+  expect((await ui.find({ key: 'toggle' }))?.text).toBe('▓░ 1/2 · %50 · Sıradaki: Görünüm')
   await ui.unmount()
 })
 
@@ -357,12 +366,13 @@ test('my-skill .workflow: STATE.md ilerlemesi, eski plan devreye girmez', async 
   })
   on('tool.call', () => ({ result: {}, text: 'ok' }))
 
-  // STATE.md is the newest file with checkboxes; `## In progress` items are the current step
+  // STATE.md is the newest file with checkboxes; both `## In progress` items run (Decision 7)
   await $.tool.call({ tool: 'Edit', file_path: '.workflow/STATE.md', old_string: 'a', new_string: 'b' } as never)
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect((await ui.find({ key: 'toggle' }))?.text).toBe('▓▓░░░ 2/5 · %40 · Şu an: T6 — Implement T6 (opus)')
+  expect((await ui.find({ key: 'toggle' }))?.text).toBe('▓▓░░░ 2/5 · %40 · Şu an 2 iş üzerinde çalışılıyor')
   await ui.press({ key: 'toggle' })
   expect((await ui.find({ text: /^● T6/ }))?.text).toBe('● T6 — Implement T6 (opus)')
+  expect((await ui.find({ text: /^● T7/ }))?.text).toBe('● T7 — Implement T7 (opus)')
   expect((await ui.find({ text: /^○ T10/ }))?.text).toBe('○ T10 — site')
   await ui.unmount()
 
@@ -500,7 +510,7 @@ test('yeni chat aynı projede: açık STATE.md olsa da bağlanana kadar çubuk y
 
   // a task list is this chat's own: it shows with no engagement
   await $.tool.call(todos(['completed', 'pending']) as never)
-  expect(await toggleText($)).toBe('▓░ 1/2 · %50 · Şu an: Adım 2')
+  expect(await toggleText($)).toBe('▓░ 1/2 · %50 · Sıradaki: Adım 2')
 })
 
 test('devir prompt.submit çubuğu hemen gösterir (kuran biçimi: 3/6, şu an T2)', async ($, on) => {
@@ -579,6 +589,114 @@ test('inceleme: yeni chat bitmiş planı bağlayınca ne çubuk ne "✓ Tamamlan
   await clock.advance(5000)
   expect(await toggleText($)).toBeUndefined()
   expect(toasts).toEqual([])
+})
+
+// --- PROGRESS.md: the plan's own ledger decides (Decisions 6 and 7) ---
+
+const V3_PLAN = [
+  '# PLAN v3',
+  '- id: T1',
+  '  goal: Bir',
+  '- id: T2',
+  '  goal: İki',
+  '- id: T3',
+  '  goal: Üç',
+  '- id: T4',
+  '  goal: Dört',
+  '- id: T5',
+  '  goal: Beş',
+  '- id: T6',
+  '  goal: Altı',
+].join('\n')
+
+// a real-world shape: Done only points at the ledger; running ids live in STATE.md
+const V3_STATE = [
+  '# STATE',
+  'Active skill: my-skill-execute',
+  'Phase: Phase 1 (1/3)',
+  '## Done',
+  '- (per-task ledger with shas: .workflow/plans/v3/PROGRESS.md)',
+  '## In progress',
+  '- Implementers running: T3 (from session 2); T4 (base abc1234).',
+  '- BLOCKED on owner: T6',
+  '## Files',
+  '- Plan: .workflow/plans/v3/PLAN.md',
+].join('\n')
+
+const V3_PROGRESS = ['# v3 progress', '- [x] T1 — 1a2b3c4d — ok', '- [x] T3 — 2b3c4d5e — merged', '- [ ] T2 —', '- [ ] T4 —', '- [-] T5 — retired', '- [ ] T6 —'].join('\n')
+
+test('PROGRESS.md: defter sayar, düşen görev toplamdan çıkar, STATE yalnız koşanı verir', async ($, on) => {
+  mock.clock(on, { now: 15_000_000 })
+  const files: Record<string, { source: string; mtimeMs: number }> = {
+    '.workflow/plans/v3/PLAN.md': { source: V3_PLAN, mtimeMs: 10 },
+    '.workflow/plans/v3/PROGRESS.md': { source: V3_PROGRESS, mtimeMs: 50 },
+    '.workflow/STATE.md': { source: V3_STATE, mtimeMs: 40 },
+  }
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text key="engine">engine</Text>
+  })
+  on('fs.list', (_, e) =>
+    e.path.endsWith('/.workflow/plans')
+      ? { value: [{ name: 'v3', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] }
+      : Promise.reject(new Error('ENOENT')),
+  )
+  const fileAt = (path: string) => Object.entries(files).find(([name]) => path.endsWith(`/${name}`))?.[1]
+  on('fs.stat', (_, e) => {
+    const file = fileAt(e.path)
+    return file
+      ? { value: { kind: 'file' as const, size: file.source.length, mtimeMs: file.mtimeMs, isLink: false } }
+      : Promise.reject(new Error('ENOENT'))
+  })
+  on('fs.read', (_, e) => {
+    const file = fileAt(e.path)
+    return file ? { value: file.source } : Promise.reject(new Error('ENOENT'))
+  })
+  on('session.id', () => ({ value: 's1' }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('tool.call', () => ({ result: {}, text: 'ok' }))
+  const edit = async (name: string, change: (source: string) => string) => {
+    const file = files[name]
+    if (!file) throw new Error(name)
+    file.source = change(file.source)
+    file.mtimeMs++
+    await $.tool.call({ tool: 'Edit', file_path: name, old_string: 'a', new_string: 'b' } as never)
+  }
+
+  // a prompt naming only PROGRESS.md engages; T5 is retired (5 in total), T1 T3 done;
+  // no running mark in the ledger yet, so STATE's In progress less the done T3 → T4
+  await $.prompt.submit(prompt('PROGRESS.md güncel mi?'))
+  expect(await toggleText($)).toBe('▓▓░░░ 2/5 · %40 · Şu an: T4 · Dört')
+
+  // running marks in the ledger win over STATE; `[!]` is neither done nor running
+  await edit('.workflow/plans/v3/PROGRESS.md', source =>
+    source.replace('- [ ] T2 —', '- [~] T2 —').replace('- [ ] T4 —', '- [>] T4 —').replace('- [ ] T6 —', '- [!] T6 — owner'),
+  )
+  expect(await toggleText($)).toBe('▓▓░░░ 2/5 · %40 · Şu an 2 iş üzerinde çalışılıyor')
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'toggle' })
+  expect((await ui.find({ text: /^● T2/ }))?.text).toBe('● T2 · İki')
+  expect((await ui.find({ text: /^● T4/ }))?.text).toBe('● T4 · Dört')
+  expect((await ui.find({ text: /^✓ T3/ }))?.text).toBe('✓ T3 · Üç')
+  expect((await ui.find({ text: /^○ T6/ }))?.text).toBe('○ T6 · Altı')
+  expect(await ui.find({ text: /T5/ })).toBeUndefined()
+  await ui.press({ key: 'toggle' })
+  await ui.unmount()
+
+  // nothing running anywhere: the next pending step
+  await edit('.workflow/plans/v3/PROGRESS.md', source => source.replace('- [~] T2 —', '- [ ] T2 —').replace('- [>] T4 —', '- [x] T4 — 3c4d5e6f'))
+  await edit('.workflow/STATE.md', source => source.replace('- Implementers running: T3 (from session 2); T4 (base abc1234).\n', ''))
+  expect(await toggleText($)).toBe('▓▓▓░░ 3/5 · %60 · Sıradaki: T2 · İki')
+
+  // no ledger at all: legacy STATE.md reading, and its Done credits no plan id → warning
+  delete files['.workflow/plans/v3/PROGRESS.md']
+  await edit('.workflow/STATE.md', source => source.replace('## In progress\n', '## In progress\n- T3 — sürüyor\n'))
+  expect(await toggleText($)).toBe('░░░░░░ 0/6 · %0 · ⚠ ilerleme kaydı okunamadı · Şu an: T3 · Üç')
+
+  // a Done that names plan ids is read fine: no warning
+  await edit('.workflow/STATE.md', source => source.replace('- (per-task ledger', '- [x] T1 — 1a2b3c4d\n- (per-task ledger'))
+  expect(await toggleText($)).toBe('▓░░░░░ 1/6 · %17 · Şu an: T3 · Üç')
 })
 
 test('/ilerleme GİZLE ve GIZLE de çubuğu gizler, GÖSTER geri getirir', async ($, on) => {

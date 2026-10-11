@@ -15,6 +15,20 @@ export type StateInfo = {
   inProgress: Set<string>
   phase: string
   activeSkill: string
+  /** ids retired from the plan (PROGRESS.md `[-]`); left out of the total */
+  dropped?: Set<string>
+  /** non-blank content lines under STATE.md's `## Done` */
+  doneLines?: number
+}
+
+// A plan's own ledger, .workflow/plans/<dir>/PROGRESS.md: one `- [x] T12 — …` line per task.
+export type ProgressInfo = {
+  done: Set<string>
+  inProgress: Set<string>
+  blocked: Set<string>
+  dropped: Set<string>
+  /** any running box (`[~] [>] [/]`) at all; without one STATE.md's In progress stands in */
+  marksRunning: boolean
 }
 
 const MS_ID = /^[ \t]{0,3}[-*+][ \t]+id:[ \t]*([A-Z]{1,3}\d{1,4}[a-z]{0,2})[ \t]*(?:#.*)?$/
@@ -48,8 +62,13 @@ export const sectionOf = (heading: string): Section => {
   return 'none'
 }
 
-// Calls `visit` for every top-level bullet with the section it sits in.
-const walkSections = (source: string, visit: (section: Section, text: string) => void) => {
+// Calls `visit` for every top-level bullet with the section it sits in, and `onLine`
+// for every other non-blank, non-heading line.
+const walkSections = (
+  source: string,
+  visit: (section: Section, text: string) => void,
+  onLine?: (section: Section) => void,
+) => {
   let section: Section = 'none'
   let level = 0
   for (const line of lines(source)) {
@@ -65,6 +84,7 @@ const walkSections = (source: string, visit: (section: Section, text: string) =>
     }
     const bullet = BULLET.exec(line)
     if (bullet) visit(section, bullet[2] ?? '')
+    else if (line.trim()) onLine?.(section)
   }
 }
 
@@ -81,19 +101,53 @@ const idPattern = (ids: Iterable<string>, tail = '') => {
 
 const idsIn = (text: string, pattern: RegExp) => [...text.matchAll(pattern)].map(match => match[1] ?? '')
 
+// a parenthetical that qualifies a label: "Session 4 (ids in x.txt): T1 T2"
+const LABEL_NOTE = /\([^()]*\)(?=[ \t]*:)/g
+// what may sit between the ids of a bare list ("T90, T300 and T267.")
+const LIST_REST = /^(?:[\s,.&+]|\band\b|\bve\b)*$/
+
+// `;`-separated clauses, outside parentheses
+const clauses = (text: string) => {
+  const found: string[] = []
+  let depth = 0
+  let from = 0
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+    if (char === '(') depth++
+    else if (char === ')') depth = Math.max(0, depth - 1)
+    else if (char === ';' && depth === 0) {
+      found.push(text.slice(from, i))
+      from = i + 1
+    }
+  }
+  found.push(text.slice(from))
+  return found
+}
+
+const headOf = (clause: string) => clause.replace(RANGE, ' ').split(/ — | – | - |\(/)[0] ?? ''
+
 // The ids a bullet is about: its head, before the first dash or parenthesis; of its
-// colon segments, the first that names a plan id ("W4: T1 T15" → T1 T15).
+// colon segments, the first that names a plan id ("W4: T1 T15" → T1 T15). A later
+// `;` clause adds its ids only when it is a bare id list ("…: T1 (x); T2, T3 (y)").
 export const leadIds = (bullet: string, ids: Set<string>) => {
   if (ids.size === 0) return []
   const pattern = idPattern(ids)
-  const head = plainText(bullet.replace(/^\[[^\]]\][ \t]*/, ''))
-    .replace(RANGE, ' ')
-    .split(/ — | – | - |\(/)[0] ?? ''
-  for (const segment of head.split(':')) {
-    const found = idsIn(segment, pattern)
-    if (found.length > 0) return found
+  const text = plainText(bullet.replace(/^\[[^\]]\][ \t]*/, '')).replace(LABEL_NOTE, '')
+  const [first = '', ...rest] = clauses(text)
+  const found: string[] = []
+  for (const segment of headOf(first).split(':')) {
+    const some = idsIn(segment, pattern)
+    if (some.length > 0) {
+      found.push(...some)
+      break
+    }
   }
-  return []
+  for (const clause of rest) {
+    const head = headOf(clause)
+    const some = idsIn(head, pattern)
+    if (some.length > 0 && LIST_REST.test(head.replace(pattern, ' '))) found.push(...some)
+  }
+  return found
 }
 
 // A my-skill plan: `- id: T1` lines (at least two), `goal:` titles, `status: DONE`
@@ -124,6 +178,9 @@ export const parseMsPlan = (source: string): MsPlan | undefined => {
   return { ids, titles, done }
 }
 
+// an In progress line about what is held up, not running ("BLOCKED on owner: T245")
+const BLOCKED = /^(blocked|engell?i|bloke)(?!\p{L})/u
+
 // STATE.md, read against a plan's id set: Done (sha pairs + lead ids), In progress
 // (lead ids), and the header's Phase / Active skill. Ids outside the plan are dropped.
 export const parseState = (source: string, ids: Set<string>): StateInfo => {
@@ -137,19 +194,83 @@ export const parseState = (source: string, ids: Set<string>): StateInfo => {
     const skillAt = /^Active skill:[ \t]*(.*)$/.exec(line)
     if (skillAt && !activeSkill) activeSkill = skillAt[1] ?? ''
   }
-  if (ids.size > 0) {
-    const withSha = idPattern(ids, SHA_AFTER)
-    walkSections(source, (section, text) => {
+  let doneLines = 0
+  const withSha = ids.size > 0 ? idPattern(ids, SHA_AFTER) : undefined
+  walkSections(
+    source,
+    (section, text) => {
+      if (section === 'done') doneLines++
+      if (!withSha) return
       if (section === 'done') {
         for (const id of idsIn(text.replace(RANGE, ' '), withSha)) done.add(id)
         for (const id of leadIds(text, ids)) done.add(id)
-      } else if (section === 'in_progress') {
+      } else if (section === 'in_progress' && !BLOCKED.test(fold(plainText(text.replace(/^\[[^\]]\][ \t]*/, ''))))) {
         for (const id of leadIds(text, ids)) inProgress.add(id)
       }
-    })
-  }
-  return { done, inProgress, phase, activeSkill }
+    },
+    section => {
+      if (section === 'done') doneLines++
+    },
+  )
+  return { done, inProgress, phase, activeSkill, doneLines }
 }
+
+const LEDGER = /^[ \t]*[-*+][ \t]+\[([ xX~>/!-])\][ \t]+(.*)$/
+
+// A ledger line credits only the plan id that is its first token (`- [x] T12 — <sha> — notes`);
+// ids in the notes tail, ranges ("T5–T7") and other prefixes ("AT2", "T1a") never count.
+const ledgerId = (text: string, ids: Set<string>) => {
+  const token = plainText(text).split(/\s/, 1)[0]?.replace(/[:,.;]+$/, '') ?? ''
+  return ids.has(token) ? token : undefined
+}
+
+// PROGRESS.md against a plan's id set: `[x]` done, `[~] [>] [/]` running, `[!]` blocked
+// (neither), `[-]` dropped, `[ ]` pending. Ids outside the plan are ignored; when an id
+// is marked twice, done > dropped > blocked > running.
+export const parseProgress = (source: string, ids: Set<string>): ProgressInfo => {
+  const done = new Set<string>()
+  const inProgress = new Set<string>()
+  const blocked = new Set<string>()
+  const dropped = new Set<string>()
+  let marksRunning = false
+  for (const line of lines(source)) {
+    const match = LEDGER.exec(line)
+    if (!match) continue
+    const mark = match[1] ?? ' '
+    const isRunning = mark === '~' || mark === '>' || mark === '/'
+    if (isRunning) marksRunning = true
+    const into = /[xX]/.test(mark) ? done : mark === '-' ? dropped : mark === '!' ? blocked : isRunning ? inProgress : undefined
+    const id = ledgerId(match[2] ?? '', ids)
+    if (into && id) into.add(id)
+  }
+  const rank = [done, dropped, blocked, inProgress]
+  rank.forEach((set, i) => {
+    for (const lower of rank.slice(i + 1)) for (const id of set) lower.delete(id)
+  })
+  return { done, inProgress, blocked, dropped, marksRunning }
+}
+
+// The status a plan gets when it has a PROGRESS.md (Decision 6): the ledger decides
+// done / dropped / blocked / running; STATE.md (if credited) only gives the phase and
+// active skill, and its In progress while the ledger has no running mark yet.
+export const mergeProgress = (progress: ProgressInfo, state?: StateInfo): StateInfo => {
+  const settled = (id: string) => progress.done.has(id) || progress.dropped.has(id) || progress.blocked.has(id)
+  const inProgress = progress.marksRunning
+    ? progress.inProgress
+    : new Set([...(state?.inProgress ?? [])].filter(id => !settled(id)))
+  return {
+    done: progress.done,
+    inProgress,
+    dropped: progress.dropped,
+    phase: state?.phase ?? '',
+    activeSkill: state?.activeSkill ?? '',
+  }
+}
+
+// The safety net: execute is running, STATE.md's Done says something, yet none of it
+// names a plan id and there is no PROGRESS.md: the bar's count cannot be trusted.
+export const ledgerUnread = (state: StateInfo) =>
+  /^my-skill-execute\b/.test(fold(state.activeSkill)) && (state.doneLines ?? 0) > 0 && state.done.size === 0
 
 const TERMINAL_PHASE = /^(tamam(land[ıi])?|bitti|complete(d)?|done|finished|shipped)(?![\p{L}\d])/u
 
@@ -158,7 +279,7 @@ const TERMINAL_PHASE = /^(tamam(land[ıi])?|bitti|complete(d)?|done|finished|shi
 export const mySkillSteps = (plan: MsPlan, state?: StateInfo): Adim[] => {
   const status = (id: string): Durum =>
     plan.done.has(id) || state?.done.has(id) ? 'completed' : state?.inProgress.has(id) ? 'in_progress' : 'pending'
-  const steps = plan.ids.map(id => {
+  const steps = plan.ids.filter(id => !state?.dropped?.has(id)).map(id => {
     const title = plan.titles.get(id)
     return { id, content: title ? `${id} · ${title}` : id, activeForm: '', status: status(id) }
   })

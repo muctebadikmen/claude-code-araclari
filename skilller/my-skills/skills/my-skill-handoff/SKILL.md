@@ -9,15 +9,15 @@ A fresh chat resumes exactly here without re-asking anything.
 
 REQUIRED SUB-SKILL: my-skill-orchestrate
 
-Orchestrate rule 13 invokes this at a phase boundary when context is heavy, execute included. No 🛑, no questions (rule 12): run start to finish, ending with the resume prompt. STATE.md is a claim; git is evidence.
+Orchestrate rule 13 invokes this at a phase boundary when context is heavy. No 🛑, no questions (rule 12): run start to finish, ending with the resume prompt. STATE.md is a claim; git is evidence.
 
 ## Steps
 
-1. **Reconcile.** Dispatch `Reconcile state vs reality` (Explore, read-only, `model: sonnet`). Inputs: `.workflow/STATE.md`, the active `PLAN.md` if any, `git status --short`, `git log -15 --oneline`, `git worktree list`, `git stash list`, `git diff --stat`. Output contract, ≤15 lines: (a) tasks marked done whose sha is absent from `git log` or whose files show no matching change, (b) work in the tree but absent from STATE.md, (c) uncommitted paths, (d) every worktree with its branch. It runs no tests, reads no source; you inspect nothing (rule 1).
-2. **Fix state.** Rewrite `.workflow/STATE.md` from the delta, keeping the headings `## Done`, `## In progress`, `## Remaining`, `## Decisions`, `## Gotchas`, `## Files`. Done = verification passed or commit exists; otherwise In progress with a note why. Each task in one section only.
-3. **Update plan.** If a PLAN.md is active, tick completed tasks and add a `Deviations:` line under each changed task.
-4. **Write `.workflow/HANDOFF.md`** (never the repo root) from the template below. Git repo: un-ignore per `my-skill-init`, commit it, STATE.md and PLAN.md alone; never push.
-5. **Print the resume prompt** filled from the template, in a code block, as the last thing in your reply. No status table after it.
+1. **Reconcile.** Dispatch `Reconcile state vs reality` (Explore, `model: sonnet`). Inputs: `.workflow/STATE.md`, any active `PLAN.md`/`PROGRESS.md`, `git status --short`, `git log -15 --oneline`, `git log --merges --oneline` (ledger shas), `git worktree list`, `git stash list`, `git diff --stat`. Output contract, ≤15 lines: (a) tasks marked done whose sha is absent from `git log` or whose files show no matching change, (b) work in the tree but absent from STATE.md, (c) uncommitted paths, (d) every worktree with its branch. It runs no tests, reads no source; you inspect nothing (rule 1).
+2. **Fix state.** Rewrite `.workflow/STATE.md` from the delta, keeping the headings `## Done`/`In progress`/`Remaining`/`Decisions`/`Gotchas`/`Files`. No ledger: Done = verification passed or commit exists, else In progress noting why; one section per task. Ledger (orchestrate's `progress-template.md`): merge commit → `[x]`, unmerged dispatch → `[~]` with note, `[!]` kept, one line each; `Progress:` count matches.
+3. **Update plan.** Active PLAN.md: tick completed checkboxes, add a `Deviations:` line under each changed task.
+4. **Write `.workflow/HANDOFF.md`** (never the repo root) from the template. Git repo: un-ignore per `my-skill-init`, commit it and STATE.md/PLAN.md/PROGRESS.md alone; never push.
+5. **Print the resume prompt** filled from the template, in a code block, last in your reply. No table after it.
 
 ## HANDOFF.md template
 

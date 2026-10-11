@@ -20,7 +20,7 @@ In Cloudroom (`CLOUDROOM_WORKLOAD` or `ROOM_THREAD_ID` set), dispatches, resumes
 7. **Model routing.** Pass `model` on every dispatch; table below. In doubt between sonnet and opus: opus.
 8. **Overload fallback.** An agent dying with a 529/5xx is re-dispatched once; a second failure drops a model (opus → sonnet), noted in STATE.md.
 9. **Task name = `verb object`**, e.g. `Verify auth findings`; model travels in `model`, not the name.
-10. **State.** Read `.workflow/STATE.md` first (none: `my-skill-init`); write it from `references/state-template.md` before the first dispatch, at every 🛑, after every phase. Commit STATE.md/PLAN.md/HANDOFF.md, never scratch.
+10. **State.** Read `.workflow/STATE.md` first (none: `my-skill-init`); write it from `references/state-template.md` before the first dispatch, at every 🛑, after every phase. Commit STATE.md/PLAN.md/PROGRESS.md/HANDOFF.md, never scratch.
 11. **🛑 means stop.** Write STATE.md, report done/next in 3 lines, wait. Non-stop skills (execute) skip the wait.
 12. **Questions.** Research and masterplan ask whatever they need: AskUserQuestion, ≤4 per call, more calls allowed, recommended first, marked "(Recommended)". Execute, ship and handoff never ask.
 13. **Long chats.** With heavy context (≈300K tokens or after compaction), finish the phase, invoke `my-skill-handoff`, continue in a new chat. Non-stop skills included.

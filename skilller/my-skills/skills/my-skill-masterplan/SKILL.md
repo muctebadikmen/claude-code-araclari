@@ -9,7 +9,7 @@ REQUIRED SUB-SKILL: my-skill-orchestrate
 
 A plan another chat executes non-stop in parallel lanes.
 
-Fixed paths: `.workflow/plans/<name>/PLAN.md`, `.workflow/plans/<name>/PROMPT.md`, `.workflow/STATE.md` (rule 10). Agents write the plan (rule 1).
+Fixed paths: `.workflow/plans/<name>/{PLAN,PROMPT,PROGRESS}.md`, `.workflow/STATE.md` (rule 10). Agents write the plan (rule 1).
 
 ## Inputs
 
@@ -30,8 +30,8 @@ List every fork: architecture, naming, scope, edge cases. Drop those the invokin
 `Draft plan` (opus). Inputs: collect/verify files, Decisions, `references/plan-template.md`. Nine fields per task: id, goal, files, change, tests, verify, model, depends-on, parallel-group; every phase declares `may-start-early-when:`. As many parallel-groups with disjoint `files:` as the work allows; sequential edits to one file are ONE task with ordered steps, each naming its change and verify line; `depends-on` only for a real data dependency. Task blocks ≤40 lines, no audit-trail notes. UI strings and code obey repo rules (CLAUDE.md, lint, sentinel tests), read first. `Global verify`'s expected result comes from running it.
 
 ### 5. Check (2 rounds max, rule 6)
-`Check plan` (opus, fresh context) per `references/plan-checker-prompt.md`: only defects that would make execution fail. `Fix plan issues` (opus) applies every item in the task bodies. Round 2 rechecks only the changed tasks plus the round-1 items. Stop at `CLEAN`; otherwise remaining items go to STATE.md `## Gotchas` and into PROMPT.md, and a third round needs a 🛑.
+`Check plan` (opus, fresh context) per `references/plan-checker-prompt.md`: only defects that would make execution fail. `Fix plan issues` (opus) applies every item in task bodies. Round 2 rechecks only changed tasks plus round-1 items. Stop at `CLEAN`; otherwise remaining items go to STATE.md `## Gotchas` and into PROMPT.md, and a third round needs a 🛑.
 
 ### 6. Prompt (orchestrator)
-Write `PROMPT.md` from `references/prompt-template.md`.
-🛑 Print phases, task count, parallel groups, both paths. Update STATE.md. End with "Next: paste PROMPT.md into an empty chat." Never ask whether to execute.
+Write `PROMPT.md` (`references/prompt-template.md`) and `PROGRESS.md`, all `[ ]` (orchestrate's `progress-template.md`).
+🛑 Print phases, task count, parallel groups, paths. Update STATE.md. End with "Next: paste PROMPT.md into an empty chat." Never ask whether to execute.

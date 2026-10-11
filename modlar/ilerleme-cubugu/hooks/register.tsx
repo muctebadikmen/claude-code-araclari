@@ -2,7 +2,16 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement, RenderInput, Timer } from 'claude-code'
 
 import type { IlerlemeCubuguAdim as Adim, IlerlemeCubuguDurum as Durum } from '../types'
-import { genericSteps, mySkillSteps, parseMsPlan, parseState, planDirsFromState } from './progress'
+import {
+  genericSteps,
+  ledgerUnread,
+  mergeProgress,
+  mySkillSteps,
+  parseMsPlan,
+  parseProgress,
+  parseState,
+  planDirsFromState,
+} from './progress'
 import type { MsPlan } from './progress'
 
 const tasks = atom({ plugin: 'ilerleme-cubugu', key: 'tasks' } as const, [])
@@ -11,13 +20,15 @@ const job = atom({ plugin: 'ilerleme-cubugu', key: 'job' } as const, { startedAt
 const isHidden = atom({ plugin: 'ilerleme-cubugu', key: 'isHidden' } as const, false)
 const isExpanded = atom({ plugin: 'ilerleme-cubugu', key: 'isExpanded' } as const, false)
 const engagedSid = atom({ plugin: 'ilerleme-cubugu', key: 'engagedSid' } as const, null)
+const isUnread = atom({ plugin: 'ilerleme-cubugu', key: 'isUnread' } as const, false)
 
 const HIDE_MS = 4000
 const TICK_MS = 5000
 const MAX_CELLS = 20
 const USAGE = 'Kullanım: /ilerleme gizle | göster | detay'
+const UNREAD = '⚠ ilerleme kaydı okunamadı · '
 // a text or tool argument that names the my-skill workflow files
-const WORKFLOW = /\b(?:PLAN|STATE)\.md\b|\bHANDOFF\b|\.workflow\/plans\//
+const WORKFLOW = /\b(?:PLAN|STATE|PROGRESS)\.md\b|\bHANDOFF\b|\.workflow\/plans\//
 const ENGAGING_SKILLS = new Set(['my-skill-execute', 'my-skill-handoff', 'my-skill-masterplan'])
 
 type $ = EngineInterface
@@ -32,8 +43,7 @@ const toStatus = (value: unknown): Durum | 'deleted' | undefined =>
 
 const isDone = (step: Adim) => step.status === 'completed'
 
-const current = (steps: Adim[]) =>
-  steps.find(step => step.status === 'in_progress') ?? steps.find(step => !isDone(step))
+const isRunning = (step: Adim) => step.status === 'in_progress'
 
 const fromTodos = (todos: unknown): Adim[] =>
   (Array.isArray(todos) ? todos : []).flatMap((todo: Args, i) => {
@@ -89,6 +99,7 @@ type Found = { path: string; mtimeMs: number }
 
 const STATE_PATH = '.workflow/STATE.md'
 const planPath = (dir: string) => `.workflow/plans/${dir}/PLAN.md`
+const progressPath = (dir: string) => `.workflow/plans/${dir}/PROGRESS.md`
 
 const statFile = ($: $, path: string): Promise<Found | undefined> =>
   $.fs.stat(path).then(
@@ -105,16 +116,17 @@ let ticker: Timer | undefined
 
 // File I/O only; the parsing is in ./progress (pure, unit-tested). Order (spec §2.1):
 // a my-skill plan (the one STATE.md names, else the newest .workflow/plans/*/PLAN.md)
-// with its status from STATE.md; then the generic ladder on PLAN.md,
+// with its status from its PROGRESS.md ledger, else from STATE.md; then the generic ladder on PLAN.md,
 // .workflow/PLAN.md, STATE.md and the newest plan, newest first.
 async function refreshPlan($: $) {
   const entries = await $.fs.list('.workflow/plans').catch(() => [])
   const dirs = entries.filter(entry => entry.kind === 'dir').map(entry => entry.name)
   const plans = await Promise.all(dirs.map(dir => statFile($, planPath(dir))))
+  const ledgers = await Promise.all(dirs.map(dir => statFile($, progressPath(dir))))
   const fixed = await Promise.all(['PLAN.md', '.workflow/PLAN.md', STATE_PATH].map(path => statFile($, path)))
 
   // re-read only when any file consulted changed (or appeared, or went away)
-  const stamp = newest([...plans, ...fixed])
+  const stamp = newest([...plans, ...ledgers, ...fixed])
     .map(one => `${one.path}:${one.mtimeMs}`)
     .sort()
     .join('|')
@@ -131,25 +143,35 @@ async function refreshPlan($: $) {
   const [active] = newest(plans)
   const named = state ? planDirsFromState(stateText, dirs.filter((_, i) => plans[i] !== undefined)) : []
 
-  let mine: { plan: MsPlan; found: Found; isNamed: boolean } | undefined
+  let mine: { plan: MsPlan; found: Found; isNamed: boolean; dir: string } | undefined
   for (const dir of named) {
     const found = plans[dirs.indexOf(dir)]
     const parsed = found && parseMsPlan(await load(found.path))
     if (found && parsed) {
-      mine = { plan: parsed, found, isNamed: true }
+      mine = { plan: parsed, found, isNamed: true, dir }
       break
     }
   }
   if (!mine && active) {
     const parsed = parseMsPlan(await load(active.path))
-    if (parsed) mine = { plan: parsed, found: active, isNamed: false }
+    if (parsed) mine = { plan: parsed, found: active, isNamed: false, dir: dirs[plans.indexOf(active)] ?? '' }
   }
 
   let steps: Adim[] = []
+  let unread = false
   if (mine) {
     // an unnamed plan newer than STATE.md is not what STATE.md's ids are about
     const credit = state !== undefined && (mine.isNamed || state.mtimeMs >= mine.found.mtimeMs)
-    steps = mySkillSteps(mine.plan, credit ? parseState(stateText, new Set(mine.plan.ids)) : undefined)
+    const ids = new Set(mine.plan.ids)
+    const status = credit ? parseState(stateText, ids) : undefined
+    // the plan's own ledger always belongs to it, and decides over STATE.md (Decision 6)
+    const ledger = ledgers[dirs.indexOf(mine.dir)]
+    if (ledger) {
+      steps = mySkillSteps(mine.plan, mergeProgress(parseProgress(await load(ledger.path), ids), status))
+    } else {
+      steps = mySkillSteps(mine.plan, status)
+      unread = status !== undefined && ledgerUnread(status)
+    }
   }
   // an all-done my-skill plan yields to anything else open; kept, it lets reconcile
   // flash "✓ Tamamlandı" for a job it saw run
@@ -160,6 +182,8 @@ async function refreshPlan($: $) {
       const found = genericSteps(await load(path), path === STATE_PATH)
       if (found.length > 0 && (steps.length === 0 || found.some(one => one.status !== 'completed'))) {
         steps = found
+        // the safety net is about the my-skill plan, not the file that replaced it
+        unread = false
         break
       }
     }
@@ -167,6 +191,7 @@ async function refreshPlan($: $) {
 
   seen = stamp
   await update($, plan, () => steps)
+  await update($, isUnread, () => unread)
 }
 
 const sessionId = ($: $) => $.session.id().catch(() => '')
@@ -347,6 +372,7 @@ export const register: Register = on => {
     await update($, plan, () => [])
     await update($, job, () => ({ startedAt: null, doneAt: null }))
     await update($, engagedSid, () => null)
+    await update($, isUnread, () => false)
 
     return next(e)
   })
@@ -385,10 +411,21 @@ async function ownRows($: $, e: RenderInput<'AbovePrompt'>): Promise<RenderEleme
   if (isComplete && (doneAt === null || now - doneAt > HIDE_MS)) return undefined
 
   const total = steps.length
-  const head = `${bar(done, total)} ${done}/${total} · %${Math.round((done / total) * 100)} · `
-  const step = current(steps)
+  // the safety net speaks for the plan files only, never for a task list
+  const warn = (await read($, tasks)).length === 0 && (await read($, isUnread)) ? UNREAD : ''
+  const head = `${bar(done, total)} ${done}/${total} · %${Math.round((done / total) * 100)} · ${warn}`
+  const running = steps.filter(isRunning)
+  const next = steps.find(one => !isDone(one))
   const room = Math.max(8, e.props.bodyColumns - head.length - 9)
-  const middle = isComplete || !step ? '✓ Tamamlandı' : `Şu an: ${clip((step.status === 'in_progress' && step.activeForm) || step.content, room)}`
+  // Decision 7: parallel work is a count; one step is named; none running names the next
+  const middle =
+    isComplete || !next
+      ? '✓ Tamamlandı'
+      : running.length >= 2
+        ? `Şu an ${running.length} iş üzerinde çalışılıyor`
+        : running[0]
+          ? `Şu an: ${clip(running[0].activeForm || running[0].content, room)}`
+          : `Sıradaki: ${clip(next.content, room)}`
   const expanded = await read($, isExpanded)
 
   const { Button, Text } = $.ui.resolve(e)
@@ -397,8 +434,8 @@ async function ownRows($: $, e: RenderInput<'AbovePrompt'>): Promise<RenderEleme
     <Button key="toggle" label={head + middle} plain onPress={() => update($, isExpanded, value => !value)} />,
     ...(expanded
       ? steps.map(one => (
-          <Text key={`adim-${one.id}`} dimColor={isDone(one)} bold={one === step} wrap="truncate-end">
-            {isDone(one) ? '✓' : one === step ? '●' : '○'} {one.content}
+          <Text key={`adim-${one.id}`} dimColor={isDone(one)} bold={isRunning(one)} wrap="truncate-end">
+            {isDone(one) ? '✓' : isRunning(one) ? '●' : '○'} {one.content}
           </Text>
         ))
       : []),

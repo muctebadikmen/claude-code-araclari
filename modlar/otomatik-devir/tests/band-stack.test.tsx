@@ -67,7 +67,7 @@ const walk = (node: any, out: any[] = []): any[] => {
 }
 
 const setup = (on: any) => {
-  const world = { sid: 's1', percent: 50, sent: [] as string[], ran: [] as string[] }
+  const world = { sid: 's1', percent: 50, sent: [] as string[], ran: [] as string[], tools: [] as string[] }
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.store(on, { esik: 40, mod: 'sor' })
   mock.env(on, { HOME: '/home/test' })
@@ -85,8 +85,22 @@ const setup = (on: any) => {
   on('command.list', () => ({ value: [{ name: SKILL }] }))
   on('command.run', ($: any, e: any) => {
     world.ran.push(e.command)
-    if (e.command === 'clear') world.sid = `${world.sid}-yeni`
     return {}
+  })
+  on('agent.list', () => ({ value: [] }))
+  on('tool.list', () => ({
+    value: [
+      'mcp__ccd_session__start_session',
+      'mcp__ccd_session_mgmt__get_session',
+      'mcp__ccd_session_mgmt__detach_session',
+    ].map(name => ({ name, description: '', mcp: true })),
+  }))
+  on('tool.call', ($: any, e: any) => {
+    world.tools.push(e.tool)
+    if (e.tool === 'mcp__ccd_session__start_session') {
+      return { result: [], text: 'Started session "Devam" (session_id: local_ab12-cd34, name: devam)' }
+    }
+    return { result: [], text: '{}' }
   })
   on('fs.exists', () => ({ value: false }))
   on('prompt.submit', ($: any, e: any) => {
@@ -171,8 +185,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(world.ran).toEqual([SKILL])
     await ui.press({ key: 'gec' })
     await clock.advance(100)
-    expect(world.ran).toEqual([SKILL, 'clear'])
-    expect(world.sent).toEqual(['Devam et: adım 3'])
+    expect(world.ran).toEqual([SKILL])
+    expect(world.tools).toContain('mcp__ccd_session__start_session')
+    expect(world.sent).toEqual([])
 
     // After the switch the question is gone; the others and the drawing beneath stay.
     const after = walk(await ui.drawn())

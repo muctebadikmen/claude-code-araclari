@@ -1,7 +1,7 @@
 {
   "name": "otomatik-devir",
-  "version": "0.1.0",
-  "description": "Bağlam doluluğunu durum satırında gösterir; eşik aşılınca işi güvenli bir noktada bitirtir, devam notu yazdırır ve sorarak yeni sohbete geçer (/devir).",
+  "version": "0.2.0",
+  "description": "Bağlam doluluğunu durum satırında gösterir; eşik aşılınca işi güvenli bir noktada bitirtir, çalışan subagent'ları bekler, devam notu yazdırır ve sorarak yeni bir kardeş sohbette devam eder; eski sohbet açık kalır (/devir).",
   "author": {
     "name": "Mustafa Dikmen",
     "url": "https://github.com/muctebadikmen"

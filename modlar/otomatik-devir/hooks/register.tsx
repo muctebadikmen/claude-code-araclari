@@ -1,5 +1,12 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderSurface } from 'claude-code'
+import type {
+  AgentInfo,
+  EngineInterface,
+  Register,
+  RenderSurface,
+  Timer,
+  ToolCallArgs,
+} from 'claude-code'
 
 import type { OtomatikDevirConv, OtomatikDevirPhase } from '../types'
 
@@ -11,6 +18,17 @@ const conv = atom({ plugin: 'otomatik-devir', key: 'conv' } as const, null)
 
 const SKILL = 'my-skill-handoff'
 const DEFAULT_THRESHOLD = 60
+
+// Claude desktop's session tools: the continuation runs in a new sibling chat.
+const START_SESSION = 'mcp__ccd_session__start_session'
+const TITLE_LIMIT = 59
+const CONTINUE_SUFFIX = ' (devam)'
+const CONTINUE_BACKGROUND =
+  "Önceki sohbet bağlam eşiğine ulaştı; iş otomatik devirle bu yeni sohbete aktarıldı. Bu prompt, kaldığı yerden sürdürülecek iştir: önce onu oku, sonra devam et."
+
+// Subagents in these states still owe the main loop a result.
+const ACTIVE_AGENT: ReadonlySet<AgentInfo['status']> = new Set(['pending', 'running', 'waiting'])
+const WATCH_MS = 5000
 
 // Used when no `my-skill-handoff` command exists (most people): the mod reads
 // the resume prompt from the LAST code block of the reply, so the prompt asks
@@ -32,7 +50,7 @@ const dative = (n: number): string => {
 }
 
 export const noteText = (threshold: number): string =>
-  `Bağlam %${threshold}${dative(threshold)} ulaştı. Şu anki adımı güvenli bir noktada bitir, yarım dosya bırakma, yeni işe başlama ve dur.`
+  `Bağlam %${threshold}${dative(threshold)} ulaştı. Yeni iş ve yeni subagent başlatma. Elindeki adımı güvenli bir noktada bitir (yarım dosya bırakma), çalışan subagent'ların bitmesini bekle, sonuçlarını işle ve dur. Devir notu (/${SKILL}) ardından otomatik başlatılacak.`
 
 type Mode = 'sor' | 'otomatik'
 type Settings = { threshold: number; mode: Mode; isEnabled: boolean }
@@ -205,9 +223,11 @@ const hasHandoffSkill = async ($: EngineInterface): Promise<boolean> => {
 
 /** Starts the handoff turn: the skill when it exists, else the fallback prompt. */
 const startHandoff = async ($: EngineInterface, sid: string): Promise<void> => {
-  // One handoff at a time; clearing `grace` keeps the handoff turn's end from
-  // being eaten by the grace branch of turn.complete.
-  const isClaimed = await claim($, sid, held => held.phase !== 'handoff_running', {
+  // One handoff at a time, and only from idle or warned: the agent watcher and a
+  // turn end racing cannot both start it, nor restart a done or awaiting one.
+  // Clearing `grace` keeps the handoff turn's end from being eaten by the grace
+  // branch of turn.complete.
+  const isClaimed = await claim($, sid, held => held.phase === 'idle' || held.phase === 'warned', {
     phase: 'handoff_running',
     grace: false,
   })
@@ -235,7 +255,154 @@ const startHandoff = async ($: EngineInterface, sid: string): Promise<void> => {
   }
 }
 
-/** Clears the chat and submits the continuation prompt; on failure, clipboard + toast. */
+/**
+ * `$.tool.call` for a tool the saved MCP typings may not declare yet (they list
+ * the tools connected when the mod was last saved): the input goes through
+ * loosely typed.
+ */
+const callTool = ($: EngineInterface, input: { tool: string } & Record<string, unknown>) =>
+  $.tool.call(input as unknown as ToolCallArgs)
+
+/** This chat's own desktop session: its id (local_...) and title, either unknown on failure. */
+const selfSession = async ($: EngineInterface): Promise<{ id?: string; title?: string }> => {
+  try {
+    const got = await $.tool.call({ tool: 'mcp__ccd_session_mgmt__get_session', session_id: 'self' })
+    if (got.deny !== undefined || got.isError === true || got.text === undefined) return {}
+    const info = JSON.parse(got.text) as { sessionId?: unknown; title?: unknown }
+
+    return {
+      id: typeof info.sessionId === 'string' ? info.sessionId : undefined,
+      title: typeof info.title === 'string' && info.title.trim() !== '' ? info.title.trim() : undefined,
+    }
+  } catch {
+    return {}
+  }
+}
+
+/** This chat's title + " (devam)", kept under 60 characters; "Devam" when unknown. */
+const continueTitle = (title: string | undefined): string => {
+  if (title === undefined) return 'Devam'
+  const room = TITLE_LIMIT - CONTINUE_SUFFIX.length
+
+  return `${title.slice(0, room).trimEnd()}${CONTINUE_SUFFIX}`
+}
+
+/** Moves a session this chat started to top level; a failure is only logged. */
+const detachSession = async ($: EngineInterface, id: string): Promise<void> => {
+  try {
+    const detached = await $.tool.call({ tool: 'mcp__ccd_session_mgmt__detach_session', session_id: id })
+    if (detached.deny !== undefined || detached.isError === true) {
+      throw new Error(detached.deny ?? detached.text ?? 'detach failed')
+    }
+  } catch (error) {
+    $.ui.log(`otomatik-devir: ${id} üst seviyeye taşınamadı: ${String(error)}`, { to: 'debug' })
+  }
+}
+
+type SiblingChat =
+  | { kind: 'started'; title: string }
+  | { kind: 'proposed'; title: string; selfId?: string }
+
+/**
+ * Starts a new top-level sibling chat (Claude desktop) with the continuation
+ * prompt. A turn the mod itself started counts as an automated event, where
+ * the app refuses `user_asked`: then the chat is proposed as a card instead
+ * (`own_initiative`), which the person starts with a click. Resolves undefined
+ * when the session tools are missing; throws when neither call worked.
+ */
+const startSiblingChat = async (
+  $: EngineInterface,
+  prompt: string,
+): Promise<SiblingChat | undefined> => {
+  const tools = await $.tool.list().catch(() => [])
+  if (!tools.some(tool => tool.name === START_SESSION)) return undefined
+  const self = await selfSession($)
+  const title = continueTitle(self.title)
+  const ask = (initiation: 'user_asked' | 'own_initiative') =>
+    callTool($, {
+      tool: START_SESSION,
+      initiation,
+      context: 'fresh',
+      title,
+      prompt,
+      background: CONTINUE_BACKGROUND,
+      use_worktree: false,
+    })
+
+  const started = await ask('user_asked')
+  const refusal = started.deny ?? (started.isError === true ? (started.text ?? '') : undefined)
+  if (refusal === undefined) {
+    const id = /session_id: (local_[A-Za-z0-9-]+)/.exec(started.text ?? '')?.[1]
+    if (id === undefined) throw new Error(`start_session gave no session id: ${started.text ?? ''}`)
+    // Started from this chat it nests under it: move it to top level.
+    await detachSession($, id)
+
+    return { kind: 'started', title }
+  }
+  if (!/own_initiative|Start sessions only/.test(refusal)) {
+    throw new Error(`start_session refused: ${refusal}`)
+  }
+
+  const proposed = await ask('own_initiative')
+  if (proposed.deny !== undefined) throw new Error(`start_session denied: ${proposed.deny}`)
+  if (proposed.isError === true) throw new Error(`start_session failed: ${proposed.text ?? ''}`)
+  const task = /task_id: (task_[A-Za-z0-9]+)/.exec(proposed.text ?? '')?.[1]
+  if (task === undefined) throw new Error(`start_session gave no task id: ${proposed.text ?? ''}`)
+
+  return { kind: 'proposed', title, selfId: self.id }
+}
+
+const PROPOSAL_WATCH_MS = 5000
+const PROPOSAL_WATCH_LIMIT_MS = 2 * 60 * 60 * 1000
+
+// One proposal watcher per loaded module.
+let isWatchingProposal = false
+
+/**
+ * Waits (at most two hours) for the person to start the proposed card, then
+ * moves that session to top level: the linked session with the card's title
+ * that this chat started. Errors only log.
+ */
+const watchProposal = ($: EngineInterface, title: string, selfId: string): void => {
+  if (isWatchingProposal) return
+  isWatchingProposal = true
+  let timer: Timer | undefined
+  let isTicking = false
+  let deadline: number | undefined
+  const stop = (): void => {
+    timer?.cancel()
+    isWatchingProposal = false
+  }
+  const tick = async (): Promise<void> => {
+    const now = await $.clock.now()
+    deadline ??= now + PROPOSAL_WATCH_LIMIT_MS
+    if (now > deadline) return stop()
+    const listed = await $.tool.call({ tool: 'mcp__ccd_session_mgmt__list_sessions', linked: true })
+    if (listed.deny !== undefined || listed.isError === true || listed.text === undefined) return
+    const sessions: unknown = JSON.parse(listed.text)
+    if (!Array.isArray(sessions)) return
+    const found = (sessions as { sessionId?: unknown; title?: unknown; startedBy?: unknown }[]).find(
+      session => session.title === title && session.startedBy === selfId,
+    )
+    if (found === undefined || typeof found.sessionId !== 'string') return
+    stop()
+    await detachSession($, found.sessionId)
+  }
+  timer = $.clock.every(PROPOSAL_WATCH_MS, () => {
+    if (isTicking) return
+    isTicking = true
+    tick()
+      .catch(error => $.ui.log(`otomatik-devir: kart izleme: ${String(error)}`, { to: 'debug' }))
+      .finally(() => {
+        isTicking = false
+      })
+  })
+}
+
+/**
+ * Continues in a new sibling chat; this chat stays as it is (not cleared, not
+ * archived). Without the session tools, or on failure: clipboard + toast.
+ */
 const switchChat = async (
   $: EngineInterface,
   sid: string,
@@ -243,38 +410,48 @@ const switchChat = async (
   surface?: RenderSurface,
 ): Promise<void> => {
   // Only one switch per prompt: a double press of [Geç] (or Geç racing the
-  // otomatik switch) must not run /clear and submit twice.
+  // otomatik switch) must not start two chats.
   const isClaimed = await claim($, sid, held => held.phase === 'awaiting_choice', {
     phase: 'done',
   })
   if (!isClaimed) return
-  let isSubmitted = false
+  let chat: SiblingChat | undefined
   try {
-    await $.command.run({ command: 'clear' })
-    const fresh = await $.session.id()
-    if (fresh === sid) throw new Error('clear did not start a new conversation')
-    // The continuation turn of the fresh chat is exempt from triggering.
-    await update($, conv, (): OtomatikDevirConv => ({ sid: fresh, phase: 'idle', grace: true }))
-    const sent = await $.prompt.submit({ text: prompt, asUser: true })
-    if (sent.drop !== undefined) throw new Error(`prompt dropped: ${sent.drop}`)
-    isSubmitted = true
-  } catch {
-    const copied = await $.ui
-      .copy(surface === undefined ? { text: prompt } : { text: prompt, surface })
-      .catch(() => ({ isCopied: false as const }))
-    $.ui.toast(
-      copied.isCopied
-        ? "Devam prompt'u panoya kopyalandı. /clear yazıp yeni sohbete yapıştır."
-        : "Yeni sohbete yapıştır: devam prompt'u aşağıda.",
-      { timeoutMs: 15000 },
-    )
-    if (!copied.isCopied) $.ui.log(`Yeni sohbete yapıştır:\n${prompt}`)
-    // Still in the same conversation (the clear did not happen): keep the
-    // prompt claimable so `/devir gec` can try again.
-    const now = await $.session.id().catch(() => sid)
-    if (now === sid) await patchConv($, sid, { phase: 'awaiting_choice', bandHidden: true })
+    chat = await startSiblingChat($, prompt)
+  } catch (error) {
+    $.ui.log(`otomatik-devir: yeni sohbet açılamadı: ${String(error)}`, { to: 'debug' })
   }
-  if (isSubmitted) await refreshStatus($).catch(() => undefined)
+  if (chat?.kind === 'started') {
+    $.ui.toast(`Devam yeni sohbette: ${chat.title}`, { timeoutMs: 15000 })
+    await refreshStatus($).catch(() => undefined)
+
+    return
+  }
+  if (chat?.kind === 'proposed') {
+    await patchConv($, sid, { phase: 'done', proposalTitle: chat.title })
+    $.ui.toast('Devam kartı hazır: karta tıklayınca yeni sohbet açılır.', { timeoutMs: 15000 })
+    if (chat.selfId === undefined) {
+      $.ui.log('otomatik-devir: oturum kimliği yok, kart izlenmiyor', { to: 'debug' })
+    } else {
+      watchProposal($, chat.title, chat.selfId)
+    }
+    await refreshStatus($).catch(() => undefined)
+
+    return
+  }
+  const copied = await $.ui
+    .copy(surface === undefined ? { text: prompt } : { text: prompt, surface })
+    .catch(() => ({ isCopied: false as const }))
+  $.ui.toast(
+    copied.isCopied
+      ? "Devam prompt'u panoya kopyalandı. Yeni sohbet açıp yapıştır."
+      : "Yeni sohbete yapıştır: devam prompt'u aşağıda.",
+    { timeoutMs: 15000 },
+  )
+  if (!copied.isCopied) $.ui.log(`Yeni sohbete yapıştır:\n${prompt}`)
+  // No new chat: keep the prompt claimable so `/devir gec` can try again.
+  const now = await $.session.id().catch(() => sid)
+  if (now === sid) await patchConv($, sid, { phase: 'awaiting_choice', bandHidden: true })
 }
 
 /** Work that must not run inside the dispatch the turn waits on. */
@@ -282,6 +459,85 @@ const later = ($: EngineInterface, work: () => Promise<void>): void => {
   $.clock.after(50, () => {
     work().catch(error => $.ui.log(`otomatik-devir: ${String(error)}`, { to: 'debug' }))
   })
+}
+
+/** Subagents still running (or about to); fails open to none. */
+const activeAgents = async ($: EngineInterface): Promise<AgentInfo[]> => {
+  try {
+    return (await $.agent.list()).filter(agent => ACTIVE_AGENT.has(agent.status))
+  } catch (error) {
+    $.ui.log(`otomatik-devir: ajan listesi okunamadı: ${String(error)}`, { to: 'debug' })
+
+    return []
+  }
+}
+
+// One agent watcher per loaded module, whatever number of turns ask for it.
+let isWatching = false
+// The main loop's turn is running (turn.start .. turn.complete): its end
+// starts the handoff itself, so the watcher must not start it mid-turn.
+let isTurnRunning = false
+
+/**
+ * Polls until no subagent is active, then starts the handoff, as long as the
+ * record of `sid` still stands at `warned`. Stops when the phase leaves
+ * `warned` or the conversation changes.
+ */
+const watchAgents = ($: EngineInterface, sid: string): void => {
+  if (isWatching) return
+  isWatching = true
+  let timer: Timer | undefined
+  let isTicking = false
+  const stop = (): void => {
+    timer?.cancel()
+    isWatching = false
+  }
+  const tick = async (): Promise<void> => {
+    const held = await read($, conv)
+    if (held === null || held.sid !== sid || held.phase !== 'warned') return stop()
+    if ((await $.session.id()) !== sid) return stop()
+    const active = (await activeAgents($)).length
+    if (active > 0) {
+      $.ui.status(`Devir: ${active} subagent bekleniyor`)
+
+      return
+    }
+    stop()
+    if (!isTurnRunning) await startHandoff($, sid)
+  }
+  timer = $.clock.every(WATCH_MS, () => {
+    if (isTicking) return
+    isTicking = true
+    tick()
+      .catch(error => {
+        stop()
+        $.ui.log(`otomatik-devir: ajan bekleme durdu: ${String(error)}`, { to: 'debug' })
+      })
+      .finally(() => {
+        isTicking = false
+      })
+  })
+}
+
+/**
+ * Starts the handoff now, or, while subagents run, holds it at `warned` and
+ * leaves it to the watcher. Resolves how many subagents it waits for.
+ */
+const handoffWhenIdle = async ($: EngineInterface, sid: string): Promise<number> => {
+  const active = (await activeAgents($)).length
+  if (active === 0) {
+    later($, () => startHandoff($, sid))
+
+    return 0
+  }
+  await claim($, sid, held => held.phase === 'idle', { phase: 'warned' })
+  $.ui.status(`Devir: ${active} subagent bekleniyor`)
+  if (!isWatching) {
+    $.ui.toast(`Devir: ${active} subagent bitince başlayacak.`)
+    watchAgents($, sid)
+  }
+
+  return active
 }
 
 // ---------------------------------------------------------------------------
@@ -354,9 +610,16 @@ export const register: Register = on => {
     return stored
   })
 
+  on('turn.start', async ($, e, next) => {
+    if ((e as { agentId?: string }).agentId === undefined) isTurnRunning = true
+
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId !== undefined) return result
+    isTurnRunning = false
     const settings = await readSettings($)
     const percent = await contextPercent($)
     $.ui.status(statusText(settings, percent))
@@ -406,7 +669,10 @@ export const register: Register = on => {
     const isDue =
       held.phase === 'warned' || (held.phase === 'idle' && settings.isEnabled && isCrossed)
     if (isDue && !e.isAborted && settings.isEnabled) {
-      later($, () => startHandoff($, held.sid))
+      // Running subagents first: the handoff waits for their results.
+      later($, async () => {
+        await handoffWhenIdle($, held.sid)
+      })
     }
 
     return result
@@ -449,11 +715,17 @@ export const register: Register = on => {
         await refreshStatus($)
 
         return { text: 'Otomatik devir açıldı.' }
-      case 'simdi':
+      case 'simdi': {
         if (held.phase === 'handoff_running') return { text: 'Devir zaten çalışıyor.' }
-        later($, () => startHandoff($, held.sid))
+        // Asked for by hand: any other phase (done, awaiting_choice) re-arms to
+        // warned, the one startHandoff and the agent watcher start from.
+        await claim($, held.sid, now => now.phase !== 'handoff_running', { phase: 'warned' })
+        const waiting = await handoffWhenIdle($, held.sid)
 
-        return { text: 'Devir başlatılıyor.' }
+        return {
+          text: waiting > 0 ? `${waiting} subagent bitince devir başlayacak.` : 'Devir başlatılıyor.',
+        }
+      }
       case 'gec': {
         // switchChat only runs from awaiting_choice: say so instead of
         // answering "geçiliyor" and then doing nothing (e.g. after `done`).
@@ -482,7 +754,7 @@ export const register: Register = on => {
     }
   })
 
-  // The question band: "Yeni sohbete geçeyim mi?" [Geç] [Bekle]
+  // The question band: "Devam prompt'u hazır. Yeni sohbet açayım mı?" [Geç] [Bekle]
   //
   // The context indicator lives in the status line ($.ui.status: one line per
   // plugin, no contention); only this question uses the AbovePrompt band,
@@ -515,7 +787,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Box key="devir">
-          <Text>Yeni sohbete geçeyim mi? </Text>
+          <Text>Devam prompt'u hazır. Yeni sohbet açayım mı? </Text>
           <Button
             key="gec"
             label="Geç"

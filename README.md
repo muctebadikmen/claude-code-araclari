@@ -7,7 +7,7 @@ Kendi işimde her gün kullandığım Claude Code modları. Kod yazmadan, Claude
 
 | Mod | Ne yapar |
 |---|---|
-| **otomatik-devir** | Sohbetin bağlamı dolmaya yaklaşınca işi güvenli bir yerde bitirtir, devam notu yazdırır, sohbeti temizleyip işe kaldığı yerden devam ettirir. |
+| **otomatik-devir** | Sohbetin bağlamı dolmaya yaklaşınca işi güvenli bir yerde bitirtir, çalışan subagent'ları bekler, devam notu yazdırır ve işi yeni bir sohbette kaldığı yerden sürdürür. |
 | **ilerleme-cubugu** | Süren işin ilerlemesini yazı kutusunun üstünde çubuk olarak gösterir: kaç adımın bittiği, yüzde kaç olduğu ve şu an hangi adımda olunduğu. |
 
 > "Mod", Claude Code'un içine takılan küçük bir eklentidir. Claude Code'un görünüşünü ve davranışını değiştirir.
@@ -80,7 +80,7 @@ Sonra Claude Code'u yeniden başlatın.
 
 ### otomatik-devir
 
-Alt satırdaki durum çubuğunda `Devir: %X / eşik %60` görürsünüz (ilk yanıttan önce %0 görünür). Doluluk eşiği aşınca mod, işi güvenli bir noktada bitirtir ve devam notu yazdırır (`.workflow/HANDOFF.md`). Sonra "Yeni sohbete geçeyim mi?" diye sorar: **g** = Geç, **b** = Bekle. "Geç" dediğinizde sohbeti temizler (`/clear`), devam prompt'unu yapıştırır ve iş kaldığı yerden sürer.
+Alt satırdaki durum çubuğunda `Devir: %X / eşik %60` görürsünüz (ilk yanıttan önce %0 görünür). Doluluk eşiği aşınca mod, işi güvenli bir noktada bitirtir ve devam notu yazdırır (`.workflow/HANDOFF.md`). Çalışan subagent'lar varsa devir onlar bitene kadar bekler (durum satırında `Devir: N subagent bekleniyor`). Sonra "Devam prompt'u hazır. Yeni sohbet açayım mı?" diye sorar: **g** = Geç, **b** = Bekle. "Geç" dediğinizde Claude masaüstü uygulamasında devam prompt'uyla yeni bir üst seviye sohbet açar ve iş orada kaldığı yerden sürer; eski sohbet temizlenmez, açık kalır.
 
 | Komut | Ne yapar |
 |---|---|
@@ -138,11 +138,11 @@ claude plugin validate modlar/otomatik-devir
 claude plugin validate modlar/ilerleme-cubugu
 ```
 
-Çıktı, modun hangi işlemleri yaptığını listeler. İki modun listesinde de ağ çağrısı yoktur. ilerleme-cubugu yalnızca proje klasöründeki plan dosyalarını okur, hiçbir dosyaya yazmaz. otomatik-devir devam notunu Claude'a yazdırır, kendisi dosya yazmaz; devir anında sohbeti temizleyip devam prompt'unu gönderir.
+Çıktı, modun hangi işlemleri yaptığını listeler. İki modun listesinde de ağ çağrısı yoktur. ilerleme-cubugu yalnızca proje klasöründeki plan dosyalarını okur, hiçbir dosyaya yazmaz. otomatik-devir devam notunu Claude'a yazdırır, kendisi dosya yazmaz; devir anında devam prompt'uyla yeni bir sohbet açar (masaüstü uygulamasının oturum araçlarıyla).
 
 ## Bilinen sınırlar
 
-- **otomatik-devir:** Alt komutlar Türkçe harfsiz yazılır: `esik`, `simdi` (`eşik` çalışmaz). Devir yanıtı bir kod bloğuyla bitmezse "devam prompt'u bulunamadı" der. Sohbet temizlenemezse devam metni panoya kopyalanır ve ekranda "/clear yazıp yeni sohbete yapıştır" yazar.
+- **otomatik-devir:** Alt komutlar Türkçe harfsiz yazılır: `esik`, `simdi` (`eşik` çalışmaz). Devir yanıtı bir kod bloğuyla bitmezse "devam prompt'u bulunamadı" der. Yeni sohbet açılamazsa (oturum araçları yoksa, örneğin terminalde) devam metni panoya kopyalanır ve ekranda "Yeni sohbet açıp yapıştır" yazar; `/devir gec` ile yeniden denenebilir.
 - **ilerleme-cubugu:** Plan dosyasını editörde elle değiştirirseniz çubuğun güncellenmesi birkaç saniye sürebilir. Plan çubuğu yalnız o dosyalardan bahseden sohbette görünür. İş bitince çubuk kısa bir süre "✓ Tamamlandı" gösterip kaybolur.
 - **Yazı kutusunun üstündeki şerit paylaşılır:** iki mod (ve varsa başka modlar) aynı şeride çizer. Başka modun düğmeleri (ör. "Geç / Bekle") her zaman üstte kalır; adım listesi açıkken bile onları ekrandan itmez.
 

@@ -181,13 +181,15 @@ for (const surface of ['terminal', 'desktop'] as const) {
     ])
     await ui.redraw(BAND)
 
-    // Presses reach the plugin that drew the Button, nested or not.
-    expect(world.ran).toEqual([SKILL])
+    // Presses reach the plugin that drew the Button, nested or not. The
+    // handoff went out as the one message; nothing more is sent on the press.
+    expect(world.ran).toEqual([])
+    expect(world.sent).toHaveLength(1)
     await ui.press({ key: 'gec' })
     await clock.advance(100)
-    expect(world.ran).toEqual([SKILL])
+    expect(world.ran).toEqual([])
     expect(world.tools).toContain('mcp__ccd_session__start_session')
-    expect(world.sent).toEqual([])
+    expect(world.sent).toHaveLength(1)
 
     // After the switch the question is gone; the others and the drawing beneath stay.
     const after = walk(await ui.drawn())

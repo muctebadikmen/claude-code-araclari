@@ -394,12 +394,12 @@ export const fileFirstNote = (file: string): string =>
   `otomatik-devir: bu devrin devam prompt'u ${file} dosyasında yok. Önce onu yaz (dosyayı baştan yaz), sonra ${GATE} aracını yeniden çağır.`
 
 /**
- * Pre-provisioning (v0.5): in a turn the person typed, with Auto or Bypass on,
- * the model creates this folder's next task pair, so the app saves the mode
- * with them (only such a turn's create keeps it).
+ * `/devir hazirla` (v0.5.2): an open request the person reads in the prompt
+ * box and sends themselves (never model context). Sent in a turn they typed,
+ * with Auto or Bypass on, the model's creates keep the mode with the pair.
  */
-export const provisionNote = ([a, b]: readonly [string, string]): string =>
-  `otomatik-devir: devir zinciri için bu turda iki zamanlanmış görev oluştur (izin modu yalnızca kullanıcının yazdığı bir turda görevle saklanır): ${CREATE_TASK} aracını taskId "${a}" ile, sonra taskId "${b}" ile çağır; prompt ve description için "-" ver, zamanlama verme (başlığı, prompt'u ve ayarları mod doldurur). Görevleri çalıştırma, silme ya da güncelleme. Sonra kullanıcının isteğine kaldığın yerden devam et; bu adımı yanıtında anlatma.`
+export const provisionRequest = ([a, b]: readonly [string, string]): string =>
+  `Please set up the task pair for the otomatik-devir mod (~/.claude/mods/otomatik-devir), so a later automatic handoff from this folder keeps this chat's permission mode. The app saves the permission mode only with a scheduled task created in a turn I typed myself, so this has to happen in this turn. Call ${CREATE_TASK} twice, one after the other: first with taskId "${a}", then with taskId "${b}". For each, give prompt "-" and description "-" and no schedule (no cronExpression, no fireAt); the mod fills in the title, prompt and settings. Do not run, update or delete these tasks. Then tell me whether the app said the permission mode was saved.`
 
 const RUN_RETRY =
   "otomatik-devir: görev çalıştırılamadı. Diğer görev bu oturumun görevi değilse onu bir kez dene; o da olmazsa yeniden deneme: devam prompt'unu yanıtının en sonunda tek bir kod bloğu olarak ver, yeni sohbeti mod açar."
@@ -1999,6 +1999,12 @@ const DONE_PREFIX = 'gonderildi:'
 const MODE_PREFIX = 'gorevModu:'
 // The one-time setup hint was shown for this folder (one toast per folder).
 const HINT_PREFIX = 'ipucu:'
+// The mod's own create of this folder's pair failed and the person was told (one toast per folder).
+const SETUP_FAIL_PREFIX = 'kurulumUyari:'
+// The mod's own creates, across folders: "not saved" pairs counted; at
+// MAX_OWN_UNSAVED it turns itself off until `/devir otomatik` or `/devir hazirla`.
+const OWN_SETUP = 'kendiKurulum'
+const MAX_OWN_UNSAVED = 2
 const RELAY_TICK_MS = 5000
 // A relay whose heartbeat is older than this is gone: another session takes over.
 const RELAY_STALE_MS = 30 * 1000
@@ -2050,6 +2056,8 @@ type Provision = {
   created: Record<string, 'saved' | 'unsaved' | 'unknown'>
   /** The asking session; its claim on the ask ends at `until` (its turn's end, or ASK_TTL_MS). */
   by?: string
+  /** Who creates the pair: the mod itself (Bypass) or the model, on the person's `/devir hazirla` request. */
+  via?: 'mod' | 'hazirla'
   until?: number
   /** "Not saved" pairs on `missDay` (UTC date); at MAX_PROVISION_MISSES no more asks that day. */
   misses?: number
@@ -2091,6 +2099,8 @@ let turnHadMachine = false
 let isProvisionAsked = false
 // The folder whose ask this session holds until its turn ends (v0.5 live check, bug 3).
 let askedCwd: string | undefined
+// The folder whose pair the mod is creating itself right now: its outcome, not the turn's end, decides a miss.
+let ownCreating: string | undefined
 let relayTimer: Timer | undefined
 let requestTimer: Timer | undefined
 let isRelayTicking = false
@@ -2289,13 +2299,28 @@ const readyPair = async (
 
 /** The one-time setup, said once per folder (review H1). */
 export const SETUP_HINT =
-  "Devir zinciri: bu klasörde izin modu kayıtlı görev çifti yok, bu yüzden yeni sohbet bir sonraki mesajınla açılacak. Bir kez yapılacak ayar: bu klasördeki normal bir sohbette Auto ya da Bypass modundayken herhangi bir mesaj yazın (mod kayıtlı çifti o turda oluşturur) ya da uygulamada Zamanlanmış görevler'de otomatik-devir görevlerini düzenleyip izin modunu bir kez seçin."
+  "Devir zinciri: bu klasörde izin modu kayıtlı görev çifti yok, bu yüzden yeni sohbet bir sonraki mesajınla açılacak. Bir kez yapılacak ayar: bu klasördeki normal bir sohbette Bypass modundayken herhangi bir mesaj yazın (mod kayıtlı çifti o turda kendisi oluşturur), Auto ya da Bypass modunda /devir hazirla yazıp giriş kutusuna gelen isteği gönderin ya da uygulamada Zamanlanmış görevler'de otomatik-devir görevlerini düzenleyip izin modunu bir kez seçin."
 
 const hintOnce = async ($: EngineInterface, cwd: string): Promise<void> => {
   const key = `${HINT_PREFIX}${hashOf(cwd)}`
   if ((await $.store.get(key).catch(() => undefined)) !== undefined) return
   await $.store.set(key, await $.clock.now()).catch(() => undefined)
   $.ui.toast(SETUP_HINT, { timeoutMs: 30000 })
+}
+
+/** The mod's own create of a folder's pair failed: said once per folder, to the person only. */
+export const setupFailHint = (reason: string): string =>
+  `Devir zinciri: mod bu klasörün görev çiftini kendisi oluşturamadı (${reason}); bugün bu klasörde yeniden denemeyecek. Elle kurmak için Auto ya da Bypass modunda /devir hazirla yazıp giriş kutusuna gelen isteği gönderin.`
+
+/** The mod's own creates were "not saved" MAX_OWN_UNSAVED times: it stopped everywhere (one toast). */
+export const SETUP_OFF_HINT =
+  'Devir zinciri: mod iki kez görev çifti oluşturdu ama uygulama izin modunu görevle saklamadı; kendi kendine kurulumu her klasörde kapattı. Kurmak için Auto ya da Bypass modundaki normal bir sohbette /devir hazirla yazıp giriş kutusuna gelen isteği gönderin (/devir otomatik de yeniden açar).'
+
+const failHintOnce = async ($: EngineInterface, cwd: string, reason: string): Promise<void> => {
+  const key = `${SETUP_FAIL_PREFIX}${hashOf(cwd)}`
+  if ((await $.store.get(key).catch(() => undefined)) !== undefined) return
+  await $.store.set(key, await $.clock.now()).catch(() => undefined)
+  $.ui.toast(setupFailHint(reason), { timeoutMs: 30000 })
 }
 
 /**
@@ -2911,37 +2936,88 @@ const startRelay = ($: EngineInterface): void => {
   })
 }
 
+/** The mod's own provisioning is off everywhere (MAX_OWN_UNSAVED "not saved" pairs, v0.5.2). */
+const isOwnSetupOff = async ($: EngineInterface): Promise<boolean> =>
+  record(await $.store.get(OWN_SETUP).catch(() => undefined))?.off === true
+
 /**
- * Pre-provisioning: in a turn the person typed (no machine input joined or
- * opened it, no agent still running, not a run chat) with Auto or Bypass on,
- * while this folder has no pair ready in that mode, the model is asked once
- * to create the next generation; the create results say whether the app kept
- * the mode. After MAX_PROVISION_MISSES "not saved" pairs in a day it stops
- * asking until the next day or `/devir otomatik` (review H3).
+ * Records this session's ask for the folder's next pair: an earlier ask
+ * nothing was created from keeps its ids, else the next generation
+ * (undefined past MAX_GEN). Other chats in the folder are held off until
+ * this session's typed turn ends or ASK_TTL_MS passes.
  */
-const provisionCheck = async ($: EngineInterface): Promise<string | undefined> => {
-  if (!chainCapable || isProvisionAsked || !isPersonTurn || turnHadMachine || !isRoleKnown || isRunChat) return undefined
+const recordAsk = async (
+  $: EngineInterface,
+  cwd: string,
+  sid: string,
+  mode: string,
+  via: 'mod' | 'hazirla',
+  pending: Provision | undefined,
+  misses: number,
+): Promise<Provision | undefined> => {
+  const pair = await readPair($, cwd)
+  const isUnused = pending !== undefined && pending.state !== 'done' && Object.keys(pending.created ?? {}).length === 0
+  const gen = isUnused ? pending.gen : Math.max(pair?.gen ?? 0, pending?.gen ?? 0) + 1
+  if (gen > MAX_GEN) return undefined
+  const now = await $.clock.now()
+  const ask: Provision = {
+    gen,
+    ids: genIds(tagOf(cwd), gen),
+    mode,
+    model: selfInfo.model,
+    at: now,
+    state: 'asked',
+    created: {},
+    by: sid,
+    via,
+    until: now + ASK_TTL_MS,
+    misses,
+    missDay: dayOf(now),
+  }
+  await $.store.set(provisionKey(cwd), ask)
+  isProvisionAsked = true
+  askedCwd = cwd
+
+  return ask
+}
+
+/**
+ * Pre-provisioning (v0.5.2): the mod creates this folder's next pair itself
+ * ($.tool.call), never through the model: a note asking the model to create
+ * tasks reads as prompt injection, and a refused one asked every new chat
+ * again. Only in Bypass, in a turn the person typed (no machine input joined
+ * or opened it, no agent still running, not a run chat), while the folder
+ * has no pair ready in that mode. Never in Auto: there the app's classifier
+ * may raise a card, mid-task, for a call the person did not ask for; Auto
+ * provisions only through `/devir hazirla`. A failed own create stops it in
+ * that folder for the day (MAX_PROVISION_MISSES still caps the misses);
+ * MAX_OWN_UNSAVED "not saved" pairs stop it everywhere until `/devir
+ * otomatik` or `/devir hazirla`.
+ */
+const provisionCheck = async ($: EngineInterface): Promise<void> => {
+  if (!chainCapable || isProvisionAsked || !isPersonTurn || turnHadMachine || !isRoleKnown || isRunChat) return
   const mode = selfInfo.permissionMode
-  if (!isSavable(mode)) return undefined
+  if (mode !== 'bypassPermissions') return
   const settings = await readSettings($)
-  if (!settings.isEnabled || settings.mode !== 'otomatik') return undefined
+  if (!settings.isEnabled || settings.mode !== 'otomatik') return
+  if (await isOwnSetupOff($)) return
   const held = await read($, conv)
   const sid = await $.session.id()
-  if (held !== null && held.sid === sid && (held.phase === 'handoff_running' || held.phase === 'deferred')) {
-    return undefined
-  }
-  if ((await activeAgents($)).length > 0) return undefined
+  if (held !== null && held.sid === sid && (held.phase === 'handoff_running' || held.phase === 'deferred')) return
+  if ((await activeAgents($)).length > 0) return
   const cwd = await $.session.cwd()
   const pair = await readPair($, cwd)
   if (pair !== undefined && pair.gen > 0 && (await pairMode($, pair)) === mode) {
     isProvisionAsked = true
-    return undefined
+    return
   }
   const now = await $.clock.now()
   const pending = asProvision(await $.store.get(provisionKey(cwd)))
   const today = dayOf(now)
-  const misses = pending?.missDay === today ? (pending.misses ?? 0) : 0
-  if (misses >= MAX_PROVISION_MISSES) return undefined
+  let misses = pending?.missDay === today ? (pending.misses ?? 0) : 0
+  // A failed own create, or an ask left unanswered, ends the folder's day (D2).
+  if (pending?.state === 'failed' && misses > 0) return
+  if (misses >= MAX_PROVISION_MISSES) return
   // Another chat's open ask holds off this one only until its turn ends or
   // ASK_TTL_MS passes, never for hours (v0.5 live check, bug 3).
   const isHeldElsewhere =
@@ -2950,41 +3026,192 @@ const provisionCheck = async ($: EngineInterface): Promise<string | undefined> =
     pending.mode === mode &&
     pending.by !== sid &&
     now < Math.min(pending.until ?? Number.POSITIVE_INFINITY, pending.at + ASK_TTL_MS)
-  if (isHeldElsewhere) return undefined
-  // An ask nothing came of is asked again with the same ids, not a new generation.
-  const isUnused = pending !== undefined && pending.state === 'asked' && Object.keys(pending.created ?? {}).length === 0
-  const gen = isUnused ? pending.gen : Math.max(pair?.gen ?? 0, pending?.gen ?? 0) + 1
-  if (gen > MAX_GEN) return undefined
-  isProvisionAsked = true
-  const ids = genIds(tagOf(cwd), gen)
-  const ask: Provision = {
-    gen,
-    ids,
-    mode,
-    model: selfInfo.model,
-    at: now,
-    state: 'asked',
-    created: {},
-    by: sid,
-    until: now + ASK_TTL_MS,
-    misses,
-    missDay: today,
+  if (isHeldElsewhere) return
+  // An ask another chat left incomplete (it ended or vanished first) is one miss before the retry.
+  if (pending !== undefined && pending.state === 'asked' && pending.by !== sid && pending.ids.some(id => pending.created?.[id] === undefined)) {
+    misses += 1
+    if (misses >= MAX_PROVISION_MISSES) {
+      await $.store.set(provisionKey(cwd), { ...pending, state: 'failed', misses, missDay: today })
+      return
+    }
   }
-  await $.store.set(provisionKey(cwd), ask)
-  askedCwd = cwd
-
-  return provisionNote(ids)
+  const ask = await recordAsk($, cwd, sid, mode, 'mod', pending, misses)
+  if (ask === undefined) return
+  ownCreating = cwd
+  const turn = runningTurnId
+  later($, () => ownCreate($, cwd, ask, turn))
 }
 
-/** At the asking session's turn end its claim on the ask ends: other chats may ask again (bug 3). */
-const releaseAsk = async ($: EngineInterface): Promise<void> => {
+/** An own create that never started (its turn ended or stopped qualifying): let go, no miss. */
+const letAskGo = async ($: EngineInterface, cwd: string, gen: number): Promise<void> => {
+  if (askedCwd === cwd) askedCwd = undefined
+  isProvisionAsked = false
+  const pending = asProvision(await $.store.get(provisionKey(cwd)))
+  if (pending === undefined || pending.gen !== gen || pending.state !== 'asked') return
+  await $.store.set(provisionKey(cwd), { ...pending, until: await $.clock.now() })
+}
+
+/** The ask failed: one miss (unless the pair's own record counted it), the folder is done for the day. */
+const failProvision = async ($: EngineInterface, cwd: string, gen: number): Promise<void> => {
+  const pending = asProvision(await $.store.get(provisionKey(cwd)))
+  if (pending === undefined || pending.gen !== gen || pending.state === 'failed') return
+  const now = await $.clock.now()
+  const today = dayOf(now)
+  // A 'done' pair with an "unsaved" create counted its miss already (noteCreated).
+  const misses = (pending.missDay === today ? (pending.misses ?? 0) : 0) + (pending.state === 'asked' ? 1 : 0)
+  await $.store.set(provisionKey(cwd), { ...pending, state: 'failed', misses: Math.max(misses, 1), missDay: today, until: now })
+}
+
+/** One more own "not saved" pair; true once own provisioning is off everywhere (the person is told once). */
+const countOwnUnsaved = async ($: EngineInterface): Promise<boolean> => {
+  const got = record(await $.store.get(OWN_SETUP).catch(() => undefined))
+  if (got?.off === true) return true
+  const unsaved = (typeof got?.unsaved === 'number' ? got.unsaved : 0) + 1
+  if (unsaved < MAX_OWN_UNSAVED) {
+    await $.store.set(OWN_SETUP, { unsaved })
+    return false
+  }
+  await $.store.set(OWN_SETUP, { unsaved, off: true, reason: 'izin modu saklanmadı', at: await $.clock.now() })
+  $.ui.toast(SETUP_OFF_HINT, { timeoutMs: 30000 })
+
+  return true
+}
+
+/**
+ * The mod's own creates of an ask's pair (v0.5.2), one after the other, with
+ * the fields watchScheduled gives the model's (title, static description,
+ * bootstrap prompt, no schedule, no completion notices). Only while the typed
+ * turn that qualified still runs and still qualifies; else the ask is let go.
+ * Each result is recorded as the model's would be (noteCreated). A deny, an
+ * error, no result text or the app's "not saved" ends it: the folder is done
+ * for the day, and the person (never the model) is told once.
+ */
+const ownCreate = async ($: EngineInterface, cwd: string, ask: Provision, turn: string | undefined): Promise<void> => {
+  let failure: string | undefined
+  let isUnsaved = false
+  try {
+    const qualifies =
+      isTurnRunning && runningTurnId === turn && isPersonTurn && !turnHadMachine && (await activeAgents($)).length === 0
+    if (!qualifies) {
+      await letAskGo($, cwd, ask.gen)
+      return
+    }
+    for (const id of ask.ids) {
+      let result: { deny?: string; isError?: boolean; text?: string }
+      try {
+        result = await serialCreate(() =>
+          callTool($, {
+            tool: CREATE_TASK,
+            taskId: id,
+            title: taskTitle(cwd, id),
+            description: TASK_DESCRIPTION,
+            prompt: BOOTSTRAP_PROMPT,
+            notifyOnCompletion: false,
+          }),
+        )
+      } catch (error) {
+        result = { isError: true, text: String(error) }
+      }
+      if (result.deny !== undefined) {
+        failure = 'izin verilmedi'
+        break
+      }
+      if (result.isError === true || result.text === undefined) {
+        failure = 'görev aracı hata verdi'
+        break
+      }
+      await noteCreated($, cwd, id, result.text)
+      if (savedFrom(result.text) === false) {
+        failure = 'uygulama izin modunu görevle saklamadı'
+        isUnsaved = true
+        break
+      }
+    }
+  } finally {
+    if (ownCreating === cwd) ownCreating = undefined
+  }
+  if (failure === undefined) return
+  $.ui.log(`otomatik-devir: görev çifti ${ask.ids.join(', ')} kurulamadı: ${failure}`, { to: 'debug' })
+  await failProvision($, cwd, ask.gen)
+  if (isUnsaved && (await countOwnUnsaved($))) return
+  await failHintOnce($, cwd, failure)
+}
+
+/**
+ * At the end of the asking session's typed turn its claim on the ask ends:
+ * other chats may ask again (bug 3). An ask that turn left incomplete was
+ * ignored or refused: one miss, and the folder is done for the day
+ * (v0.5.2). A machine's turn ending keeps a `/devir hazirla` ask waiting for
+ * the person's send; the mod's own creates still running decide themselves.
+ */
+const releaseAsk = async ($: EngineInterface, wasPersonTurn: boolean): Promise<void> => {
   const cwd = askedCwd
+  if (cwd === undefined || !wasPersonTurn) return
   askedCwd = undefined
-  if (cwd === undefined) return
   const sid = await $.session.id()
   const pending = asProvision(await $.store.get(provisionKey(cwd)))
   if (pending === undefined || pending.state !== 'asked' || pending.by !== sid) return
-  await $.store.set(provisionKey(cwd), { ...pending, until: await $.clock.now() })
+  const now = await $.clock.now()
+  const isComplete = pending.ids.every(id => pending.created?.[id] !== undefined)
+  if (isComplete || ownCreating === cwd) {
+    await $.store.set(provisionKey(cwd), { ...pending, until: now })
+    return
+  }
+  const today = dayOf(now)
+  const misses = (pending.missDay === today ? (pending.misses ?? 0) : 0) + 1
+  await $.store.set(provisionKey(cwd), { ...pending, until: now, state: 'failed', misses, missDay: today })
+}
+
+/** Puts the open request in the person's prompt box; where no box takes it, a toast shows the same text. */
+const fillRequest = async ($: EngineInterface, text: string): Promise<void> => {
+  // An engine without the call (or one that throws) falls back to the toast as well.
+  let filled: { isFilled: boolean } | undefined
+  try {
+    filled = await $.prompt.fill({ text })
+  } catch {
+    filled = undefined
+  }
+  if (filled?.isFilled === true) return
+  $.ui.toast(`otomatik-devir: giriş kutusu doldurulamadı; şu isteği kopyalayıp kendiniz gönderin:\n\n${text}`, {
+    timeoutMs: 60000,
+  })
+}
+
+/**
+ * `/devir hazirla` (v0.5.2): the person sets the folder's pair up by hand.
+ * An ask is recorded for this folder and session (new ids as the mod's own
+ * would get), the "not saved" stop is lifted, and an open request goes into
+ * the prompt box for the person to read and send. The model's creates in
+ * that typed turn are recorded as any (watchScheduled → noteCreated).
+ */
+const prepareByHand = async ($: EngineInterface): Promise<{ text: string }> => {
+  if (!chainCapable) {
+    return { text: 'Devir zinciri bu oturumda yok: Claude masaüstünün zamanlanmış görev araçları gerekir.' }
+  }
+  const mode = selfInfo.permissionMode
+  if (!isSavable(mode)) {
+    return {
+      text: 'Uygulama izin modunu görevle yalnızca Auto ya da Bypass modundaki bir sohbette saklar. Mod menüsünden Auto ya da Bypass seçip /devir hazirla yazın.',
+    }
+  }
+  await $.store.delete(OWN_SETUP).catch(() => undefined)
+  const cwd = await $.session.cwd()
+  const sid = await $.session.id()
+  const pair = await readPair($, cwd)
+  if (pair !== undefined && pair.gen > 0 && (await pairMode($, pair)) === mode) {
+    return { text: `Bu klasörün görev çifti bu modda zaten hazır (${pair.ids.join(', ')}).` }
+  }
+  const pending = asProvision(await $.store.get(provisionKey(cwd)).catch(() => undefined))
+  const today = dayOf(await $.clock.now())
+  const misses = pending?.missDay === today ? (pending.misses ?? 0) : 0
+  const ask = await recordAsk($, cwd, sid, mode, 'hazirla', pending, misses)
+  if (ask === undefined) return { text: `Bu klasörde görev kuşağı sınırına (${MAX_GEN}) gelindi.` }
+  const request = provisionRequest(ask.ids)
+  later($, () => fillRequest($, request))
+
+  return {
+    text: `Görev çifti isteği (${ask.ids.join(', ')}) giriş kutusuna yazılıyor: okuyun ve kendiniz gönderin.`,
+  }
 }
 
 /**
@@ -3032,8 +3259,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'devir',
-      description: 'Otomatik devir: durum, esik <n>, otomatik, sor, simdi, kapat, ac, gec',
-      argumentHint: '[esik <n> | otomatik | sor | simdi | kapat | ac | gec]',
+      description: 'Otomatik devir: durum, esik <n>, otomatik, sor, simdi, kapat, ac, gec, hazirla',
+      argumentHint: '[esik <n> | otomatik | sor | simdi | kapat | ac | gec | hazirla]',
     })
     isPersonTurn = false
     isNextTurnPerson = false
@@ -3043,6 +3270,7 @@ export const register: Register = on => {
     turnHadMachine = false
     isProvisionAsked = false
     askedCwd = undefined
+    ownCreating = undefined
     isModeNoted = false
     isRoleKnown = false
     isRunChat = false
@@ -3178,9 +3406,15 @@ export const register: Register = on => {
     if (result.deny !== undefined) return result
     // The gate picks (a) or (s) where it exists; else (a) in a turn the person
     // typed, (s) in any other.
-    // The handoff first; otherwise, in a qualifying typed turn, the v0.5 pre-provisioning.
-    const note = (await tripMidTurn($)) ?? (await provisionCheck($))
-    if (note === undefined) return result
+    // The handoff first; otherwise, in a qualifying typed turn, the v0.5.2
+    // pre-provisioning: the mod's own creates, never a note to the model.
+    const note = await tripMidTurn($)
+    if (note === undefined) {
+      await provisionCheck($).catch(error =>
+        $.ui.log(`otomatik-devir: ön hazırlık: ${String(error)}`, { to: 'debug' }),
+      )
+      return result
+    }
 
     return { ...result, context: [...(result.context ?? []), note] } as typeof result
   })
@@ -3222,7 +3456,7 @@ export const register: Register = on => {
     gateOpen = undefined
     runningTurnId = undefined
     idleSince = await $.clock.now()
-    await releaseAsk($).catch(() => undefined)
+    await releaseAsk($, wasPersonTurn).catch(() => undefined)
     const settings = await readSettings($)
     const percent = await contextPercent($)
     $.ui.status(statusText(settings, percent))
@@ -3429,6 +3663,8 @@ export const register: Register = on => {
           const pending = asProvision(await $.store.get(key))
           if (pending !== undefined && (pending.misses ?? 0) > 0) await $.store.set(key, { ...pending, misses: 0 })
         }
+        // And the mod's own provisioning, if "not saved" pairs turned it off (v0.5.2).
+        await $.store.delete(OWN_SETUP).catch(() => undefined)
 
         return { text: 'Devir modu: otomatik (sormadan geçer).' }
       }
@@ -3501,6 +3737,8 @@ export const register: Register = on => {
 
         return { text: 'Yeni sohbete geçiliyor.' }
       }
+      case 'hazirla':
+        return prepareByHand($)
       case '': {
         const percent = await contextPercent($)
 
@@ -3509,7 +3747,7 @@ export const register: Register = on => {
         }
       }
       default:
-        return { text: 'Kullanım: /devir [esik <n> | otomatik | sor | simdi | kapat | ac | gec]' }
+        return { text: 'Kullanım: /devir [esik <n> | otomatik | sor | simdi | kapat | ac | gec | hazirla]' }
     }
   })
 

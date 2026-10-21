@@ -1724,7 +1724,13 @@ const watchScheduled = async (
     // A create retried under the app's suggested free id ("...-a-2") would
     // make a task outside the pair, with the default prompt and notices (N10).
     const base = OWN_TASK_RETRY.exec(taskId)?.[1]
-    if (base !== undefined && isThisFolder(base, await $.session.cwd())) {
+    const here = await $.session.cwd()
+    if (base !== undefined && isThisFolder(base, here)) {
+      // A pair being set up (review L5): never told to run it, that would open a chat nobody asked for.
+      const setup = asProvision(await $.store.get(provisionKey(here)).catch(() => undefined))
+      if (setup?.ids.includes(base) === true) {
+        return { deny: `otomatik-devir: "${base}" görevi zaten var; yeniden oluşturma ve çalıştırma. Kullanıcıya görevin zaten var olduğunu söyle.` }
+      }
       return { deny: `otomatik-devir: "${base}" görevi zaten var; yeni görev oluşturma, onu ${RUN_TASK} ile çalıştır.` }
     }
   }
@@ -2001,10 +2007,12 @@ const MODE_PREFIX = 'gorevModu:'
 const HINT_PREFIX = 'ipucu:'
 // The mod's own create of this folder's pair failed and the person was told (one toast per folder).
 const SETUP_FAIL_PREFIX = 'kurulumUyari:'
-// The mod's own creates, across folders: "not saved" pairs counted; at
-// MAX_OWN_UNSAVED it turns itself off until `/devir otomatik` or `/devir hazirla`.
+// The mod's own creates, across folders: failures counted (any kind); at
+// MAX_OWN_FAILS it turns itself off until `/devir otomatik` or `/devir hazirla`.
 const OWN_SETUP = 'kendiKurulum'
-const MAX_OWN_UNSAVED = 2
+const MAX_OWN_FAILS = 2
+// Failed days of the mod's own create in one folder before it stops there (review M2).
+const MAX_FAIL_DAYS = 2
 const RELAY_TICK_MS = 5000
 // A relay whose heartbeat is older than this is gone: another session takes over.
 const RELAY_STALE_MS = 30 * 1000
@@ -2062,6 +2070,15 @@ type Provision = {
   /** "Not saved" pairs on `missDay` (UTC date); at MAX_PROVISION_MISSES no more asks that day. */
   misses?: number
   missDay?: string
+  /** Let go before its creates ran (the turn ended or stopped qualifying): no one's miss (review L1). */
+  released?: true
+  /** A create may have made its task (an error, no text, a timeout): the next ask takes new ids (review M2). */
+  burned?: true
+  /** Days on which the mod's own create failed here; at MAX_FAIL_DAYS, or on an unknown wording, `stopped`. */
+  failDays?: number
+  failDay?: string
+  /** No more own creates in this folder until `/devir hazirla` or `/devir otomatik` (review M1, M2). */
+  stopped?: true
 }
 /** A run chat's handoff request, one-shot: pending → claimed (one relay) → done | failed. */
 export type ChainRequest = {
@@ -2310,11 +2327,11 @@ const hintOnce = async ($: EngineInterface, cwd: string): Promise<void> => {
 
 /** The mod's own create of a folder's pair failed: said once per folder, to the person only. */
 export const setupFailHint = (reason: string): string =>
-  `Devir zinciri: mod bu klasörün görev çiftini kendisi oluşturamadı (${reason}); bugün bu klasörde yeniden denemeyecek. Elle kurmak için Auto ya da Bypass modunda /devir hazirla yazıp giriş kutusuna gelen isteği gönderin.`
+  `Devir zinciri: mod bu klasörün görev çiftini kendisi oluşturamadı (${reason}); bu klasörde kendiliğinden yeniden denemesi sınırlı (en çok iki gün, bazı durumlarda hiç). Elle kurmak için Auto ya da Bypass modunda /devir hazirla yazıp giriş kutusuna gelen isteği gönderin.`
 
-/** The mod's own creates were "not saved" MAX_OWN_UNSAVED times: it stopped everywhere (one toast). */
-export const SETUP_OFF_HINT =
-  'Devir zinciri: mod iki kez görev çifti oluşturdu ama uygulama izin modunu görevle saklamadı; kendi kendine kurulumu her klasörde kapattı. Kurmak için Auto ya da Bypass modundaki normal bir sohbette /devir hazirla yazıp giriş kutusuna gelen isteği gönderin (/devir otomatik de yeniden açar).'
+/** The mod's own creates failed MAX_OWN_FAILS times: it stopped everywhere (one toast). */
+export const setupOffHint = (reason: string): string =>
+  `Devir zinciri: modun kendi görev oluşturması iki kez olmadı (son neden: ${reason}); kendi kendine kurulumu her klasörde kapattı. Kurmak için Auto ya da Bypass modundaki normal bir sohbette /devir hazirla yazıp giriş kutusuna gelen isteği gönderin (/devir otomatik de yeniden açar).`
 
 const failHintOnce = async ($: EngineInterface, cwd: string, reason: string): Promise<void> => {
   const key = `${SETUP_FAIL_PREFIX}${hashOf(cwd)}`
@@ -2936,15 +2953,18 @@ const startRelay = ($: EngineInterface): void => {
   })
 }
 
-/** The mod's own provisioning is off everywhere (MAX_OWN_UNSAVED "not saved" pairs, v0.5.2). */
+/** The mod's own provisioning is off everywhere (MAX_OWN_FAILS own failures, v0.5.2). */
 const isOwnSetupOff = async ($: EngineInterface): Promise<boolean> =>
   record(await $.store.get(OWN_SETUP).catch(() => undefined))?.off === true
 
 /**
- * Records this session's ask for the folder's next pair: an earlier ask
- * nothing was created from keeps its ids, else the next generation
- * (undefined past MAX_GEN). Other chats in the folder are held off until
- * this session's typed turn ends or ASK_TTL_MS passes.
+ * Records this session's ask for the folder's next pair. An earlier ask
+ * nothing was created from keeps its ids; so does one the mod left half made
+ * with its first task saved (its own ask then makes only the missing one,
+ * review M3). Anything else takes the next generation (undefined past
+ * MAX_GEN). Other chats in the folder are held off until this session's
+ * typed turn ends or ASK_TTL_MS passes. A `/devir hazirla` ask starts the
+ * folder afresh (no failed days, no stop).
  */
 const recordAsk = async (
   $: EngineInterface,
@@ -2956,8 +2976,12 @@ const recordAsk = async (
   misses: number,
 ): Promise<Provision | undefined> => {
   const pair = await readPair($, cwd)
-  const isUnused = pending !== undefined && pending.state !== 'done' && Object.keys(pending.created ?? {}).length === 0
-  const gen = isUnused ? pending.gen : Math.max(pair?.gen ?? 0, pending?.gen ?? 0) + 1
+  const created = pending?.created ?? {}
+  const made = Object.keys(created)
+  const isOpen = pending !== undefined && pending.state !== 'done' && pending.burned !== true
+  const isUnused = isOpen && made.length === 0
+  const isPartial = via === 'mod' && isOpen && made.length > 0 && made.every(id => created[id] === 'saved')
+  const gen = pending !== undefined && (isUnused || isPartial) ? pending.gen : Math.max(pair?.gen ?? 0, pending?.gen ?? 0) + 1
   if (gen > MAX_GEN) return undefined
   const now = await $.clock.now()
   const ask: Provision = {
@@ -2967,12 +2991,13 @@ const recordAsk = async (
     model: selfInfo.model,
     at: now,
     state: 'asked',
-    created: {},
+    created: isPartial ? { ...created } : {},
     by: sid,
     via,
     until: now + ASK_TTL_MS,
     misses,
     missDay: dayOf(now),
+    ...(via === 'mod' && pending?.failDays !== undefined ? { failDays: pending.failDays, failDay: pending.failDay } : {}),
   }
   await $.store.set(provisionKey(cwd), ask)
   isProvisionAsked = true
@@ -2989,10 +3014,12 @@ const recordAsk = async (
  * or opened it, no agent still running, not a run chat), while the folder
  * has no pair ready in that mode. Never in Auto: there the app's classifier
  * may raise a card, mid-task, for a call the person did not ask for; Auto
- * provisions only through `/devir hazirla`. A failed own create stops it in
- * that folder for the day (MAX_PROVISION_MISSES still caps the misses);
- * MAX_OWN_UNSAVED "not saved" pairs stop it everywhere until `/devir
- * otomatik` or `/devir hazirla`.
+ * provisions only through `/devir hazirla`. Fail-safe: a failed own create
+ * ends the folder's day, MAX_FAIL_DAYS failed days (or one unknown wording)
+ * stop the folder, MAX_OWN_FAILS failures stop it everywhere, each told to
+ * the person once; only `/devir hazirla` or `/devir otomatik` lift a stop.
+ * A terminal answer is kept for the session, so later tool results skip
+ * the check (review L4).
  */
 const provisionCheck = async ($: EngineInterface): Promise<void> => {
   if (!chainCapable || isProvisionAsked || !isPersonTurn || turnHadMachine || !isRoleKnown || isRunChat) return
@@ -3000,24 +3027,25 @@ const provisionCheck = async ($: EngineInterface): Promise<void> => {
   if (mode !== 'bypassPermissions') return
   const settings = await readSettings($)
   if (!settings.isEnabled || settings.mode !== 'otomatik') return
-  if (await isOwnSetupOff($)) return
+  const settle = (): void => {
+    isProvisionAsked = true
+  }
+  if (await isOwnSetupOff($)) return settle()
   const held = await read($, conv)
   const sid = await $.session.id()
   if (held !== null && held.sid === sid && (held.phase === 'handoff_running' || held.phase === 'deferred')) return
   if ((await activeAgents($)).length > 0) return
   const cwd = await $.session.cwd()
   const pair = await readPair($, cwd)
-  if (pair !== undefined && pair.gen > 0 && (await pairMode($, pair)) === mode) {
-    isProvisionAsked = true
-    return
-  }
+  if (pair !== undefined && pair.gen > 0 && (await pairMode($, pair)) === mode) return settle()
   const now = await $.clock.now()
   const pending = asProvision(await $.store.get(provisionKey(cwd)))
   const today = dayOf(now)
   let misses = pending?.missDay === today ? (pending.misses ?? 0) : 0
+  if (pending?.stopped === true) return settle()
   // A failed own create, or an ask left unanswered, ends the folder's day (D2).
-  if (pending?.state === 'failed' && misses > 0) return
-  if (misses >= MAX_PROVISION_MISSES) return
+  if (pending?.state === 'failed' && misses > 0) return settle()
+  if (misses >= MAX_PROVISION_MISSES) return settle()
   // Another chat's open ask holds off this one only until its turn ends or
   // ASK_TTL_MS passes, never for hours (v0.5 live check, bug 3).
   const isHeldElsewhere =
@@ -3027,52 +3055,111 @@ const provisionCheck = async ($: EngineInterface): Promise<void> => {
     pending.by !== sid &&
     now < Math.min(pending.until ?? Number.POSITIVE_INFINITY, pending.at + ASK_TTL_MS)
   if (isHeldElsewhere) return
-  // An ask another chat left incomplete (it ended or vanished first) is one miss before the retry.
-  if (pending !== undefined && pending.state === 'asked' && pending.by !== sid && pending.ids.some(id => pending.created?.[id] === undefined)) {
+  // An ask another chat left incomplete (it ended or vanished first) is one
+  // miss before the retry; one let go before its creates ran is no one's (L1).
+  if (
+    pending !== undefined &&
+    pending.state === 'asked' &&
+    pending.released !== true &&
+    pending.by !== sid &&
+    pending.ids.some(id => pending.created?.[id] === undefined)
+  ) {
     misses += 1
     if (misses >= MAX_PROVISION_MISSES) {
       await $.store.set(provisionKey(cwd), { ...pending, state: 'failed', misses, missDay: today })
-      return
+      return settle()
     }
   }
   const ask = await recordAsk($, cwd, sid, mode, 'mod', pending, misses)
-  if (ask === undefined) return
+  if (ask === undefined) {
+    await failHintOnce($, cwd, `görev kuşağı sınırına (${MAX_GEN}) gelindi`)
+    return settle()
+  }
   ownCreating = cwd
   const turn = runningTurnId
   later($, () => ownCreate($, cwd, ask, turn))
 }
 
-/** An own create that never started (its turn ended or stopped qualifying): let go, no miss. */
-const letAskGo = async ($: EngineInterface, cwd: string, gen: number): Promise<void> => {
+/** The typed turn that qualified still runs and still qualifies (read again after every wait). */
+const isTurnStill = (turn: string | undefined): boolean =>
+  isTurnRunning && runningTurnId === turn && isPersonTurn && !turnHadMachine
+
+/**
+ * Right before each own create (review M2, M3): the same typed turn still
+ * open and qualifying, no agent running, the live permission mode (read
+ * fresh, not the turn start's) Bypass, and the ask still this session's.
+ */
+const mayCreateNow = async ($: EngineInterface, cwd: string, ask: Provision, turn: string | undefined): Promise<boolean> => {
+  if (!isTurnStill(turn)) return false
+  if ((await activeAgents($)).length > 0) return false
+  if ((await selfSession($)).permissionMode !== 'bypassPermissions') return false
+  const pending = asProvision(await $.store.get(provisionKey(cwd)).catch(() => undefined))
+  if (pending?.gen !== ask.gen || pending.by !== ask.by || pending.state !== 'asked') return false
+
+  return isTurnStill(turn)
+}
+
+/**
+ * An own create that stopped before a call (its turn ended or stopped
+ * qualifying, the mode changed): let go, no one's miss (L1). A task it did
+ * make stays in the record, so the next ask reuses these ids (M3).
+ */
+const letAskGo = async ($: EngineInterface, cwd: string, ask: Provision): Promise<void> => {
   if (askedCwd === cwd) askedCwd = undefined
   isProvisionAsked = false
   const pending = asProvision(await $.store.get(provisionKey(cwd)))
-  if (pending === undefined || pending.gen !== gen || pending.state !== 'asked') return
-  await $.store.set(provisionKey(cwd), { ...pending, until: await $.clock.now() })
+  if (pending === undefined || pending.gen !== ask.gen || pending.by !== ask.by || pending.state !== 'asked') return
+  await $.store.set(provisionKey(cwd), { ...pending, until: await $.clock.now(), released: true })
 }
 
-/** The ask failed: one miss (unless the pair's own record counted it), the folder is done for the day. */
-const failProvision = async ($: EngineInterface, cwd: string, gen: number): Promise<void> => {
+type OwnFailure = {
+  reason: string
+  /** The call may have made its task: the next ask takes new ids. */
+  isBurned?: true
+  /** No retry here until `/devir hazirla` or `/devir otomatik`, whatever the day. */
+  isFinal?: true
+}
+
+/**
+ * This session's own ask failed: one miss (unless the pair's own record
+ * counted it), the folder's day is over, one more failed day; at
+ * MAX_FAIL_DAYS (or a final failure) the folder stops (M2). Another chat's
+ * record is never written over (review L2): false when it was not ours.
+ */
+const failProvision = async ($: EngineInterface, cwd: string, ask: Provision, failure: OwnFailure): Promise<boolean> => {
   const pending = asProvision(await $.store.get(provisionKey(cwd)))
-  if (pending === undefined || pending.gen !== gen || pending.state === 'failed') return
+  if (pending === undefined || pending.gen !== ask.gen || pending.by !== ask.by || pending.state === 'failed') return false
   const now = await $.clock.now()
   const today = dayOf(now)
   // A 'done' pair with an "unsaved" create counted its miss already (noteCreated).
   const misses = (pending.missDay === today ? (pending.misses ?? 0) : 0) + (pending.state === 'asked' ? 1 : 0)
-  await $.store.set(provisionKey(cwd), { ...pending, state: 'failed', misses: Math.max(misses, 1), missDay: today, until: now })
+  const failDays = pending.failDay === today ? Math.max(pending.failDays ?? 1, 1) : (pending.failDays ?? 0) + 1
+  await $.store.set(provisionKey(cwd), {
+    ...pending,
+    state: 'failed',
+    misses: Math.max(misses, 1),
+    missDay: today,
+    until: now,
+    failDays,
+    failDay: today,
+    ...(failure.isBurned === true ? { burned: true } : {}),
+    ...(failure.isFinal === true || failDays >= MAX_FAIL_DAYS ? { stopped: true } : {}),
+  })
+
+  return true
 }
 
-/** One more own "not saved" pair; true once own provisioning is off everywhere (the person is told once). */
-const countOwnUnsaved = async ($: EngineInterface): Promise<boolean> => {
+/** One more own failure, of any kind; true once own provisioning is off everywhere (the person is told once). */
+const countOwnFailure = async ($: EngineInterface, reason: string): Promise<boolean> => {
   const got = record(await $.store.get(OWN_SETUP).catch(() => undefined))
   if (got?.off === true) return true
-  const unsaved = (typeof got?.unsaved === 'number' ? got.unsaved : 0) + 1
-  if (unsaved < MAX_OWN_UNSAVED) {
-    await $.store.set(OWN_SETUP, { unsaved })
+  const fails = (typeof got?.fails === 'number' ? got.fails : 0) + 1
+  if (fails < MAX_OWN_FAILS) {
+    await $.store.set(OWN_SETUP, { fails })
     return false
   }
-  await $.store.set(OWN_SETUP, { unsaved, off: true, reason: 'izin modu saklanmadı', at: await $.clock.now() })
-  $.ui.toast(SETUP_OFF_HINT, { timeoutMs: 30000 })
+  await $.store.set(OWN_SETUP, { fails, off: true, reason, at: await $.clock.now() })
+  $.ui.toast(setupOffHint(reason), { timeoutMs: 30000 })
 
   return true
 }
@@ -3080,61 +3167,71 @@ const countOwnUnsaved = async ($: EngineInterface): Promise<boolean> => {
 /**
  * The mod's own creates of an ask's pair (v0.5.2), one after the other, with
  * the fields watchScheduled gives the model's (title, static description,
- * bootstrap prompt, no schedule, no completion notices). Only while the typed
- * turn that qualified still runs and still qualifies; else the ask is let go.
- * Each result is recorded as the model's would be (noteCreated). A deny, an
- * error, no result text or the app's "not saved" ends it: the folder is done
- * for the day, and the person (never the model) is told once.
+ * bootstrap prompt, no schedule, no completion notices). Before each:
+ * mayCreateNow, then the engine's verdict ($.tool.check: no dialog, no
+ * classifier); anything but allow is not called (it would need a card in
+ * the person's task). Each call is bounded (CALL_LIMIT_MS) and its result
+ * recorded as the model's would be (noteCreated). A deny, an error, no text,
+ * a timeout, an ask verdict, "not saved" or an unknown wording ends it as a
+ * failure, told to the person (never the model) once.
  */
 const ownCreate = async ($: EngineInterface, cwd: string, ask: Provision, turn: string | undefined): Promise<void> => {
-  let failure: string | undefined
-  let isUnsaved = false
+  let failure: OwnFailure | undefined
+  let isLetGo = false
   try {
-    const qualifies =
-      isTurnRunning && runningTurnId === turn && isPersonTurn && !turnHadMachine && (await activeAgents($)).length === 0
-    if (!qualifies) {
-      await letAskGo($, cwd, ask.gen)
-      return
-    }
     for (const id of ask.ids) {
-      let result: { deny?: string; isError?: boolean; text?: string }
-      try {
-        result = await serialCreate(() =>
-          callTool($, {
-            tool: CREATE_TASK,
-            taskId: id,
-            title: taskTitle(cwd, id),
-            description: TASK_DESCRIPTION,
-            prompt: BOOTSTRAP_PROMPT,
-            notifyOnCompletion: false,
-          }),
-        )
-      } catch (error) {
-        result = { isError: true, text: String(error) }
+      if (ask.created[id] !== undefined) continue
+      if (!(await mayCreateNow($, cwd, ask, turn))) {
+        isLetGo = true
+        break
       }
+      const args = {
+        taskId: id,
+        title: taskTitle(cwd, id),
+        description: TASK_DESCRIPTION,
+        prompt: BOOTSTRAP_PROMPT,
+        notifyOnCompletion: false,
+      }
+      const verdict = await $.tool.check({ tool: CREATE_TASK, input: args }).catch(() => undefined)
+      if (verdict?.decision !== 'allow') {
+        failure = { reason: 'görev oluşturma onay isterdi' }
+        break
+      }
+      const result = await serialCreate(() => boundedCall($, { tool: CREATE_TASK, ...args }))
       if (result.deny !== undefined) {
-        failure = 'izin verilmedi'
+        failure = { reason: 'izin verilmedi' }
         break
       }
       if (result.isError === true || result.text === undefined) {
-        failure = 'görev aracı hata verdi'
+        failure = { reason: result.isTimeout === true ? 'görev aracı yanıt vermedi' : 'görev aracı hata verdi', isBurned: true }
         break
       }
-      await noteCreated($, cwd, id, result.text)
-      if (savedFrom(result.text) === false) {
-        failure = 'uygulama izin modunu görevle saklamadı'
-        isUnsaved = true
+      await noteCreated($, cwd, id, result.text, ask.by)
+      const said = savedFrom(result.text)
+      if (said === false) {
+        failure = { reason: 'uygulama izin modunu görevle saklamadı' }
+        break
+      }
+      if (said === undefined) {
+        // An app wording the mod does not know: it cannot tell a usable pair,
+        // so it stops here rather than make one per chat (review M1).
+        failure = { reason: 'uygulamanın cevabı izin modunun saklandığını söylemedi', isFinal: true }
         break
       }
     }
   } finally {
     if (ownCreating === cwd) ownCreating = undefined
   }
+  if (isLetGo) {
+    await letAskGo($, cwd, ask)
+    return
+  }
   if (failure === undefined) return
-  $.ui.log(`otomatik-devir: görev çifti ${ask.ids.join(', ')} kurulamadı: ${failure}`, { to: 'debug' })
-  await failProvision($, cwd, ask.gen)
-  if (isUnsaved && (await countOwnUnsaved($))) return
-  await failHintOnce($, cwd, failure)
+  $.ui.log(`otomatik-devir: görev çifti ${ask.ids.join(', ')} kurulamadı: ${failure.reason}`, { to: 'debug' })
+  // Another chat took the folder's record meanwhile: its outcome is its own to tell.
+  if (!(await failProvision($, cwd, ask, failure))) return
+  if (await countOwnFailure($, failure.reason)) return
+  await failHintOnce($, cwd, failure.reason)
 }
 
 /**
@@ -3150,7 +3247,7 @@ const releaseAsk = async ($: EngineInterface, wasPersonTurn: boolean): Promise<v
   askedCwd = undefined
   const sid = await $.session.id()
   const pending = asProvision(await $.store.get(provisionKey(cwd)))
-  if (pending === undefined || pending.state !== 'asked' || pending.by !== sid) return
+  if (pending === undefined || pending.state !== 'asked' || pending.by !== sid || pending.released === true) return
   const now = await $.clock.now()
   const isComplete = pending.ids.every(id => pending.created?.[id] !== undefined)
   if (isComplete || ownCreating === cwd) {
@@ -3179,16 +3276,25 @@ const fillRequest = async ($: EngineInterface, text: string): Promise<void> => {
 
 /**
  * `/devir hazirla` (v0.5.2): the person sets the folder's pair up by hand.
- * An ask is recorded for this folder and session (new ids as the mod's own
- * would get), the "not saved" stop is lifted, and an open request goes into
- * the prompt box for the person to read and send. The model's creates in
- * that typed turn are recorded as any (watchScheduled → noteCreated).
+ * The permission mode is read fresh (the menu may have changed since the
+ * last turn, review M4). An ask is recorded for this folder and session (new
+ * ids as the mod's own would get), the folder's and the global stops are
+ * lifted, and an open request goes into the prompt box for the person to
+ * read and send. It holds until the end of their next typed turn (or
+ * ASK_TTL_MS). The model's creates in that turn are recorded as any
+ * (watchScheduled → noteCreated).
  */
 const prepareByHand = async ($: EngineInterface): Promise<{ text: string }> => {
   if (!chainCapable) {
     return { text: 'Devir zinciri bu oturumda yok: Claude masaüstünün zamanlanmış görev araçları gerekir.' }
   }
-  const mode = selfInfo.permissionMode
+  const live = await selfSession($)
+  const mode = live.permissionMode
+  if (live.id === undefined || mode === undefined) {
+    return { text: 'Bu sohbetin izin modu okunamadı; biraz sonra /devir hazirla yazıp yeniden deneyin.' }
+  }
+  selfInfo = live
+  isRoleKnown = true
   if (!isSavable(mode)) {
     return {
       text: 'Uygulama izin modunu görevle yalnızca Auto ya da Bypass modundaki bir sohbette saklar. Mod menüsünden Auto ya da Bypass seçip /devir hazirla yazın.',
@@ -3196,6 +3302,7 @@ const prepareByHand = async ($: EngineInterface): Promise<{ text: string }> => {
   }
   await $.store.delete(OWN_SETUP).catch(() => undefined)
   const cwd = await $.session.cwd()
+  await $.store.delete(`${SETUP_FAIL_PREFIX}${hashOf(cwd)}`).catch(() => undefined)
   const sid = await $.session.id()
   const pair = await readPair($, cwd)
   if (pair !== undefined && pair.gen > 0 && (await pairMode($, pair)) === mode) {
@@ -3220,10 +3327,18 @@ const prepareByHand = async ($: EngineInterface): Promise<{ text: string }> => {
  * becomes the folder's active one (saved mode, or null when the app said
  * "not saved": such a pair is never dispatched, and it counts a miss).
  */
-const noteCreated = async ($: EngineInterface, cwd: string, id: string, text: string | undefined): Promise<void> => {
+const noteCreated = async (
+  $: EngineInterface,
+  cwd: string,
+  id: string,
+  text: string | undefined,
+  by?: string,
+): Promise<void> => {
   const pending = asProvision(await $.store.get(provisionKey(cwd)))
   later($, () => writeModelLine($, id, pending?.model ?? selfInfo.model))
   if (pending === undefined || !pending.ids.includes(id) || pending.state !== 'asked') return
+  // The mod's own create records only into its own session's ask (review L2).
+  if (by !== undefined && pending.by !== by) return
   const said = savedFrom(text)
   if (said === undefined) {
     $.ui.log(`otomatik-devir: ${id} oluşturma sonucunda bilinen bir izin modu cümlesi yok: ${text ?? ''}`, { to: 'debug' })
@@ -3657,11 +3772,17 @@ export const register: Register = on => {
       }
       case 'otomatik': {
         await $.store.set('mod', 'otomatik')
-        // Re-issued: pre-provisioning may ask again today (v0.5 review H3).
+        // Re-issued: pre-provisioning may ask again today (v0.5 review H3), a
+        // stopped folder too, and each folder's failure is told again (0.5.2 M2).
         for (const key of await $.store.keys().catch(() => [] as string[])) {
+          if (key.startsWith(SETUP_FAIL_PREFIX)) await $.store.delete(key).catch(() => undefined)
           if (!key.startsWith(PROVISION_PREFIX)) continue
           const pending = asProvision(await $.store.get(key))
-          if (pending !== undefined && (pending.misses ?? 0) > 0) await $.store.set(key, { ...pending, misses: 0 })
+          if (pending === undefined) continue
+          if ((pending.misses ?? 0) > 0 || pending.stopped === true || pending.failDays !== undefined) {
+            const { stopped: _stopped, failDays: _days, failDay: _day, ...rest } = pending
+            await $.store.set(key, { ...rest, misses: 0 })
+          }
         }
         // And the mod's own provisioning, if "not saved" pairs turned it off (v0.5.2).
         await $.store.delete(OWN_SETUP).catch(() => undefined)

@@ -14,8 +14,8 @@ import {
   scheduledHandoff,
   scheduledPlan,
   SETUP_HINT,
-  SETUP_OFF_HINT,
   setupFailHint,
+  setupOffHint,
   syncText,
   taskPrompt,
 } from '../hooks/register.tsx'
@@ -53,6 +53,7 @@ const SAVED_LIVE =
   'This task was saved in Bypass permissions mode because this session is in it: its runs use tools and connectors without asking first…'
 const SAVED_AUTO = 'This task was saved in Auto mode because this session is in it'
 const NOT_SAVED_LIVE = "This session's permission mode was not saved with this task"
+const OFF_UNSAVED = setupOffHint('uygulama izin modunu görevle saklamadı')
 // The app's refusal of the gate in an unattended run (live check, verbatim).
 const UNATTENDED =
   'Starting sessions requires a user at the keyboard; this session runs unattended (scheduled or remotely dispatched).'
@@ -102,6 +103,10 @@ const setup = (on: any, store: Record<string, unknown>) => {
     // What $.prompt.fill put in the box, and whether a box took it.
     fills: [] as string[],
     fillOk: true,
+    // The engine's verdict for $.tool.check, and a create that takes this long (ms of the mock clock).
+    checkDecision: 'allow' as string,
+    checks: [] as any[],
+    createDelayMs: 0,
   }
   const clock = mock.clock(on, { now: 1_000_000 })
   // The mod's store (one JSON file every session shares), open to the test,
@@ -137,7 +142,11 @@ const setup = (on: any, store: Record<string, unknown>) => {
   on('command.run', () => ({}))
   on('agent.list', () => ({ value: world.agents }))
   on('tool.list', () => ({ value: CHAIN_TOOLS.map(name => ({ name, description: '', mcp: true })) }))
-  on('tool.call', ($: any, e: any, next: any) => {
+  on('tool.check', ($: any, e: any) => {
+    world.checks.push(e)
+    return { decision: world.checkDecision }
+  })
+  on('tool.call', async ($: any, e: any, next: any) => {
     world.calls.push(e)
     world.origins.push(next?.origin?.plugin)
     if (world.hang.has(e.tool)) return new Promise(() => undefined)
@@ -165,6 +174,7 @@ const setup = (on: any, store: Record<string, unknown>) => {
       return { result: [], text: `Started a run of ${e.taskId}: session ${id}` }
     }
     if (e.tool === CREATE) {
+      if (world.createDelayMs > 0) await clock.sleep(world.createDelayMs)
       if (world.createResult !== undefined) return world.createResult
       world.created.push(e.taskId)
       // The app writes the task file: name/description frontmatter, then the prompt.
@@ -239,10 +249,12 @@ const callsOf = (world: any, tool: string) => world.calls.filter((c: any) => c.t
 /** The mod's own creates (its $.tool.call), not the model's. */
 const ownCreates = (world: any) =>
   world.calls.filter((c: any, i: number) => c.tool === CREATE && world.origins[i] !== 'engine')
-/** The next UTC day for the folders' provisioning records (their miss day passes). */
+/** The next UTC day for the folders' provisioning records (their miss and fail days pass). */
 const newDay = (world: any) => {
   for (const key of Object.keys(world.store)) {
-    if (key.startsWith('hazirlik:')) world.store[key] = { ...world.store[key], missDay: '1969-12-31' }
+    if (!key.startsWith('hazirlik:')) continue
+    const got = world.store[key]
+    world.store[key] = { ...got, missDay: '1969-12-31', ...(got.failDay === undefined ? {} : { failDay: '1969-12-31' }) }
   }
 }
 /** A turn the person typed: its first tool result's context, after the mod's own work ran. */
@@ -732,8 +744,8 @@ describe('otomatik-devir v0.5 zincir', () => {
     expect(await typedTurn($, clock)).toEqual([])
     await turnEnd($, 'tamam')
     expect(ownCreates(world).map((c: any) => c.taskId)).toEqual([PAIR1[0], PAIR2[0]])
-    expect(world.store['kendiKurulum']).toMatchObject({ off: true, unsaved: 2 })
-    expect(world.toasts.filter((t: string) => t === SETUP_OFF_HINT)).toHaveLength(1)
+    expect(world.store['kendiKurulum']).toMatchObject({ off: true, fails: 2 })
+    expect(world.toasts.filter((t: string) => t === OFF_UNSAVED)).toHaveLength(1)
     newDay(world)
     await become($, world, clock, 's5', { ...SELF })
     expect(await typedTurn($, clock)).toEqual([])
@@ -885,7 +897,7 @@ describe('otomatik-devir v0.5 zincir', () => {
     expect(world.store['aktarici']).toBeUndefined()
   })
 
-  test('(M8) savedFrom yalnızca modun kaydedildiğini söyleyen cümleyi sayar', async ($, on) => {
+  test('(M8) savedFrom yalnızca modun kaydedildiğini söyleyen cümleyi sayar; modun kendi oluşturmasında bilinmeyen cümle klasörü durdurur (R-M1)', async ($, on) => {
     expect(savedFrom(SAVED)).toBe(true)
     expect(savedFrom(NOT_SAVED)).toBe(false)
     // Any other wording is unknown: not a "not saved".
@@ -896,17 +908,27 @@ describe('otomatik-devir v0.5 zincir', () => {
     world.createText = 'Task saved to ~/.claude/scheduled-tasks/x/SKILL.md'
     await become($, world, clock, 's1', { ...SELF })
     expect(await typedTurn($, clock)).toEqual([])
-    expect(ownCreates(world).map((c: any) => c.taskId)).toEqual([...PAIR1])
-    expect(world.store[PAIR_KEY]).toMatchObject({ gen: 1, savedMode: null })
-    // An unknown wording is never a miss (v0.5 live check, bug 1), nor a failure.
-    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({
-      state: 'done',
-      misses: 0,
-      created: { [PAIR1[0]]: 'unknown', [PAIR1[1]]: 'unknown' },
-    })
+    // The first create's wording is unknown: no second task, the folder stops.
+    expect(ownCreates(world).map((c: any) => c.taskId)).toEqual([PAIR1[0]])
     await turnEnd($, 'tamam')
-    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ state: 'done', misses: 0 })
-    expect(world.toasts).toEqual([])
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({
+      gen: 1, state: 'failed', stopped: true, created: { [PAIR1[0]]: 'unknown' },
+    })
+    expect(world.store['kendiKurulum']).toMatchObject({ fails: 1 })
+    expect(world.toasts).toEqual([setupFailHint('uygulamanın cevabı izin modunun saklandığını söylemedi')])
+    // No new generation for it, whatever the day, in any later chat.
+    for (const sid of ['s2', 's3', 's4']) {
+      newDay(world)
+      await become($, world, clock, sid, { ...SELF })
+      expect(await typedTurn($, clock)).toEqual([])
+      await turnEnd($, 'tamam')
+    }
+    expect(ownCreates(world)).toHaveLength(1)
+    expect(world.toasts).toHaveLength(1)
+    // `/devir hazirla` lifts it: a new generation, by hand.
+    await devir($, 'hazirla')
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ gen: 2, state: 'asked', via: 'hazirla' })
+    expect(world.store[`hazirlik:${HASH}`].stopped).toBeUndefined()
   })
 
   test('(M9) ortak görev meşgulse aktarıcı süre içinde yeniden dener, boşalınca gönderir', async ($, on) => {
@@ -1113,39 +1135,191 @@ describe('otomatik-devir v0.5 zincir', () => {
     for (const turn of world.typed) expect(turn.context).toEqual([])
   })
 
-  test('(P2) modun kendi oluşturması reddedilir / hata verir / "saklanmadı" der: eksik, failed, o gün yeniden deneme yok, klasör başına tek bildirim', async ($, on) => {
+  test('(P2) modun kendi oluşturması reddedilir / hata verir / metinsiz / "saklanmadı": eksik, failed, o gün yeniden deneme yok, klasör başına tek bildirim, küresel sayaca girer', async ($, on) => {
     const { world, clock } = setup(on, { esik: 40, mod: 'otomatik' })
     world.percent = 10
     const cases = [
-      { result: { deny: 'Permission denied' }, reason: 'izin verilmedi' },
-      { result: { result: [], text: 'Scheduled tasks are unavailable.', isError: true }, reason: 'görev aracı hata verdi' },
-      { result: { result: [] }, reason: 'görev aracı hata verdi' },
-      { result: undefined, reason: 'uygulama izin modunu görevle saklamadı' },
+      { cwd: '/p-deny', result: { deny: 'Permission denied' }, reason: 'izin verilmedi', burned: false },
+      { cwd: '/p-error', result: { result: [], text: 'Scheduled tasks are unavailable.', isError: true }, reason: 'görev aracı hata verdi', burned: true },
+      { cwd: '/p-empty', result: { result: [] }, reason: 'görev aracı hata verdi', burned: true },
+      { cwd: '/p-unsaved', result: undefined, reason: 'uygulama izin modunu görevle saklamadı', burned: false },
     ]
     let n = 0
-    for (const { result, reason } of cases) {
+    for (const { cwd, result, reason, burned } of cases) {
+      world.cwd = cwd
+      const key = `hazirlik:${scheduledPlan(cwd, 1).ids[0].split('-')[2]}`
       world.createResult = result
       world.createText = NOT_SAVED_LIVE
+      world.toasts = []
+      delete world.store['kendiKurulum']
       const before = ownCreates(world).length
       await become($, world, clock, `s${++n}`, { ...SELF })
       expect(await typedTurn($, clock)).toEqual([])
       await turnEnd($, 'tamam')
-      // One create tried, the second never made.
+      // One create tried, the second never made; the failure counts toward the global stop.
       expect(ownCreates(world).length - before).toBe(1)
-      expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ state: 'failed', misses: 1 })
-      // The same day, another chat: no retry.
+      expect(world.store[key]).toMatchObject({ state: 'failed', misses: 1, failDays: 1 })
+      expect(world.store[key].burned === true).toBe(burned)
+      expect(world.store['kendiKurulum']).toMatchObject({ fails: 1 })
+      expect(world.toasts).toEqual([setupFailHint(reason)])
+      // The same day, another chat: no retry, no second toast.
       await become($, world, clock, `s${++n}`, { ...SELF })
       expect(await typedTurn($, clock)).toEqual([])
       await turnEnd($, 'tamam')
       expect(ownCreates(world).length - before).toBe(1)
-      if (n === 2) expect(world.toasts).toEqual([setupFailHint(reason)])
-      newDay(world)
+      expect(world.toasts).toHaveLength(1)
     }
-    // One toast for the folder, whatever came after.
+  })
+
+  test('(R1) klasörde iki başarısız günden sonra durur; /devir otomatik ya da /devir hazirla açar; bildirim yeniden söylenebilir', async ($, on) => {
+    const { world, clock } = setup(on, { esik: 40, mod: 'otomatik' })
+    world.percent = 10
+    world.createResult = { deny: 'Permission denied' }
+    for (const sid of ['s1', 's2']) {
+      delete world.store['kendiKurulum']
+      newDay(world)
+      await become($, world, clock, sid, { ...SELF })
+      expect(await typedTurn($, clock)).toEqual([])
+      await turnEnd($, 'tamam')
+    }
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ state: 'failed', failDays: 2, stopped: true, gen: 1 })
+    // Later days: nothing, without bound.
+    for (const sid of ['s3', 's4', 's5']) {
+      delete world.store['kendiKurulum']
+      newDay(world)
+      await become($, world, clock, sid, { ...SELF })
+      expect(await typedTurn($, clock)).toEqual([])
+      await turnEnd($, 'tamam')
+    }
+    expect(ownCreates(world)).toHaveLength(2)
     expect(world.toasts).toHaveLength(1)
-    expect(world.toasts[0]).toContain('/devir hazirla')
-    expect(world.store['kendiKurulum']).toMatchObject({ unsaved: 1 })
-    expect(world.store['kendiKurulum'].off).toBeUndefined()
+    // `/devir otomatik` lifts the folder's stop and its told-once mark.
+    await devir($, 'otomatik')
+    expect(world.store[`hazirlik:${HASH}`].stopped).toBeUndefined()
+    await become($, world, clock, 's6', { ...SELF })
+    expect(await typedTurn($, clock)).toEqual([])
+    await turnEnd($, 'tamam')
+    expect(ownCreates(world)).toHaveLength(3)
+    expect(world.toasts).toHaveLength(2)
+  })
+
+  test('(R2) her oluşturmadan önce $.tool.check: onay isterse çağrılmaz, eksik sayılır; canlı mod Bypass değilse çağrılmaz, eksik sayılmaz', async ($, on) => {
+    const { world, clock } = setup(on, { esik: 40, mod: 'otomatik' })
+    world.percent = 10
+    world.createText = SAVED_LIVE
+    // The verdict would need a card: no call at all.
+    world.checkDecision = 'ask'
+    await become($, world, clock, 's1', { ...SELF })
+    expect(await typedTurn($, clock)).toEqual([])
+    await turnEnd($, 'tamam')
+    expect(world.checks.map((c: any) => [c.tool, c.input?.taskId])).toEqual([[CREATE, PAIR1[0]]])
+    expect(callsOf(world, CREATE)).toHaveLength(0)
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ state: 'failed', misses: 1 })
+    expect(world.store['kendiKurulum']).toMatchObject({ fails: 1 })
+    expect(world.toasts).toEqual([setupFailHint('görev oluşturma onay isterdi')])
+    // The menu went from Bypass to Auto after the turn began: the live read stops it, no miss.
+    world.checkDecision = 'allow'
+    delete world.store[`hazirlik:${HASH}`]
+    await become($, world, clock, 's2', { ...SELF })
+    await typed($, 'iş')
+    await turnBegin($)
+    await clock.advance(100)
+    world.self = { ...SELF, permissionMode: 'auto' }
+    expect((await bash($)).context ?? []).toEqual([])
+    await clock.advance(100)
+    await turnEnd($, 'tamam')
+    expect(callsOf(world, CREATE)).toHaveLength(0)
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ state: 'asked', released: true, misses: 0 })
+    // Another chat does not count a let-go ask as its miss (review L1).
+    await become($, world, clock, 's3', { ...SELF })
+    expect(await typedTurn($, clock)).toEqual([])
+    await turnEnd($, 'tamam')
+    expect(ownCreates(world).map((c: any) => c.taskId)).toEqual([...PAIR1])
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ state: 'done', misses: 0, gen: 1 })
+  })
+
+  test('(R3) tur a ile b arasında biterse b oluşturulmaz; yarım çift "saklanmadı" sayılmaz, sonraki istek aynı kimliklerle yalnızca eksiği yapar', async ($, on) => {
+    const { world, clock } = setup(on, { esik: 40, mod: 'otomatik' })
+    world.percent = 10
+    world.createText = SAVED_LIVE
+    world.createDelayMs = 1000
+    await become($, world, clock, 's1', { ...SELF })
+    await typed($, 'iş')
+    await turnBegin($)
+    await clock.advance(100)
+    await bash($)
+    await clock.advance(100)
+    // Create a is in flight when the turn ends.
+    expect(ownCreates(world).map((c: any) => c.taskId)).toEqual([PAIR1[0]])
+    await turnEnd($, 'tamam')
+    await clock.advance(2000)
+    expect(ownCreates(world)).toHaveLength(1)
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({
+      state: 'asked', released: true, misses: 0, created: { [PAIR1[0]]: 'saved' },
+    })
+    expect(world.store['kendiKurulum']).toBeUndefined()
+    expect(world.toasts).toEqual([])
+    // The next qualifying turn (another chat) makes only b: the pair is whole.
+    world.createDelayMs = 0
+    await become($, world, clock, 's2', { ...SELF })
+    expect(await typedTurn($, clock)).toEqual([])
+    await turnEnd($, 'tamam')
+    expect(ownCreates(world).map((c: any) => c.taskId)).toEqual([PAIR1[0], PAIR1[1]])
+    expect(world.store[PAIR_KEY]).toMatchObject({ gen: 1, ids: [...PAIR1], savedMode: 'bypassPermissions' })
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ state: 'done', misses: 0, by: 's2' })
+  })
+
+  test('(R4) /devir hazirla izin modunu o an okur: menüden Auto seçilince tur olmadan da kabul eder, Default seçilince reddeder', async ($, on) => {
+    const { world, clock } = setup(on, { esik: 40, mod: 'otomatik' })
+    world.percent = 10
+    await become($, world, clock, 's1', { ...SELF, permissionMode: 'default' })
+    await typedTurn($, clock)
+    await turnEnd($, 'tamam')
+    // Auto picked in the menu, no turn since.
+    world.self = { ...SELF, permissionMode: 'auto' }
+    expect((await devir($, 'hazirla')).text).toContain('giriş kutusuna yazılıyor')
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ mode: 'auto', via: 'hazirla', state: 'asked' })
+    await clock.advance(100)
+    expect(world.fills).toEqual([provisionRequest(PAIR1)])
+    // And back to Default: refused, nothing recorded anew.
+    world.self = { ...SELF, permissionMode: 'default' }
+    expect((await devir($, 'hazirla')).text).toContain('Auto ya da Bypass')
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ mode: 'auto' })
+    // The mode cannot be read: refused, said so.
+    world.self = {}
+    expect((await devir($, 'hazirla')).text).toContain('okunamadı')
+  })
+
+  test('(R5) takılan oluşturma süre dolunca başarısızdır (kimlikler yanmış sayılır); kuşak sınırı bir kez söylenir', async ($, on) => {
+    const { world, clock } = setup(on, { esik: 40, mod: 'otomatik' })
+    world.percent = 10
+    world.hang.add(CREATE)
+    await become($, world, clock, 's1', { ...SELF })
+    expect(await typedTurn($, clock)).toEqual([])
+    await clock.advance(61_000)
+    await turnEnd($, 'tamam')
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ state: 'failed', burned: true, misses: 1 })
+    expect(world.toasts).toEqual([setupFailHint('görev aracı yanıt vermedi')])
+    // The next day: new ids (the hung call may have made 1a).
+    world.hang.clear()
+    world.createText = NOT_SAVED_LIVE
+    newDay(world)
+    delete world.store['kendiKurulum']
+    await become($, world, clock, 's2', { ...SELF })
+    expect(await typedTurn($, clock)).toEqual([])
+    await turnEnd($, 'tamam')
+    expect(ownCreates(world).map((c: any) => c.taskId).at(-1)).toBe(PAIR2[0])
+    // At MAX_GEN: told once, no create.
+    setStore(world, `hazirlik:${HASH}`, { gen: 12, ids: [...scheduledPlan('/proj', 12).ids], mode: 'bypassPermissions', at: 1, state: 'done', created: {}, misses: 0 })
+    delete world.store['kendiKurulum']
+    delete world.store[`kurulumUyari:${HASH}`]
+    world.toasts = []
+    const before = ownCreates(world).length
+    await become($, world, clock, 's3', { ...SELF })
+    expect(await typedTurn($, clock)).toEqual([])
+    await turnEnd($, 'tamam')
+    expect(ownCreates(world)).toHaveLength(before)
+    expect(world.toasts).toEqual([setupFailHint('görev kuşağı sınırına (12) gelindi')])
   })
 
   test('(P3) iki "saklanmadı" çifti (farklı klasörler): kendi kurulum her yerde kapanır, tek bildirim; /devir hazirla açar', async ($, on) => {
@@ -1159,8 +1333,8 @@ describe('otomatik-devir v0.5 zincir', () => {
       await turnEnd($, 'tamam')
     }
     expect(ownCreates(world).map((c: any) => c.taskId)).toEqual([PAIR1[0], scheduledPlan('/other', 1).ids[0]])
-    expect(world.store['kendiKurulum']).toMatchObject({ off: true, unsaved: 2, reason: 'izin modu saklanmadı' })
-    expect(world.toasts.filter((t: string) => t === SETUP_OFF_HINT)).toHaveLength(1)
+    expect(world.store['kendiKurulum']).toMatchObject({ off: true, fails: 2, reason: 'uygulama izin modunu görevle saklamadı' })
+    expect(world.toasts.filter((t: string) => t === OFF_UNSAVED)).toHaveLength(1)
     // Off everywhere: a third folder (and another day) gets no own create.
     world.createText = SAVED_LIVE
     newDay(world)
@@ -1169,7 +1343,7 @@ describe('otomatik-devir v0.5 zincir', () => {
     expect(await typedTurn($, clock)).toEqual([])
     await turnEnd($, 'tamam')
     expect(ownCreates(world)).toHaveLength(2)
-    expect(world.toasts.filter((t: string) => t === SETUP_OFF_HINT)).toHaveLength(1)
+    expect(world.toasts.filter((t: string) => t === OFF_UNSAVED)).toHaveLength(1)
     // `/devir hazirla` clears the stop: the next qualifying chat creates again.
     await devir($, 'hazirla')
     expect(world.store['kendiKurulum']).toBeUndefined()
@@ -1232,7 +1406,7 @@ describe('otomatik-devir v0.5 zincir', () => {
   })
 
   test('(P6) /devir hazirla isteği giriş kutusuna açık, İngilizce yazar: kimlikler ve mod yolu var, gizleme yok; kutu almazsa bildirim', async ($, on) => {
-    const { world, clock } = setup(on, { esik: 40, mod: 'otomatik', kendiKurulum: { unsaved: 2, off: true } })
+    const { world, clock } = setup(on, { esik: 40, mod: 'otomatik', kendiKurulum: { fails: 2, off: true } })
     world.percent = 10
     await become($, world, clock, 's1', { ...SELF })
     const reply = await devir($, 'hazirla')
@@ -1263,5 +1437,36 @@ describe('otomatik-devir v0.5 zincir', () => {
     await become($, world, clock, 's3', { ...SELF, permissionMode: 'default' })
     expect((await devir($, 'hazirla')).text).toContain('Auto ya da Bypass')
     expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ by: 's2' })
+  })
+
+  test('(R6) başka sohbet kaydı devraldıysa modun sonucu onun kaydının üstüne yazılmaz; hazırlanan çiftte "-2" reddi görev çalıştırmayı söylemez', async ($, on) => {
+    const { world, clock } = setup(on, { esik: 40, mod: 'otomatik' })
+    world.percent = 10
+    world.createDelayMs = 1000
+    world.createResult = { deny: 'Permission denied' }
+    await become($, world, clock, 's1', { ...SELF })
+    await typed($, 'iş')
+    await turnBegin($)
+    await clock.advance(100)
+    await bash($)
+    await clock.advance(100)
+    expect(ownCreates(world)).toHaveLength(1)
+    // Another chat's ask lands while the create is in flight.
+    const other = { ...world.store[`hazirlik:${HASH}`], by: 's9', until: clock.now() + 60_000 }
+    setStore(world, `hazirlik:${HASH}`, other)
+    await clock.advance(2000)
+    await turnEnd($, 'tamam')
+    expect(world.store[`hazirlik:${HASH}`]).toMatchObject({ by: 's9', state: 'asked', misses: 0 })
+    expect(world.store['kendiKurulum']).toBeUndefined()
+    expect(world.toasts).toEqual([])
+    // A /devir hazirla pair whose task exists: the app's "-2" id is refused without "run it".
+    world.createDelayMs = 0
+    world.createResult = undefined
+    await become($, world, clock, 's2', { ...SELF, permissionMode: 'auto' })
+    delete world.store[`hazirlik:${HASH}`]
+    await devir($, 'hazirla')
+    const deny = String((await $.tool.call({ tool: CREATE, taskId: `${PAIR1[0]}-2`, prompt: '-', description: '-' })).deny)
+    expect(deny).toContain('zaten var')
+    expect(deny).not.toContain(RUN)
   })
 })

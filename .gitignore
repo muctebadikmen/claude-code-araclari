@@ -2,3 +2,4 @@
 node_modules/
 .claude-plugin/types/
 **/.claude-plugin/types/
+.worktrees/

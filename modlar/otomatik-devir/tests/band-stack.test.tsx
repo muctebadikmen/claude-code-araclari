@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { READY_BAND } from '../hooks/register'
+import { KIMLIK_PREFIX, ORKESTRA_PAUSED_BAND, orkestraRecordFile, READY_BAND } from '../hooks/register'
 
 // Cross-mod check of the shared AbovePrompt band: the REAL otomatik-devir (the
 // plugin under test) in one chain with the two other mods of the pack.
@@ -74,7 +74,28 @@ const textOf = (node: any): string | undefined => {
   return parts.length === 0 ? undefined : parts.join('')
 }
 
-const setup = (on: any) => {
+// v1.1 (Decision 19, O7): the one row the mod draws is the main chat's paused
+// band. `s1` is a chain's main chat (role `ana`): its record (BACKEND file,
+// store-probe.md) and `kimlik:s1` are seeded, so session.start restores the
+// role (O16); `get_session self` answers its local id.
+type Role = 'ana' | 'yok'
+const HOME = '/home/test'
+const MAIN_ID = 'local_main'
+const MAIN_RECORD = {
+  role: 'ana',
+  sid: 's1',
+  localId: MAIN_ID,
+  task: 'iş',
+  title: 'iş',
+  n: 1,
+  childId: 'local_c1',
+  isHeld: true,
+  startedAt: 0,
+  at: 0,
+}
+
+const setup = (on: any, opts: { role?: Role } = {}) => {
+  const { role = 'ana' } = opts
   const world = {
     sid: 's1',
     percent: 50,
@@ -84,7 +105,10 @@ const setup = (on: any) => {
     files: {} as Record<string, { text: string; mtimeMs: number }>,
   }
   const clock = mock.clock(on, { now: 1_000_000 })
-  mock.store(on, { esik: 1 })
+  if (role === 'ana') {
+    world.files[orkestraRecordFile(HOME, MAIN_ID)] = { text: JSON.stringify(MAIN_RECORD), mtimeMs: 0 }
+  }
+  mock.store(on, role === 'ana' ? { esik: 1, [`${KIMLIK_PREFIX}s1`]: MAIN_ID } : { esik: 1 })
   mock.env(on, { HOME: '/home/test' })
   // Stands in for core beneath every plugin.
   on('ui.render', { component: 'AbovePrompt' }, ($: any, e: any) => $.ui.resolve(e).Box({ key: 'below' }))
@@ -99,6 +123,7 @@ const setup = (on: any) => {
   }))
   on('session.messages', () => ({ value: [] }))
   on('turn.complete', ($: any, e: any) => ({ text: e.answer }))
+  on('turn.start', ($: any, e: any) => ({ turnId: e.turnId }))
   on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
   on('command.list', () => ({ value: [{ name: SKILL }] }))
   on('command.run', ($: any, e: any) => {
@@ -115,6 +140,9 @@ const setup = (on: any) => {
   }))
   on('tool.call', ($: any, e: any) => {
     world.tools.push(e.tool)
+    if (e.tool === 'mcp__ccd_session_mgmt__get_session') {
+      return { result: [], text: JSON.stringify(role === 'ana' ? { sessionId: MAIN_ID, title: 'Ana' } : { sessionId: 'local_self' }) }
+    }
     if (e.tool === 'mcp__ccd_session__start_session') {
       return { result: [], text: 'Started session "Devam" (session_id: local_ab12-cd34, name: devam)' }
     }
@@ -130,6 +158,11 @@ const setup = (on: any) => {
     const file = world.files[e.path]
     if (file === undefined) throw new Error('ENOENT')
     return { value: file.text }
+  })
+  // BACKEND file: the records the mod writes (mtime = now).
+  on('fs.write', ($: any, e: any) => {
+    world.files[e.path] = { text: String(e.content ?? e.text ?? e.data ?? ''), mtimeMs: clock.now() }
+    return { value: undefined }
   })
   on('prompt.submit', ($: any, e: any) => {
     world.sent.push(e.text)
@@ -151,16 +184,18 @@ const devir = ($: any, args: string) =>
   })
 
 /**
- * Trips a handoff in a machine turn (esik 1, a model tool call), writes the
- * handoff file as the model would, then lets the main turn end: the Stop hook
- * sees the closed gate and a fresh file and moves the phase to `ready`.
+ * M4: the main chat's turn runs (a model tool call at esik 1 trips nothing
+ * there, O3), then the person presses Esc: the turn closes aborted, the chain
+ * pauses (`isHeld: false`, conv `isPaused`) and the band shows
+ * ORKESTRA_PAUSED_BAND (O7).
  */
-const toReady = async ($: any, world: any, clock: any) => {
+const toPaused = async ($: any, world: any, clock: any) => {
+  await $.turn.start({ text: '', turnId: 't1' })
   await $.tool.call({ tool: 'Bash', command: 'ls' })
   await clock.advance(100)
-  world.files['/proj/.workflow/handoff/s1.md'] = { text: 'Devam notu\n\nAdım 3', mtimeMs: clock.now() }
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't1', reason: 'aborted' })
   await clock.advance(100)
-  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+  expect(JSON.parse(world.files[orkestraRecordFile(HOME, MAIN_ID)].text)).toMatchObject({ isHeld: false })
 }
 
 const OPTIONS = { plugins: [ilerlemeStandIn, blastStandIn] }
@@ -179,11 +214,12 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(idleAll.filter(n => n.props?.autoFocus === true)).toHaveLength(0)
     await idle.unmount()
 
-    // Ready: the one READY_BAND row first, the two others and the drawing beneath intact.
-    await toReady($, world, clock)
+    // Paused: the one ORKESTRA_PAUSED_BAND row first, the two others and the drawing beneath intact.
+    await toPaused($, world, clock)
     const ui = await mount()
     const all = walk(await ui.drawn())
-    const rows = all.filter(n => textOf(n) === READY_BAND)
+    const rows = all.filter(n => textOf(n) === ORKESTRA_PAUSED_BAND)
+    expect(all.filter(n => textOf(n) === READY_BAND)).toHaveLength(0)
     expect(rows).toHaveLength(1)
     const rowAt = all.indexOf(rows[0])
     expect(all.slice(0, rowAt).filter(n => n.type === 'Button')).toHaveLength(0)
@@ -199,10 +235,10 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(buttons.filter(n => n.props.hotkey !== undefined)).toHaveLength(0)
 
     // Mid-turn a blast-radius hold takes the band: the row steps aside, so
-    // exactly one autoFocus (blast-radius' Cancel) and no READY_BAND row.
+    // exactly one autoFocus (blast-radius' Cancel) and no ORKESTRA_PAUSED_BAND row.
     await ui.redraw({ ...BAND, isWorking: true })
     const busy = walk(await ui.drawn())
-    expect(busy.filter(n => textOf(n) === READY_BAND)).toHaveLength(0)
+    expect(busy.filter(n => textOf(n) === ORKESTRA_PAUSED_BAND)).toHaveLength(0)
     expect(busy.filter(n => n.props?.autoFocus === true).map(n => [n.press.plugin, n.props.key])).toEqual([
       ['blast-radius', 'cancel'],
     ])
@@ -210,7 +246,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
     // Back at rest the row is drawn again, with the others and the drawing beneath.
     const again = walk(await ui.drawn())
-    expect(again.filter(n => textOf(n) === READY_BAND)).toHaveLength(1)
+    expect(again.filter(n => textOf(n) === ORKESTRA_PAUSED_BAND)).toHaveLength(1)
     expect(again.filter(n => n.type === 'Button').map(n => n.props.key)).toEqual(['toggle'])
     expect(again.filter(n => n.props?.key === 'below')).toHaveLength(1)
     await ui.unmount()
@@ -220,7 +256,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
 test('bant: anket varken üçü de yalnızca alttaki çizimi döndürür', OPTIONS, async ($, on) => {
   const { world, clock } = setup(on)
   await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
-  await toReady($, world, clock)
+  await toPaused($, world, clock)
   const ui = await $.ui.mount({
     plugin: 'otomatik-devir',
     surface: 'terminal',
@@ -228,7 +264,7 @@ test('bant: anket varken üçü de yalnızca alttaki çizimi döndürür', OPTIO
     props: { ...BAND, hasSurvey: true },
   })
   const drawn = walk(await ui.drawn())
-  expect(drawn.filter(n => textOf(n) === READY_BAND)).toHaveLength(0)
+  expect(drawn.filter(n => textOf(n) === ORKESTRA_PAUSED_BAND)).toHaveLength(0)
   expect(await ui.drawn()).toMatchObject({ type: 'Box', props: { key: 'below' } })
   await ui.unmount()
 })

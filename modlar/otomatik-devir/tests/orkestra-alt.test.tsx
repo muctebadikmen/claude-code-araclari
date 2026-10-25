@@ -82,6 +82,8 @@ const setup = (on: any, store: Record<string, unknown> = { esik: 40 }) => {
     k: 0,
     // The mod's per-conversation record ($.state `conv`) as last written.
     conv: null as any,
+    // T7: a $.fs.write of a matching path throws.
+    failWrite: undefined as ((path: string) => boolean) | undefined,
   }
   const clock = mock.clock(on, { now: NOW })
   const clone = (value: unknown) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)))
@@ -149,6 +151,7 @@ const setup = (on: any, store: Record<string, unknown> = { esik: 40 }) => {
     return { value: file.text }
   })
   on('fs.write', ($: any, e: any) => {
+    if (world.failWrite?.(e.path) === true) throw new Error('fs.write failed')
     world.files[e.path] = { text: e.text, mtimeMs: clock.now() }
     return { value: undefined }
   })
@@ -767,5 +770,39 @@ describe('orkestra alt', () => {
     expect((await startSession($)).deny).toBe(ORKESTRA_END_DENY)
     expect(callsOf(world, START)).toHaveLength(1)
     expect(rec(world, 'local_main')).toMatchObject({ n: 1, ended: 'kapatildi' })
+  })
+
+  // T7 review-1 fixes.
+  test('(R4) rol çözümünde kayıt yazımı hata verse de alt sohbetin açış ve çatalı reddedilir; kayıt sonra yazılır (O13)', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    // The child's own record write fails during its first role resolution (inside O13's check).
+    world.failWrite = path => path === recFile(C1)
+    expect((await startSession($)).deny).toBe(MANAGED_START_DENY)
+    expect((await handOff($)).deny).toBe(MANAGED_START_DENY)
+    expect(callsOf(world, START)).toHaveLength(1)
+    expect(callsOf(world, HAND_OFF)).toHaveLength(0)
+    world.failWrite = undefined
+    expect(rec(world, C1)).toBeUndefined()
+    // Its turn ends idle: the record is written then, `finished` with the report.
+    await typed($, 'iş')
+    await turnBegin($)
+    await turnEnd($, false, 'bitti raporu')
+    await clock.advance(100)
+    expect(rec(world, C1)).toMatchObject({ role: 'alt', parent: 'local_main', n: 1, status: 'finished', report: 'bitti raporu' })
+  })
+
+  test('(R5) kapatılan zincirde ayar dosyası yarım okunsa da hazır alt sohbet tüketilmez, iptal edilir (O21 > O15)', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await childReady($, world, clock)
+    seedRec(world, clock, 'local_main', { ...rec(world, 'local_main'), ended: 'kapatildi' })
+    world.files[zincirAyarFile(HOME, 'local_main')] = { text: '{"isClosed":', mtimeMs: clock.now() }
+    // A fresh engine load: no cached chain settings.
+    await as($, world, 'c1')
+    await clock.advance(100)
+    expect(await phase($)).toContain('aşama: idle')
+    expect(rec(world, C1)).toMatchObject({ status: 'cancelled' })
+    expect(rec(world, C1).file).toBeUndefined()
   })
 })

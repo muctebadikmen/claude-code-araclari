@@ -16,6 +16,7 @@ import {
   ORKESTRA_PAUSED_BAND,
   ORKESTRA_PAUSED_DENY,
   ORKESTRA_PREFIX,
+  ORKESTRA_SECTION_ID,
   orkestraBusyDeny,
   orkestraCapDeny,
   orkestraEndText,
@@ -84,6 +85,9 @@ const setup = (on: any, store: Record<string, unknown> = { esik: 40 }) => {
     calls: [] as any[],
     agents: [] as { id: string; description: string; type: string; status: string }[],
     files: {} as Record<string, { text: string; mtimeMs: number }>,
+    // T7: a $.fs.write of a matching path throws, and a $.state write of a matching conv value throws.
+    failWrite: undefined as ((path: string) => boolean) | undefined,
+    failState: undefined as ((value: any) => boolean) | undefined,
   }
   const clock = mock.clock(on, { now: NOW })
   const clone = (value: unknown) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)))
@@ -98,6 +102,10 @@ const setup = (on: any, store: Record<string, unknown> = { esik: 40 }) => {
     return { value: undefined }
   })
   on('store.keys', () => ({ value: Object.keys(world.store) }))
+  on('state.set', ($: any, e: any, next: any) => {
+    if (e.plugin === PLUGIN && e.key === 'conv' && world.failState?.(e.value) === true) return { deny: 'state.set failed' }
+    return next(e)
+  })
   mock.env(on, { HOME })
   on('ui.render', { component: 'AbovePrompt' }, ($: any, e: any) => $.ui.resolve(e).Box({ key: 'below' }))
   on('session.start', ($: any, e: any) => ({ cwd: e.cwd }))
@@ -151,6 +159,7 @@ const setup = (on: any, store: Record<string, unknown> = { esik: 40 }) => {
     return { value: file.text }
   })
   on('fs.write', ($: any, e: any) => {
+    if (world.failWrite?.(e.path) === true) throw new Error('fs.write failed')
     world.files[e.path] = { text: e.text, mtimeMs: clock.now() }
     return { value: undefined }
   })
@@ -906,5 +915,62 @@ describe('orkestra ana', () => {
     expect(world.store.esik).toBe(40)
     expect(world.store.acik).toBe(true)
     expect('otonomLimit' in world.store).toBe(false)
+  })
+
+  // T7 review-1 fixes.
+  test('(R1) $.state kaybından sonraki ilk render ana sohbet bölümünü yine verir (O2)', async ($, on) => {
+    const { world } = setup(on)
+    on('prompt.compose', () => ({ sections: [{ id: 'env', text: 'ortam', scope: 'session' }] }))
+    const compose = async () =>
+      (
+        await $.prompt.compose({
+          model: 'claude-test',
+          promptModel: 'claude-test',
+          surfaces: ['terminal'],
+          tools: [],
+          outputStyle: null,
+          traits: [],
+        })
+      ).sections.map((s: any) => s.id)
+    on('session.end', ($: any, e: any) => ({ sessionId: e.sessionId }))
+    await chainUp($, world, 'main')
+    expect(await compose()).toContain(ORKESTRA_SECTION_ID)
+    // The conv record goes (the store and the main record stay): the role is restored first.
+    await $.session.end({ sessionId: 'main', reason: 'other' })
+    expect(await compose()).toContain(ORKESTRA_SECTION_ID)
+  })
+
+  test('(R2) ana sohbetin açışı next öncesi hata verirse açış reddedilir (yönetilmeyen sohbet açılmaz); önbellek dosyayla tutarlı', async ($, on) => {
+    const { world } = setup(on)
+    chat(world, 'main')
+    await as($, world, 'main')
+    await go($, TASK)
+    await turnBegin($)
+    // The `starting` write of O4 fails: nothing may reach start_session.
+    world.failWrite = path => path === orkestraRecordFile(HOME, 'local_main')
+    const got = await startSession($)
+    expect(got.deny).toBeDefined()
+    expect(callsOf(world, START)).toHaveLength(0)
+    world.failWrite = undefined
+    // The cached main record never took the failed `starting`: the next start passes.
+    const again = await startSession($)
+    expect(again.deny).toBeUndefined()
+    expect(callsOf(world, START)).toHaveLength(1)
+    expect(rec(world, 'local_main')).toMatchObject({ n: 1, childId: childId(1) })
+  })
+
+  test('(R3) O1: ana kayıt yazıldıktan sonra bir hata düşürürse kayıt da gider; sonraki Stop zinciri başlatmaz', async ($, on) => {
+    const { world } = setup(on)
+    chat(world, 'main')
+    await as($, world, 'main')
+    // The role write of O1 fails after the chain settings and the main record were written.
+    world.failState = value => value?.role === 'ana'
+    const out = await go($, TASK)
+    expect(out.drop).toBe('otomatik-devir: oturum kimliği okunamadı; zincir başlamadı.')
+    world.failState = undefined
+    expect(rec(world, 'local_main')?.role).toBeUndefined()
+    await turnBegin($)
+    expect((await stop($, [])).block).toBeUndefined()
+    expect(await devir($, 'otonom')).toContain('Bu sohbet orkestra modunda değil')
   })
 })

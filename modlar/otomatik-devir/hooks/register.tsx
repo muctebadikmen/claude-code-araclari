@@ -763,7 +763,8 @@ const currentConv = async ($: EngineInterface): Promise<OtomatikDevirConv> => {
     const restored = now
     await update($, conv, () => restored)
   }
-  if (now.phase === 'ready' && now.role === 'alt') now = await consumeChild($, now)
+  // O21 before O15: a closed chain cancels its ready sub-chat (below), never consumes it.
+  if (now.phase === 'ready' && now.role === 'alt' && (await readSettings($)).isEnabled) now = await consumeChild($, now)
   isDraining = isDrainPhase(now.phase)
   if (isDraining) {
     // O20: only a managed sub-chat drains; a leftover elsewhere goes silently.
@@ -2259,11 +2260,13 @@ export const register: Register = on => {
     const childId = held.phase === 'idle' && (await roleOf($)) === 'alt' ? (await read($, conv))?.localId : undefined
     if (childId !== undefined) {
       const own = await readRecord($, childId)
+      // Decision 21a: this turn's last Stop saw its Workflows too.
+      const idleTasks = lastStopTasks?.turnId === e.turnId ? lastStopTasks.tasks : undefined
       if (
         own?.role === 'alt' &&
         own.status !== 'finished' &&
         own.status !== 'cancelled' &&
-        (await runningWork($, undefined)).length === 0
+        (await runningWork($, idleTasks)).length === 0
       ) {
         await writeRecord($, own.localId, {
           ...own,

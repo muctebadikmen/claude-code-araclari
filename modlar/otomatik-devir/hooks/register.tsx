@@ -1,5 +1,12 @@
 import { atom, read, update } from 'claude-code'
-import type { AgentInfo, EngineInterface, Register, ToolCallArgs } from 'claude-code'
+import type {
+  AgentInfo,
+  EngineInterface,
+  PromptSubmitInput,
+  PromptSubmitResult,
+  Register,
+  ToolCallArgs,
+} from 'claude-code'
 
 import type {
   OrkestraAlt,
@@ -1041,6 +1048,171 @@ export const chainIdOf = async ($: EngineInterface): Promise<string | undefined>
   return own?.role === 'alt' ? own.parent : undefined
 }
 
+// ---------------------------------------------------------------------------
+// The chain's start (O1) and a typed message in a live main chat (O7), in
+// prompt.submit before every v1 return.
+// ---------------------------------------------------------------------------
+
+type SubmitNext = (e: PromptSubmitInput) => Promise<PromptSubmitResult>
+
+// Module state of the main chat's Stop and mid-turn notes (O5, O6), reset at
+// session.start (O18) and at a new chain.
+let orkestraStartBlocks: { n: number; count: number } | undefined
+let orkestraNoted: string | undefined
+
+const ROLE_ALT_DROP = 'Bu bir alt sohbet; otonom zincir ana sohbette çalışır.'
+const LIVE_DROP = 'Bu sohbette otonom zincir zaten çalışıyor (/devir otonom).'
+const HANDED_DROP = 'Bu sohbet zaten devredildi; /devir-otonom için yeni bir sohbet aç.'
+const EMPTY_DROP = 'Görev boş: /devir-otonom <görev> yaz.'
+const NO_ID_DROP = 'otomatik-devir: oturum kimliği okunamadı; zincir başlamadı.'
+const HANDED_CONTEXT = 'otomatik-devir: bu sohbet zaten devredildi; orkestra için yeni bir sohbet aç ve bunu kullanıcıya söyle.'
+const EMPTY_CONTEXT = 'otomatik-devir orkestra: görev boş; kullanıcıya "orkestra:" sonrasına görevi yazmasını söyle.'
+const NO_ID_CONTEXT = 'otomatik-devir orkestra: oturum kimliği okunamadı; orkestra başlamadı.'
+const CONTINUE_ONLY = /^\s*(devam( et)?|continue)\s*[.!]?\s*$/i
+
+/** Who typed the turn this submission opens (or the running one), as the v1 path notes it. */
+const noteTyper = (e: PromptSubmitInput, isPerson: boolean): void => {
+  if (e.turnId === undefined) {
+    isNextTurnPerson = isPerson
+  } else {
+    if (isPerson && e.turnId === runningTurnId) isPersonTurn = true
+    if (isPerson) isNextTurnPerson = true
+  }
+}
+
+/** The start trigger (O1, Decision 17): `/devir-otonom` (cmd) or `orkestra:` (pfx), with its task. */
+const otonomStart = (e: PromptSubmitInput): { entry: 'cmd' | 'pfx'; task: string } | undefined => {
+  if (e.command !== undefined) {
+    return OTONOM_COMMANDS.includes(e.command.name) ? { entry: 'cmd', task: e.command.args.trim() } : undefined
+  }
+  const text = e.text.trimStart()
+  if (text.startsWith(OTONOM_MARKER)) {
+    // The rendered body: the task is under its `Görev:` line.
+    const body = text.slice(OTONOM_MARKER.length)
+    const goal = /^\s*Görev:[ \t]*([\s\S]*)$/m.exec(body)
+
+    return { entry: 'cmd', task: (goal?.[1] ?? body).trim() }
+  }
+  const line = OTONOM_LINE.exec(text)
+  if (line !== null) return { entry: 'cmd', task: text.slice(line[0].length).trim() }
+  if (ORKESTRA_RE.test(text)) return { entry: 'pfx', task: text.replace(ORKESTRA_RE, '').trim() }
+
+  return undefined
+}
+
+const withContext = (e: PromptSubmitInput, note: string): PromptSubmitInput => ({
+  ...e,
+  context: [...(e.context ?? []), note],
+})
+
+/**
+ * O7: a typed message in a live main chat holds the chain again; its text goes
+ * to the next child as the person's note (unless it only says "devam").
+ * Undefined when this chat is no live main chat.
+ */
+const orkestraTyped = async (
+  $: EngineInterface,
+  e: PromptSubmitInput,
+  next: SubmitNext,
+  isPerson: boolean,
+): Promise<PromptSubmitResult | undefined> => {
+  const sid = await $.session.id()
+  const held = await read($, conv)
+  if (held === null || held.sid !== sid || held.role !== 'ana' || held.localId === undefined) return undefined
+  const main = await readMain($, held.localId)
+  if (main === undefined || main.ended !== undefined) return undefined
+  const isNote = !CONTINUE_ONLY.test(e.text) && e.text.trim() !== ''
+  const pending = isNote
+    ? main.pendingMessage === undefined
+      ? e.text
+      : `${main.pendingMessage}\n\n${e.text}`
+    : main.pendingMessage
+  await patchMain($, main.localId, { isHeld: true, pendingMessage: pending })
+  await patchConv($, sid, { isPaused: undefined })
+  const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+  noteTyper(e, isPerson)
+  later($, () => refreshStatus($))
+
+  return next(withContext(e, orkestraResumeNote(main.n, child?.status ?? 'yok')))
+}
+
+/**
+ * O1 and O7, before the v1 returns of prompt.submit. Undefined: not the
+ * orchestrator's, the v1 path goes on.
+ */
+const orkestraSubmit = async (
+  $: EngineInterface,
+  e: PromptSubmitInput,
+  next: SubmitNext,
+  isPerson: boolean,
+): Promise<PromptSubmitResult | undefined> => {
+  if (!isPerson) return undefined
+  const start = otonomStart(e)
+  if (start === undefined) {
+    if (e.command !== undefined) return undefined
+    try {
+      return await orkestraTyped($, e, next, isPerson)
+    } catch (error) {
+      $.ui.log(`otomatik-devir: orkestra mesajı işlenemedi: ${String(error)}`, { to: 'debug' })
+
+      return undefined
+    }
+  }
+  const { entry, task } = start
+  const isCommand = entry === 'cmd'
+  const sid = await $.session.id()
+  if ((await roleOf($)) === 'alt') {
+    if (!isCommand) return undefined
+    noteTyper(e, isPerson)
+
+    return { drop: ROLE_ALT_DROP }
+  }
+  const localId = await selfLocal($)
+  const live = localId === undefined ? undefined : await readMain($, localId)
+  if (live !== undefined && live.ended === undefined) {
+    if (!isCommand) return orkestraTyped($, e, next, isPerson)
+    noteTyper(e, isPerson)
+
+    return { drop: LIVE_DROP }
+  }
+  noteTyper(e, isPerson)
+  if ((await handedOf($, sid)) !== undefined) {
+    return isCommand ? { drop: HANDED_DROP } : next(withContext(e, HANDED_CONTEXT))
+  }
+  if (task === '') return isCommand ? { drop: EMPTY_DROP } : next(withContext(e, EMPTY_CONTEXT))
+  if (localId === undefined) return isCommand ? { drop: NO_ID_DROP } : next(withContext(e, NO_ID_CONTEXT))
+  const now = await $.clock.now()
+  await writeChainSettings($, localId, { at: now }) // D22: new chain settings
+  const first = childTitle(task, 1)
+  const held = await read($, conv)
+  await writeMain($, {
+    role: 'ana',
+    sid,
+    localId,
+    task,
+    title: first.slice(0, -' · 1'.length),
+    n: 0,
+    isHeld: true,
+    testThreshold: held !== null && held.sid === sid ? held.testThreshold : undefined,
+    startedAt: now,
+    at: now,
+  })
+  await patchConv($, sid, { role: 'ana', childN: 0, isPaused: undefined, stalledN: undefined, starting: undefined })
+  orkestraStartBlocks = undefined
+  orkestraNoted = undefined
+  const note = orkestraStartNote(first)
+  const out = await next(isCommand ? withContext(e, note) : { ...withContext(e, note), text: task })
+  if (out.drop !== undefined) {
+    // Dropped beneath: no chain started; the record goes (a tombstone: $.fs has no delete).
+    ownMain = undefined
+    await writeRecord($, localId, { gone: true, at: await $.clock.now() })
+    await patchConv($, sid, { role: undefined, childN: undefined })
+  }
+  later($, () => refreshStatus($))
+
+  return out
+}
+
 type ToolNext = (input: ToolCallArgs) => Promise<{
   deny?: string
   isError?: true
@@ -1376,6 +1548,27 @@ export const register: Register = on => {
     }
   })
 
+  // O1b: the rendered `/devir-otonom` body also carries the start note (the
+  // body alone already names start_session, `user_asked` and `fresh`).
+  on('skill.prompt', async ($, e, next) => {
+    try {
+      if (e.text.includes(OTONOM_MARKER)) {
+        const sid = await $.session.id()
+        const held = await read($, conv)
+        if (held !== null && held.sid === sid && held.role === 'ana' && held.localId !== undefined) {
+          const main = await readMain($, held.localId)
+          if (main !== undefined && main.n === 0 && main.ended === undefined) {
+            return { text: `${e.text}\n\n${orkestraStartNote(childTitle(main.task, 1))}` }
+          }
+        }
+      }
+    } catch (error) {
+      $.ui.log(`otomatik-devir: ${String(error)}`, { to: 'debug' })
+    }
+
+    return next(e)
+  })
+
   // A /clear (or any end) drops this conversation's $.state record; the
   // store keys stay (S2), so a reload restores the handoff.
   on('session.end', async ($, e, next) => {
@@ -1401,10 +1594,21 @@ export const register: Register = on => {
     // Decision 16: what the person last typed, to tell their handoff ask from the model's own.
     if (isPerson) {
       try {
-        await patchConv($, (await currentConv($)).sid, { lastTyped: e.text })
+        // O7: a person's prompt also clears the stalled band.
+        await patchConv($, (await currentConv($)).sid, { lastTyped: e.text, stalledN: undefined })
       } catch (error) {
         $.ui.log(`otomatik-devir: son istem kaydedilemedi: ${String(error)}`, { to: 'debug' })
       }
+    }
+    // O1 and O7 first, before the running-turn and command returns below.
+    const orkestra = await orkestraSubmit($, e, next, isPerson)
+    if (orkestra !== undefined) return orkestra
+    // O10: the role resolves off the dispatch, at the first submission.
+    try {
+      const known = await read($, conv)
+      if (known === null || known.role === undefined) later($, async () => void (await roleOf($)))
+    } catch {
+      // resolved at the next trip, start or Stop site instead
     }
     if (e.turnId !== undefined) {
       // Typed over a running turn: the app counts that turn as the person's
@@ -1420,6 +1624,8 @@ export const register: Register = on => {
     const sid = before.sid
     const settings = await readSettings($)
     if (!settings.isEnabled || (await handedOf($, sid)) !== undefined) return next(e)
+    // O12: a managed sub-chat hands off by its file only; no S8 there.
+    if ((await roleOf($)) === 'alt') return next(e)
     let held: OtomatikDevirConv | undefined
     if (before.phase === 'ready' || (before.phase === 'handoff_running' && before.isGateClosed === true)) {
       const isClaimed = await claim($, sid, h => h.phase === before.phase && h.starting === undefined, {

@@ -203,7 +203,7 @@ export const ORKESTRA_SECTION_ID = 'otomatik-devir:orkestra'
 export const MAIN_FULL_PERCENT = 80
 
 /** How the person starts a chain (store-probe.md `TRIGGER: command`). */
-export const START_HINT = '/devir-otonom <görev>'
+export const START_HINT = '/otomatik-devir:devir-otonom <görev>'
 
 /** The one-line answer of `/devir`, `esik`, `kapat`, `ac` and `simdi` in a normal chat (O20, Decision 22). */
 export const NORMAL_INFO =
@@ -414,7 +414,7 @@ export const orkestraLimit = async ($: EngineInterface, mainLocalId: string): Pr
 }
 
 /** `/devir otonom …` outside a chain (Decision 22: no chain settings, so the default limit). */
-const NOT_ORCHESTRATED = `Bu sohbet orkestra modunda değil (sınır ${DEFAULT_LIMIT} alt sohbet). Başlatmak için /devir-otonom <görev> yaz.`
+const NOT_ORCHESTRATED = `Bu sohbet orkestra modunda değil (sınır ${DEFAULT_LIMIT} alt sohbet). Başlatmak için ${START_HINT} yaz.`
 
 type SelfSettings = { effort?: string; model?: string; permissionMode?: string }
 type Settings = { threshold: number; isEnabled: boolean }
@@ -1267,11 +1267,13 @@ type SubmitNext = (e: PromptSubmitInput) => Promise<PromptSubmitResult>
 // session.start (O18) and at a new chain.
 let orkestraStartBlocks: { n: number; count: number } | undefined
 let orkestraNoted: string | undefined
+/** `<turn>:<n>` of the end text a tool result already carried (O6): that turn's Stop does not repeat it. */
+let orkestraEndTold: string | undefined
 
 const ROLE_ALT_DROP = 'Bu bir alt sohbet; otonom zincir ana sohbette çalışır.'
 const LIVE_DROP = 'Bu sohbette otonom zincir zaten çalışıyor (/devir otonom).'
-const HANDED_DROP = 'Bu sohbet zaten devredildi; /devir-otonom için yeni bir sohbet aç.'
-const EMPTY_DROP = 'Görev boş: /devir-otonom <görev> yaz.'
+const HANDED_DROP = 'Bu sohbet zaten devredildi; /otomatik-devir:devir-otonom için yeni bir sohbet aç.'
+const EMPTY_DROP = 'Görev boş: ' + START_HINT + ' yaz.'
 const NO_ID_DROP = 'otomatik-devir: oturum kimliği okunamadı; zincir başlamadı.'
 const HANDED_CONTEXT = 'otomatik-devir: bu sohbet zaten devredildi; orkestra için yeni bir sohbet aç ve bunu kullanıcıya söyle.'
 const EMPTY_CONTEXT = 'otomatik-devir orkestra: görev boş; kullanıcıya "orkestra:" sonrasına görevi yazmasını söyle.'
@@ -1445,6 +1447,7 @@ const orkestraSubmit = async (
   }
   orkestraStartBlocks = undefined
   orkestraNoted = undefined
+  orkestraEndTold = undefined
   const note = orkestraStartNote(first)
   const out = await next(isCommand ? withContext(e, note) : { ...withContext(e, note), text: task })
   if (out.drop !== undefined) {
@@ -1907,9 +1910,12 @@ const orkestraNote = async ($: EngineInterface): Promise<string | undefined> => 
     if (got === undefined) return undefined
     const { decision } = got
     if (decision.kind !== 'start' && decision.kind !== 'relay' && decision.kind !== 'end') return undefined
+    // A paused chain hears its end only through the next typed message (O7).
+    if (decision.kind === 'end' && !got.main.isHeld) return undefined
     const key = `${decision.n}:${decision.kind}`
     if (orkestraNoted === key) return undefined
     orkestraNoted = key
+    if (decision.kind === 'end') orkestraEndTold = `${runningTurnId}:${decision.n}`
 
     return decision.text
   } catch (error) {
@@ -2088,6 +2094,7 @@ export const register: Register = on => {
     lastStopTasks = undefined
     orkestraStartBlocks = undefined
     orkestraNoted = undefined
+    orkestraEndTold = undefined
     lastAyar = {}
     ownMain = undefined
     selfInfo = undefined
@@ -2415,7 +2422,11 @@ export const register: Register = on => {
           await patchMain($, main.localId, { ended: decision.end })
           later($, () => refreshStatus($))
           // A paused main chat (O21): no block; its next typed message gets the end text (O7).
+          // A tool result of this turn already carried it (O6) and a reply followed: no second announcement.
           if (!main.isHeld) return next(e)
+          if (orkestraEndTold === `${runningTurnId}:${decision.n}` && (e.last_assistant_message?.trim() ?? '') !== '') {
+            return next(e)
+          }
 
           return { block: decision.text }
         case 'stalled':

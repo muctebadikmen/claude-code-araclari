@@ -1,7 +1,7 @@
 {
   "name": "otomatik-devir",
   "version": "1.1.0",
-  "description": "Bağlam doluluğunu gösterir; eşikte çalışan alt ajanları bitirtir, yeni iş başlattırmaz, devir dosyası yazdırır ve devamı tıklamasız, iç içe yeni bir sohbette sürdürür (/devir). Orkestra modu: /devir-otonom <görev> işi sırayla alt sohbetlere böler.",
+  "description": "Orkestra modu: /otomatik-devir:devir-otonom <görev> yazılan sohbet ana sohbet olur; iş, eşikte devir dosyası yazan iç içe alt sohbetlere tıklamasız ve sırayla bölünür, zincir bitince ana sohbet bir özet yazar.",
   "author": {
     "name": "Mustafa Dikmen",
     "url": "https://github.com/muctebadikmen"

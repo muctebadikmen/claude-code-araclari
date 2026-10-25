@@ -136,9 +136,9 @@ const runningList = (running: Running): string =>
  * long-chat handoff. The bare id is accepted at runtime (the engine's section
  * check wants only a non-empty, unique id).
  */
-export const LONG_CHAT_SECTION_ID = 'otomatik-devir'
+export const LONG_CHAT_SECTION_ID = 'otomatik-devir:long-chat'
 export const longChatNote = (threshold: number): string =>
-  `otomatik-devir bu oturumda açık: devri mod yönetir. Bağlam büyüdü diye kendiliğinden devir yapma, my-skill-handoff çağırma, yeni sohbet ya da devam prompt'u önerme; işe devam et. Bağlam %${threshold}'e ulaşınca mod talimat verir, o talimata uy. Kullanıcı açıkça devir isterse: /devir simdi.`
+  `otomatik-devir bu oturumda açık: devri mod yönetir. Bağlam büyüdü diye kendiliğinden devir yapma, my-skill-handoff çağırma, yeni sohbet ya da devam prompt'u önerme; işe devam et. Bağlam %${threshold}${dative(threshold)} ulaşınca mod talimat verir, o talimata uy. Kullanıcı açıkça devir isterse: /devir simdi.`
 
 /** Stop block while subagents or Workflows run during a handoff (`handoff_running`): wait inside the turn (v1.0.1: only then). */
 export const waitText = (running: Running): string =>
@@ -199,6 +199,34 @@ export const clampLimit = (x: number): number =>
 /** The main chat's system-prompt section (O2); the v1 long-chat note keeps its own id. */
 export const ORKESTRA_SECTION_ID = 'otomatik-devir:orkestra'
 
+/** At a relay point with its own context at this fill or more, the main chat ends the chain (O22). */
+export const MAIN_FULL_PERCENT = 80
+
+/** How the person starts a chain (store-probe.md `TRIGGER: command`). */
+export const START_HINT = '/devir-otonom <görev>'
+
+/** The one-line answer of `/devir`, `esik`, `kapat`, `ac` and `simdi` in a normal chat (O20, Decision 22). */
+export const NORMAL_INFO =
+  'Normal sohbet: burada otomatik devir yok, bu sohbet devredilmez ve buradaki ayar hiçbir zinciri değiştirmez. Zincir için ' +
+  START_HINT +
+  ' yaz; eşik ve kapatma o zincirin ana ya da alt sohbetinde ayarlanır.'
+
+/** `/devir dene <n>` in a normal chat: kept in this chat for a chain started here later (Decision 20). */
+export const normalDeneText = (n: number): string =>
+  `Normal sohbet devredilmez. Deneme eşiği %${n} kaydedildi: bu sohbette ${START_HINT} ile başlatılan zincirin alt sohbetleri bunu kullanır.`
+
+/** Appended to the `/devir kapat` reply in a chain (O21). */
+export const KAPAT_CHAIN =
+  'Bu zincir durur: ana sohbet bir sonraki adımda özet yazar, yeni alt sohbet açılmaz; başka sohbetler etkilenmez.'
+
+/** `/devir esik <n>` in a chain (Decision 22). */
+export const chainEsikText = (n: number): string =>
+  `Bu zincirin devir eşiği %${n}: ana sohbet ve alt sohbetleri için geçerli; başka sohbetleri etkilemez.`
+
+/** `/devir ac` in a chain: it writes nothing (Decisions 20, 22). */
+export const AC_CHAIN_OPEN = 'Bu zincir açık; durdurmak için /devir kapat.'
+export const AC_CHAIN_STOPPED = 'Bu zincir durdu ve sürdürülmez; yeni zincir için ' + START_HINT + ' yaz.'
+
 /** The prefix trigger (`orkestra: <görev>`): an undocumented alias of `/devir-otonom`. */
 export const ORKESTRA_RE = /^\s*orkestra:\s*/i
 /** Store key prefix of an orchestration record (backend `store`). */
@@ -247,7 +275,7 @@ export const orkestraRelayText = (n: number, title: string): string =>
   `otomatik-devir orkestra: alt sohbet ${n - 1} devir dosyasını yazdı. Turu bitirmeden sıradaki alt sohbeti (${n}) aç: ${START_SESSION} aracını bir kez çağır, initiation "user_asked", context "fresh", title "${title}"; prompt tek satır olsun, gerisini mod doldurur (devir dosyası).`
 
 /** Why a chain ended (types/index.d.ts `OrkestraEnd`). */
-type EndKind = NonNullable<OrkestraAna['ended']>
+type EndKind = NonNullable<OrkestraAna['ended']> | 'kapatildi' | 'dolu'
 
 /** The chain is over (O5/O6 `end`, O19 `durdu`): the main chat summarises and opens nothing. */
 export const orkestraEndText = (
@@ -263,8 +291,14 @@ export const orkestraEndText = (
     sinir: `zincir sınır ${limit ?? DEFAULT_LIMIT} alt sohbete ulaştı`,
     durduruldu: 'zincir kullanıcının isteğiyle durduruldu (/devir otonom dur)',
     durdu: `alt sohbet ${n} yanıt vermiyor (${childId ?? UNKNOWN_CHILD}); zincir durdu`,
+    kapatildi: 'otomatik devir kapatıldı (/devir kapat); zincir durdu',
+    dolu: `ana sohbet dolu (bağlam %${MAIN_FULL_PERCENT} ya da fazlası); zincir burada bitiyor`,
   }
-  const where = file === undefined ? '' : ` Kalan iş için son devir dosyası: ${file}.`
+  const where =
+    (file === undefined ? '' : ` Kalan iş için son devir dosyası: ${file}.`) +
+    (kind === 'dolu'
+      ? ` Kullanıcıya söyle: devam etmek için yeni bir sohbette ${START_HINT} yazsın, görev olarak "${file ?? 'son devir dosyası'} dosyasından devam et".`
+      : '')
   const what =
     report !== undefined && report.trim() !== ''
       ? ` Son alt sohbetin raporu:\n${report}\n`

@@ -1,7 +1,15 @@
 import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, Register, ToolCallArgs } from 'claude-code'
 
-import type { OtomatikDevirConv, OtomatikDevirPhase } from '../types'
+import type {
+  OrkestraAlt,
+  OrkestraAna,
+  OrkestraAyar,
+  OrkestraRecord,
+  OrkestraRole,
+  OtomatikDevirConv,
+  OtomatikDevirPhase,
+} from '../types'
 
 // ---------------------------------------------------------------------------
 // Settings ($.store, across sessions) and the per-conversation record ($.state)
@@ -159,7 +167,213 @@ const MACHINE_TURN_DENY = `otomatik-devir: bu tur kullanıcının yazdığı bir
 const CARD_DENY = `otomatik-devir: devir için kart açma (own_initiative, proposal_id); ${START_SESSION} aracını initiation "user_asked" ile çağır.`
 const HAND_OFF_DENY = `otomatik-devir: devir için ${HAND_OFF} kullanma; devir dosyasını yaz ve ${START_SESSION} aracını initiation "user_asked" ile çağır.`
 const REMOVED_VERB = "v1.0'da kaldırıldı; tek mod otomatik. Kapatmak için: /devir kapat"
-const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac]'
+const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | limit <n>]]'
+
+// ---------------------------------------------------------------------------
+// v1.1 orkestra modu (Contract): the main chat starts managed sub-chats one
+// after another and waits for each; a sub-chat hands off by writing its file.
+// ---------------------------------------------------------------------------
+
+/** The prompt-type command that starts a chain (Decision 1), bare and namespaced. */
+export const OTONOM_COMMANDS: readonly string[] = ['devir-otonom', 'otomatik-devir:devir-otonom']
+/** The first line of the command's rendered body (Decision 17). */
+export const OTONOM_MARKER = '<!-- otomatik-devir:otonom -->'
+const OTONOM_LINE = /^\s*\/(otomatik-devir:)?devir-otonom\b/
+
+/** Sub-chats per chain (Decision 18): default, and the clamp of `/devir otonom limit <n>`. */
+export const DEFAULT_LIMIT = 100
+export const LIMIT_MIN = 1
+export const LIMIT_MAX = 1000
+
+/** The integer part of `x`, clamped to LIMIT_MIN-LIMIT_MAX (not a number: DEFAULT_LIMIT). */
+export const clampLimit = (x: number): number =>
+  Number.isNaN(x) ? DEFAULT_LIMIT : Math.min(LIMIT_MAX, Math.max(LIMIT_MIN, Math.trunc(x)))
+
+/** The main chat's system-prompt section (O2); the v1 long-chat note keeps its own id. */
+export const ORKESTRA_SECTION_ID = 'otomatik-devir:orkestra'
+
+/** The prefix trigger (`orkestra: <görev>`): an undocumented alias of `/devir-otonom`. */
+export const ORKESTRA_RE = /^\s*orkestra:\s*/i
+/** Store key prefix of an orchestration record (backend `store`). */
+export const ORKESTRA_PREFIX = 'orkestra:'
+/** `kimlik:<sid>` = this chat's local id (O16). */
+export const KIMLIK_PREFIX = 'kimlik:'
+/** The managed handoff file's "no remaining work" line (Decision 12). */
+export const NONE_LEFT_RE = /^\s*Kalan:\s*yok\s*$/im
+/** A child whose id the start_session result did not name. */
+export const UNKNOWN_CHILD = 'bilinmiyor'
+/** An in-flight start older than this is a crash mid-start (O4). */
+export const STARTING_STALE_MS = 120_000
+/** Stalled child (O19): checks at least this far apart, this many in a row. */
+export const STALL_GAP_MS = 240_000
+export const STALL_CYCLES = 2
+
+/** Where the records live (store-probe.md `BACKEND: file`: the store is stale across sessions). */
+export const RECORD_BACKEND: 'store' | 'file' = 'file'
+
+const ORKESTRA_DIR = (home: string): string => `${home}/.claude/plugins/data/otomatik-devir/orkestra`
+
+/** An orchestration record's file (backend `file`). */
+export const orkestraRecordFile = (home: string, localId: string): string => `${ORKESTRA_DIR(home)}/${localId}.json`
+
+/** The sub-chat title: the task's first line, whitespace collapsed, cut to 40 chars, + ` · n`. */
+export const childTitle = (task: string, n: number): string => {
+  const head = (task.trim().split(/\r?\n/)[0] ?? '').replace(/\s+/g, ' ').slice(0, 40).trim()
+
+  return `${head === '' ? 'Orkestra' : head} · ${n}`
+}
+
+/** The start instruction for the main chat (O1, O1b, O5 `start`). */
+export const orkestraStartNote = (title: string): string =>
+  `otomatik-devir orkestra: bu sohbet otonom bir zincirin ANA sohbeti. Burada gerçek iş yapma (kod düzenleme, dosya yazma, işi yapan alt ajan yok): işi yönetilen alt sohbetler yapar. Görevi (ya da kullanıcının talimatlarından uyarlanmış kısa bir brifi) alt sohbet 1'in prompt'u olarak ver: ${START_SESSION} aracını bir kez çağır, initiation "user_asked", context "fresh", title "${title}". Sonra otomatik-devir'in notlarına uy (bekle, sıradaki alt sohbeti aç, zincir bitince özet yaz).`
+
+/** The main chat's system-prompt section (O2). */
+export const ORKESTRA_SECTION = (task: string): string =>
+  `otomatik-devir orkestra modu: bu sohbet otonom bir zincirin ana sohbeti. Burada gerçek iş yapma: işi yönetilen alt sohbetler yapar. Senin işin alt sohbetleri ${START_SESSION} ile açmak, beklemek, sıradakini açmak ve zincir bitince kullanıcıya özet yazmak; mod her adımda ne yapacağını söyler. Kendiliğinden devir yapma. Görev: ${task.slice(0, 1000)}`
+
+/** Stop block while the child runs (O5 `wait`, Decision 6); kept short (O22). */
+export const orkestraWaitText = (n: number): string =>
+  `otomatik-devir orkestra: alt sohbet ${n} çalışıyor; turu bitirme. Bash aracıyla \`perl -e 'select(undef,undef,undef,300)'\` çalıştır (5 dakika bekler); Bash aracının timeout parametresini 330000 yap (bu bir araç parametresi, kabuk komutu değil). Sonra turu yeniden bitirmeyi dene; başka iş yapma.`
+
+/** The relay to the next child (O5/O6 `relay`; n = the next child); kept short (O22). */
+export const orkestraRelayText = (n: number, title: string): string =>
+  `otomatik-devir orkestra: alt sohbet ${n - 1} devir dosyasını yazdı. Turu bitirmeden sıradaki alt sohbeti (${n}) aç: ${START_SESSION} aracını bir kez çağır, initiation "user_asked", context "fresh", title "${title}"; prompt tek satır olsun, gerisini mod doldurur (devir dosyası).`
+
+/** Why a chain ended (types/index.d.ts `OrkestraEnd`). */
+type EndKind = NonNullable<OrkestraAna['ended']>
+
+/** The chain is over (O5/O6 `end`, O19 `durdu`): the main chat summarises and opens nothing. */
+export const orkestraEndText = (
+  kind: EndKind,
+  n: number,
+  report?: string,
+  file?: string,
+  childId?: string,
+  limit?: number,
+): string => {
+  const reasons: Record<EndKind, string> = {
+    bitti: 'zincir bitti, kalan iş yok',
+    sinir: `zincir sınır ${limit ?? DEFAULT_LIMIT} alt sohbete ulaştı`,
+    durduruldu: 'zincir kullanıcının isteğiyle durduruldu (/devir otonom dur)',
+    durdu: `alt sohbet ${n} yanıt vermiyor (${childId ?? UNKNOWN_CHILD}); zincir durdu`,
+  }
+  const where = file === undefined ? '' : ` Kalan iş için son devir dosyası: ${file}.`
+  const what =
+    report !== undefined && report.trim() !== ''
+      ? ` Son alt sohbetin raporu:\n${report}\n`
+      : ` Son alt sohbetin ne yaptığını mcp__ccd_session_mgmt__list_events ile oku (session_id ${childId ?? UNKNOWN_CHILD}).`
+
+  return `otomatik-devir orkestra: ${reasons[kind]}. Bu zincirde ${n} alt sohbet açıldı.${where}${what} Kullanıcıya kısa bir özet yaz (ne yapıldı, ne kaldı); yeni sohbet açma, özeti yazınca turu bitir.`
+}
+
+/** The status line and band of a stalled chain (O19). */
+export const orkestraStalledBand = (n: number): string => `Orkestra durdu: alt sohbet ${n} yanıt vermiyor`
+
+export const ORKESTRA_END_DENY =
+  'otomatik-devir orkestra: zincir bitti; yeni sohbet açma. Kullanıcıya özet yaz ve turu bitir.'
+
+/** Context on a typed message in a live main chat (O7). */
+export const orkestraResumeNote = (n: number, state: string): string =>
+  `otomatik-devir: orkestra devam ediyor (alt sohbet ${n}: ${state}). Kullanıcının bu mesajındaki işi burada YAPMA: mod onu sıradaki alt sohbete not olarak iletir. otomatik-devir'in notlarına uy: bekle ya da sıradaki alt sohbeti aç.`
+
+/** Appended to every child's prompt (O4). */
+export const managedChildNote = (n: number, limit: number): string =>
+  `\n\n## otomatik-devir\nBu sohbet otonom bir zincirin yönetilen alt sohbeti (${n}/${limit}). Kullanıcıya soru sorma, onay bekleme: kararları kendin ver ve gerekçesini yaz. Yeni sohbet açma, kendiliğinden devir yapma: bağlam eşiğe ulaşınca mod talimat verir. İş bitince sonucu kısaca raporla.`
+
+/** A managed sub-chat's handoff (O12): the file only, the main chat starts the next one. */
+export const managedHandoff = (threshold: number, file: string, hasSkill = true): string =>
+  `Bağlam %${threshold}${dative(threshold)} ulaştı (bağlam sınırı): bu yönetilen alt sohbet devredilecek. Elindeki adımı güvenli bir noktada tamamla (yarım dosya bırakma). ${NO_NEW_WORK} Her şey bitince: ${writeStep(file, hasSkill)} Dosyanın en üstünde tek satır olsun: iş tamamen bittiyse \`Kalan: yok\`, kalan iş varsa \`Kalan: var\`. ${START_SESSION} ve ${HAND_OFF} çağırma, kart açma: sıradaki sohbeti ana sohbet açar. Dosyayı yazınca turu bitir.`
+
+export const MANAGED_START_DENY =
+  'otomatik-devir orkestra: bu yönetilen bir alt sohbet; yeni sohbet açma. Devir dosyasını yaz ve turu bitir; sıradakini ana sohbet açar.'
+
+export const ORKESTRA_PAUSED_BAND = 'Orkestra duraklatıldı: devam etmek için bir mesaj yaz.'
+export const ORKESTRA_PAUSED_DENY =
+  'otomatik-devir orkestra: zincir duraklatıldı (ana sohbetin turu kapandı); yeni alt sohbet şimdi açılamaz. Turu bitir: kullanıcının bir sonraki mesajı zinciri sürdürür.'
+
+export const orkestraBusyDeny = (n: number): string =>
+  `otomatik-devir orkestra: alt sohbet ${n} çalışıyor ya da açılıyor; ikinci kez açma. Bekle: sıradakini ne zaman açacağını mod söyler.`
+
+// O4 answers a start at the chain's limit with orkestraCapDeny(limit), and a
+// chain that ended there (`sinir`) with orkestraCapDeny too: it names the verb
+// that raises the limit.
+export const orkestraCapDeny = (limit: number): string =>
+  `otomatik-devir orkestra: zincir sınırına (${limit} alt sohbet) ulaşıldı; yeni sohbet açma. Sınırı kullanıcı /devir otonom limit <n> ile yükseltebilir. Kullanıcıya özet yaz ve turu bitir.`
+
+/** The child's background when the model's own is shorter than 80 chars (O4). */
+export const ORKESTRA_BACKGROUND =
+  "Otonom bir zincirin (otomatik-devir orkestra modu) yönetilen alt sohbeti: iş ana sohbetten ya da önceki alt sohbetin devir dosyasından devralındı. Prompt'u oku ve işe devam et."
+
+// ---------------------------------------------------------------------------
+// Records under BACKEND file (O16, Decision 10): JSON files read and written
+// with $.fs. $.fs has no rename, so a reader can catch a file mid-write: an
+// existing file that does not parse is read once more at once, and still
+// unparsable it is "not readable now" (`torn`), never "missing".
+// ---------------------------------------------------------------------------
+
+type FileRead = { kind: 'ok'; value: Record<string, unknown> } | { kind: 'missing' } | { kind: 'torn' }
+
+const readJsonFile = async ($: EngineInterface, path: string | undefined): Promise<FileRead> => {
+  if (path === undefined) return { kind: 'missing' }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let text: string
+    try {
+      text = await $.fs.read(path)
+    } catch {
+      return { kind: 'missing' }
+    }
+    try {
+      const got = record(JSON.parse(text))
+      if (got !== undefined) return { kind: 'ok', value: got }
+    } catch {
+      // cut or empty JSON: read it once more
+    }
+  }
+
+  return { kind: 'torn' }
+}
+
+const homeOf = async ($: EngineInterface): Promise<string | undefined> => nonEmpty(await $.env.get('HOME'))
+
+/** Store key prefix of a chain's settings (backend `store`); not `zincir:`, which the v1 cleanup deletes. */
+export const ZINCIR_AYAR_PREFIX = 'ayar:'
+
+/** A chain's settings file (backend `file`), keyed by its main chat's local id. */
+export const zincirAyarFile = (home: string, localId: string): string => `${ORKESTRA_DIR(home)}/ayar-${localId}.json`
+
+// The last chain settings this engine read or wrote, per chain: a torn read
+// returns it, so a chain's `esik`/`limit` never turn into the defaults for one
+// measurement (O16). Reset at session.start (O18).
+let lastAyar: Record<string, OrkestraAyar> = {}
+
+const toAyar = (got: Record<string, unknown>): OrkestraAyar => ({
+  esik: typeof got.esik === 'number' ? got.esik : undefined,
+  limit: typeof got.limit === 'number' ? got.limit : undefined,
+  isClosed: got.isClosed === true ? true : undefined,
+  at: typeof got.at === 'number' ? got.at : 0,
+})
+
+/** A chain's settings (Decision 22), or undefined when none were written. */
+export const readChainSettings = async ($: EngineInterface, mainLocalId: string): Promise<OrkestraAyar | undefined> => {
+  const home = await homeOf($)
+  const got = await readJsonFile($, home === undefined ? undefined : zincirAyarFile(home, mainLocalId))
+  if (got.kind === 'torn') return lastAyar[mainLocalId]
+  if (got.kind === 'missing') return undefined
+  const ayar = toAyar(got.value)
+  lastAyar[mainLocalId] = ayar
+
+  return ayar
+}
+
+/** That chain's limit (Decision 22): its settings' `limit` clamped, unset or invalid the default. */
+export const orkestraLimit = async ($: EngineInterface, mainLocalId: string): Promise<number> => {
+  const limit = (await readChainSettings($, mainLocalId).catch(() => undefined))?.limit
+
+  return typeof limit === 'number' && Number.isFinite(limit) ? clampLimit(limit) : DEFAULT_LIMIT
+}
+
+/** `/devir otonom …` outside a chain (Decision 22: no chain settings, so the default limit). */
+const NOT_ORCHESTRATED = `Bu sohbet orkestra modunda değil (sınır ${DEFAULT_LIMIT} alt sohbet). Başlatmak için /devir-otonom <görev> yaz.`
 
 type SelfSettings = { effort?: string; model?: string; permissionMode?: string }
 type Settings = { threshold: number; isEnabled: boolean }
@@ -876,8 +1090,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'devir',
-      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac',
-      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac]',
+      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac, otonom [dur | limit <n>]',
+      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | limit <n>]]',
     })
     isPersonTurn = false
     isNextTurnPerson = false

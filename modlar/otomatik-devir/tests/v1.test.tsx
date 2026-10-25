@@ -9,20 +9,35 @@ import {
   HANDED_PREFIX,
   handoffFile,
   inTurnHandoff,
+  KAPAT_CHAIN,
+  KIMLIK_PREFIX,
   LONG_CHAT_SECTION_ID,
   longChatNote,
-  MAX_HANDOFF_BLOCKS,
+  MANAGED_START_DENY,
+  managedHandoff,
   nextMessageNote,
+  NORMAL_INFO,
+  normalDeneText,
+  ORKESTRA_PREFIX,
+  orkestraRecordFile,
   READY_BAND,
+  RECORD_BACKEND,
   RUN_PREFIX,
   SKILL_HANDOFF_DENY,
   START_NOW,
   timeoutText,
   waitText,
+  ZINCIR_AYAR_PREFIX,
+  zincirAyarFile,
 } from '../hooks/register.tsx'
 
 // v1.0 Spec (S1-S11) tests, one per id V1-V15 (probe: RESULT M, turn.complete PER-TURN,
 // so V16/V17 do not apply).
+//
+// v1.1 (Decisions 19-22, T11): a normal chat is passive, so every handoff test here runs
+// in a managed sub-chat (role `alt`, `local_c1` of the chain `local_main`), and the old
+// global `esik`/`acik` of the store argument are that chain's settings. Tests about
+// things that do not depend on a handoff (V14/V14b, R1) keep a normal chat (`yok`).
 
 const PLUGIN = 'otomatik-devir'
 const SKILL = 'my-skill-handoff'
@@ -47,16 +62,66 @@ const HANDOFF_TEXT = "# HANDOFF\n\nkalanlar: adım 3\n\n## Devam prompt'u\nDevam
 
 type Task = { id: string; type: string; status: string; description: string }
 
+// The managed sub-chat's chain (Decisions 19, 22): its main chat's record, its own record
+// and the chain settings, all through RECORD_BACKEND (store-probe.md: BACKEND file).
+const HOME = '/home/test'
+const MAIN = 'local_main'
+const CHILD = 'local_c1'
+const CHILD2 = 'local_c2'
+const PARENT_REC = {
+  role: 'ana',
+  sid: 'main',
+  localId: MAIN,
+  task: 'iş',
+  title: 'iş',
+  n: 1,
+  childId: CHILD,
+  isHeld: true,
+  startedAt: 0,
+  at: 0,
+}
+const CHILD_REC = { role: 'alt', parent: MAIN, n: 1, sid: 's1', localId: CHILD, status: 'working', at: 0 }
+const CHILD_PREFIX = 'Orkestra alt sohbet 1 · '
+
+const putRecord = (world: any, localId: string, rec: Record<string, unknown>) => {
+  if (RECORD_BACKEND === 'store') world.store[`${ORKESTRA_PREFIX}${localId}`] = JSON.parse(JSON.stringify(rec))
+  else world.files[orkestraRecordFile(HOME, localId)] = { text: JSON.stringify(rec), mtimeMs: 0 }
+}
+const getRecord = (world: any, localId: string): any => {
+  if (RECORD_BACKEND === 'store') return world.store[`${ORKESTRA_PREFIX}${localId}`]
+  const file = world.files[orkestraRecordFile(HOME, localId)]
+  return file === undefined ? undefined : JSON.parse(file.text)
+}
+const putChainSettings = (world: any, rec: Record<string, unknown>) => {
+  if (RECORD_BACKEND === 'store') world.store[`${ZINCIR_AYAR_PREFIX}${MAIN}`] = JSON.parse(JSON.stringify(rec))
+  else world.files[zincirAyarFile(HOME, MAIN)] = { text: JSON.stringify(rec), mtimeMs: 0 }
+}
+const getChainSettings = (world: any): any => {
+  if (RECORD_BACKEND === 'store') return world.store[`${ZINCIR_AYAR_PREFIX}${MAIN}`]
+  const file = world.files[zincirAyarFile(HOME, MAIN)]
+  return file === undefined ? undefined : JSON.parse(file.text)
+}
+/** The main chat relays the next child (O15): this ready child is consumed. */
+const parentMovesOn = (world: any) => putRecord(world, MAIN, { ...PARENT_REC, n: 2, childId: CHILD2 })
+/** A second managed sub-chat of the same chain, for session `s2`. */
+const seedSecondChild = (world: any) => {
+  world.store[`${KIMLIK_PREFIX}s2`] = CHILD2
+  putRecord(world, CHILD2, { role: 'alt', parent: MAIN, n: 2, sid: 's2', localId: CHILD2, status: 'working', at: 0 })
+}
+
 /**
  * The world beneath the mod (the trimmed v0.5 setup): a session whose id, fill,
  * subagents and handoff files the test controls, the store open to the test.
+ * `role: 'alt'` (default) makes session s1 the managed sub-chat `local_c1` of the chain
+ * `local_main`, the store argument's `esik`/`acik` its chain settings (M11);
+ * `role: 'yok'` keeps the plain v1 world (a normal chat).
  */
 const setup = (
   on: any,
   store: Record<string, unknown> = { esik: 40 },
-  opts: { tools?: string[]; commands?: string[] } = {},
+  opts: { tools?: string[]; commands?: string[]; role?: 'alt' | 'yok' } = {},
 ) => {
-  const { tools = [START, GET, DETACH, HAND_OFF], commands = [SKILL] } = opts
+  const { tools = [START, GET, DETACH, HAND_OFF], commands = [SKILL], role = 'alt' } = opts
   const world = {
     sid: 's1',
     percent: 10 as number | undefined,
@@ -83,6 +148,14 @@ const setup = (
   const clock = mock.clock(on, { now: NOW })
   const clone = (value: unknown) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)))
   Object.assign(world.store, clone(store))
+  if (role === 'alt') {
+    // session.start restores role `alt` from kimlik:s1 and the own record (O16), so
+    // compose and the status line see it from the first call (O2, O9).
+    world.store[`${KIMLIK_PREFIX}s1`] = CHILD
+    putRecord(world, MAIN, PARENT_REC)
+    putRecord(world, CHILD, CHILD_REC)
+    putChainSettings(world, { esik: store.esik, isClosed: store.acik === false ? true : undefined, at: 0 })
+  }
   on('store.get', ($: any, e: any) => ({ value: clone(world.store[e.key]) }))
   on('store.set', ($: any, e: any) => {
     world.store[e.key] = clone(e.value)
@@ -130,7 +203,13 @@ const setup = (
   on('tool.call', ($: any, e: any) => {
     world.calls.push(e)
     if (e.tool === GET) {
-      return { result: [], text: JSON.stringify({ sessionId: 'local_self', title: 'Eski iş' }) }
+      if (role === 'yok') return { result: [], text: JSON.stringify({ sessionId: 'local_self', title: 'Eski iş' }) }
+      // s1 is the chain's child; any other session is a normal chat (no parent).
+      const self =
+        world.sid === 's1'
+          ? { sessionId: CHILD, parentSessionId: MAIN, title: 'Eski iş' }
+          : { sessionId: `local_${world.sid}`, title: 'Eski iş' }
+      return { result: [], text: JSON.stringify(self) }
     }
     if (e.tool === START) {
       if (world.startMode === 'throw') throw new Error('start_session failed')
@@ -154,6 +233,11 @@ const setup = (
     const file = world.files[e.path]
     if (file === undefined) throw new Error('ENOENT')
     return { value: file.text }
+  })
+  // The orchestration records and chain settings (BACKEND file) land beside the handoff files.
+  on('fs.write', ($: any, e: any) => {
+    world.files[e.path] = { text: e.text, mtimeMs: clock.now() }
+    return { value: undefined }
   })
   on('prompt.submit', ($: any, e: any) => {
     world.typed.push({ text: e.text, context: e.context ?? [] })
@@ -261,18 +345,21 @@ describe('otomatik-devir v1', () => {
     expect(held.block).toContain('5 dakika')
     expect(held.block).not.toContain('b1')
     // Nothing waited on: the Stop goes on to the handoff's own block (file missing), no wait text.
-    expect((await stop($, [SHELL, MONITOR])).block).toBe(fileMissingText(FILE, true))
+    // M2: a managed sub-chat's gate is closed, so (d) asks for the file (no START_NOW part).
+    expect((await stop($, [SHELL, MONITOR])).block).toBe(fileMissingText(FILE, false))
     // A finished or waiting subagent is not waited on (Decision 15).
     expect((await stop($, [{ ...SUBAGENT, status: 'completed' }, { ...SUBAGENT, id: 'a2', status: 'waiting' }])).block).toBe(
-      fileMissingText(FILE, true),
+      fileMissingText(FILE, false),
     )
+    // (d) gives at most 2 file blocks per turn: a new turn for the $.agent.list() checks.
+    await turnBegin($)
     // No background_tasks in the hook: $.agent.list() decides.
     world.agents = [{ id: 'a7', description: 'yaz', type: 'general-purpose', status: 'running' }]
     expect((await $.classic.Stop({ stop_hook_active: false } as any)).block).toBe(
       waitText([{ id: 'a7', description: 'yaz' }]),
     )
     world.agents = [{ id: 'a7', description: 'yaz', type: 'general-purpose', status: 'waiting' }]
-    expect((await $.classic.Stop({ stop_hook_active: false } as any)).block).toBe(fileMissingText(FILE, true))
+    expect((await $.classic.Stop({ stop_hook_active: false } as any)).block).toBe(fileMissingText(FILE, false))
     expect(await phase($)).toContain('aşama: handoff_running')
   })
 
@@ -394,11 +481,12 @@ describe('otomatik-devir v1', () => {
     expect((await bash($)).context ?? []).toEqual([])
     world.percent = 50
     const got = await bash($)
-    expect(got.context).toEqual([inTurnHandoff(40, FILE)])
+    // M1: a managed sub-chat writes its file only; the main chat opens the next one (O12).
+    expect(got.context).toEqual([managedHandoff(40, FILE)])
     expect(got.context?.[0]).toContain(`auto ${FILE}`)
     expect(got.context?.[0]).toContain(START)
-    expect(got.context?.[0]).toContain('initiation "user_asked"')
-    expect(got.context?.[0]).toContain('context "fresh"')
+    expect(got.context?.[0]).not.toContain('initiation "user_asked"')
+    expect(got.context?.[0]).toContain('Kalan: yok')
     expect(got.context?.[0]).toContain('reddeder')
     expect(world.store[`${RUN_PREFIX}s1`]).toEqual({
       handoffId: `s1-${NOW.toString(36)}`,
@@ -420,46 +508,52 @@ describe('otomatik-devir v1', () => {
     await turnBegin($)
     world.percent = 50
     const got = await stop($, [])
-    expect(got.block).toBe(inTurnHandoff(40, FILE))
+    expect(got.block).toBe(managedHandoff(40, FILE))
     expect(await phase($)).toContain('aşama: handoff_running')
     expect(world.store[`${RUN_PREFIX}s1`]).toMatchObject({ phase: 'handoff_running', file: FILE })
   })
 
-  test('(V8) start_session: dosya yoksa ret; taze dosyayla iletilir, ayrılmaz; ikinci kez ret', async ($, on) => {
+  test('(V8) start_session yönetilen alt sohbette hep reddedilir (dosya yokken, taze dosyayla, tüketildikten sonra); dosya ready yapar, ayrılmaz', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await typedTrip($, world, clock)
+    // M3 (O13): the managed sub-chat never starts a session itself, file or not. The
+    // forwarding (prompt = file + message, background >= 80, title, no detach) is the
+    // main chat's O4 now (T5 A7/A10).
     const missing = await startSession($)
-    expect(missing.deny).toBe(`otomatik-devir: önce devir dosyasını yaz: ${FILE}`)
+    expect(missing.deny).toBe(MANAGED_START_DENY)
     expect(callsOf(world, START)).toHaveLength(0)
     // A file older than this handoff is not fresh.
     world.files[FILE] = { text: HANDOFF_TEXT, mtimeMs: NOW - 1 }
-    expect((await startSession($)).deny).toBe(`otomatik-devir: önce devir dosyasını yaz: ${FILE}`)
+    expect((await startSession($)).deny).toBe(MANAGED_START_DENY)
+    expect((await stop($, [])).block).toBe(fileMissingText(FILE, false))
     writeFile(world, clock)
     const got = await startSession($, { initiation: 'offer', context: 'inherit' })
-    expect(got.deny).toBeUndefined()
-    const [sent] = callsOf(world, START)
-    expect(callsOf(world, START)).toHaveLength(1)
-    expect(sent.prompt).toBe(HANDOFF_TEXT)
-    expect(sent.context).toBe('fresh')
-    expect(sent.initiation).toBe('user_asked')
-    expect(sent.title).toBe('Eski iş (devam)')
-    expect(sent.background.length).toBeGreaterThanOrEqual(80)
+    expect(got.deny).toBe(MANAGED_START_DENY)
+    expect(callsOf(world, START)).toHaveLength(0)
+    expect(world.store[`${HANDED_PREFIX}s1`]).toBeUndefined()
+    expect(world.store[`${RUN_PREFIX}s1`]).toMatchObject({ phase: 'handoff_running', file: FILE })
+    // The fresh file makes it ready at the Stop (d); the child's record names the file.
+    expect((await stop($, [])).block).toBeUndefined()
+    expect(await phase($)).toContain('aşama: ready')
+    expect(getRecord(world, CHILD)).toMatchObject({ role: 'alt', status: 'ready', file: FILE })
     expect(callsOf(world, DETACH)).toHaveLength(0)
     await clock.advance(100)
     expect(callsOf(world, DETACH)).toHaveLength(0)
-    expect(world.store[`${HANDED_PREFIX}s1`]).toMatchObject({
-      handoffId: `s1-${NOW.toString(36)}`,
-      startedId: NEW_ID,
-      file: FILE,
-    })
-    expect(world.store[`${RUN_PREFIX}s1`]).toBeUndefined()
-    expect(world.toasts).toContain('Devam yeni sohbette: Eski iş (devam)')
+    expect(world.toasts.some(text => text.startsWith('Devam yeni sohbette'))).toBe(false)
+    // M6 (O15): the main chat relays the next child, so this one is consumed: done.
+    parentMovesOn(world)
     expect(await phase($)).toContain('aşama: done')
+    expect(world.store[`${RUN_PREFIX}s1`]).toBeUndefined()
+    expect(world.store[`${HANDED_PREFIX}s1`]).toBeUndefined()
+    // Done: a later threshold crossing opens no handoff.
+    world.percent = 95
+    expect((await bash($)).context ?? []).toEqual([])
     const again = await startSession($)
-    expect(String(again.deny)).toContain('zaten devredildi')
-    expect(String(again.deny)).toContain(NEW_ID)
-    expect(callsOf(world, START)).toHaveLength(1)
+    expect(again.deny).toBe(MANAGED_START_DENY)
+    expect((await $.tool.call({ tool: HAND_OFF, prompt: 'x' } as any)).deny).toBe(MANAGED_START_DENY)
+    expect(callsOf(world, START)).toHaveLength(0)
+    expect(callsOf(world, HAND_OFF)).toHaveLength(0)
   })
 
   test('(V9) depoda devredildi:<sid> varsa taze $.state ile de eşik üstünde devir olmaz', async ($, on) => {
@@ -502,23 +596,26 @@ describe('otomatik-devir v1', () => {
     const third = (await stop($, [SUBAGENT])).block
     expect(third).not.toBe(waitText(running))
     expect(third).not.toBe(timeoutText(running))
-    expect(third).toBe(fileMissingText(FILE, true))
+    // M2: Stop (d) in a managed sub-chat (closed gate).
+    expect(third).toBe(fileMissingText(FILE, false))
   })
 
-  test('(V11) makine turunda tetik: kapalı tur metni, start_session ret, dosyayla ready ve bant', async ($, on) => {
+  test('(V11) makine turunda tetik: yönetilen devir metni, start_session ret, dosyayla ready; hazır tostu ve bandı yok', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await machine($, 'görev bildirimi')
     await turnBegin($)
     world.percent = 50
     const got = await bash($)
-    expect(got.context).toEqual([closedTurnHandoff(40, FILE)])
+    // M1: the managed handoff text in a machine turn too (O12).
+    expect(got.context).toEqual([managedHandoff(40, FILE)])
     expect(got.context?.[0]).toContain(FILE)
     expect(got.context?.[0]).toContain('çağırma')
     expect(got.context?.[0]).not.toContain('user_asked')
     await clock.advance(100)
     const refused = await startSession($)
-    expect(String(refused.deny)).toContain('kullanıcının yazdığı bir tur değil')
+    // M3 (O13).
+    expect(refused.deny).toBe(MANAGED_START_DENY)
     expect(callsOf(world, START)).toHaveLength(0)
     // Without the file the Stop asks for it (closed gate).
     expect((await stop($, [])).block).toBe(fileMissingText(FILE, false))
@@ -526,65 +623,74 @@ describe('otomatik-devir v1', () => {
     expect((await stop($, [])).block).toBeUndefined()
     expect(await phase($)).toContain('aşama: ready')
     expect(world.store[`${RUN_PREFIX}s1`]).toMatchObject({ phase: 'ready' })
-    expect(world.toasts).toContain(READY_BAND)
-    expect(world.statuses.at(-1)).toBe('Devir hazır')
+    // M4, M10: no ready toast or band in a managed sub-chat; the status names the child.
+    expect(world.toasts).not.toContain(READY_BAND)
+    expect(world.statuses.at(-1)).toBe(`${CHILD_PREFIX}Devir hazır`)
     const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'AbovePrompt', props: BAND } as any)
     const texts = await ui.findAll({ type: 'Text' })
-    expect(texts.map((t: any) => t.text ?? t.props?.children)).toContain(READY_BAND)
+    expect(texts.map((t: any) => t.text ?? t.props?.children)).not.toContain(READY_BAND)
     const drawn: any = await ui.drawn()
-    expect(JSON.stringify(drawn)).toContain(READY_BAND)
+    expect(JSON.stringify(drawn)).not.toContain(READY_BAND)
     expect(JSON.stringify(drawn)).toContain('"below"')
     expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
     await ui.unmount()
   })
 
-  test('(V12) Esc: iptal yok, makine turu başına bir kapalı not, yazılan mesaj notu ve prompt\'a eklenir', async ($, on) => {
+  test('(V12) Esc: iptal yok, makine turu başına bir yönetilen devir notu; yazılan mesaj not almaz, devir dosyayla ready olur', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await typedTrip($, world, clock)
     await turnEnd($, true)
     expect(await phase($)).toContain('aşama: handoff_running')
     expect([...world.toasts, ...world.logs].some(text => /iptal/i.test(text))).toBe(false)
-    // A machine turn gets the closed-turn text once.
+    // A machine turn gets the (managed, M1) handoff text once.
     await machine($, 'görev bildirimi')
     await turnBegin($)
-    expect((await bash($)).context).toEqual([closedTurnHandoff(40, FILE)])
+    expect((await bash($)).context).toEqual([managedHandoff(40, FILE)])
     expect((await bash($)).context ?? []).toEqual([])
     await turnEnd($)
     await machine($, 'görev bildirimi 2')
     await turnBegin($)
-    expect((await bash($)).context).toEqual([closedTurnHandoff(40, FILE)])
+    expect((await bash($)).context).toEqual([managedHandoff(40, FILE)])
     expect((await bash($)).context ?? []).toEqual([])
     await turnEnd($)
-    // The person's message carries the next-message note and opens the child.
+    // M5 (O12): S8 is skipped in a managed sub-chat: no next-message note, no claim. The
+    // pending-message behaviour is the main chat's O7 (T5 A12).
     await typed($, 'şunu yap')
     const last = world.typed.at(-1)
     expect(last?.text).toBe('şunu yap')
-    expect(last?.context).toEqual([nextMessageNote(FILE, false)])
-    expect(last?.context?.[0]).toContain('YAPMA')
+    expect(last?.context).toEqual([])
+    expect(world.toasts).not.toContain('Devir: yeni sohbet bu mesajınla açılacak.')
+    expect(await phase($)).toContain('aşama: handoff_running')
     await turnBegin($)
     writeFile(world, clock)
-    expect((await startSession($)).deny).toBeUndefined()
-    const [sent] = callsOf(world, START)
-    expect(sent.prompt).toBe(`${HANDOFF_TEXT}\n\n## Kullanıcının son mesajı (yeni sohbetin ilk işi)\nşunu yap`)
-    expect(await phase($)).toContain('aşama: done')
+    expect((await startSession($)).deny).toBe(MANAGED_START_DENY)
+    expect(callsOf(world, START)).toHaveLength(0)
+    // The turn end with the file written makes it ready (the main chat starts the next one).
+    await turnEnd($)
+    expect(await phase($)).toContain('aşama: ready')
+    expect(getRecord(world, CHILD)).toMatchObject({ status: 'ready', file: FILE })
   })
 
   test('(V13) /devir dene 5 yalnızca bu oturum; depodaki esik değişmez; dene kaldırır', async ($, on) => {
     const { world, clock } = setup(on)
+    seedSecondChild(world)
     world.percent = 3
     await start($)
     expect((await devir($, 'dene 5')).text).toContain('%5')
+    // The global key is never written (Decision 22); the chain's esik stays too.
     expect(world.store.esik).toBe(40)
+    expect(getChainSettings(world)).toMatchObject({ esik: 40 })
     expect(await phase($)).toContain('Devir: %3 / eşik %5 (bu sohbet)')
-    expect(world.statuses.at(-1)).toBe('Devir: %3 / eşik %5 (bu sohbet)')
-    // This chat trips at 5 (fill 10), under the global 40.
+    // M10: the managed sub-chat's status carries its prefix.
+    expect(world.statuses.at(-1)).toBe(`${CHILD_PREFIX}Devir: %3 / eşik %5 (bu sohbet)`)
+    // This chat trips at 5 (fill 10), under the chain's 40.
     await typed($, 'iş')
     await turnBegin($)
     world.percent = 10
-    expect((await bash($)).context).toEqual([inTurnHandoff(5, FILE)])
+    expect((await bash($)).context).toEqual([managedHandoff(5, FILE)])
     await clock.advance(100)
-    // Another session keeps the global threshold.
+    // Another sub-chat of the same chain keeps the chain's threshold.
     world.sid = 's2'
     expect(await phase($)).toContain('Devir: %10 / eşik %40 · aşama: idle')
     expect(await phase($)).not.toContain('bu sohbet')
@@ -598,6 +704,11 @@ describe('otomatik-devir v1', () => {
     expect(await phase($)).toContain('Devir: %10 / eşik %40 · aşama: idle')
     expect(world.store.esik).toBe(40)
     expect((await devir($, 'dene 0')).text).toContain('Kullanım')
+    // A normal chat (no chain) keeps its dene too, but does not hand off (normalDeneText).
+    world.sid = 's3'
+    expect((await devir($, 'dene 9')).text).toBe(normalDeneText(9))
+    expect(await phase($)).toBe(NORMAL_INFO)
+    expect(world.store.esik).toBe(40)
   })
 
   describe('(V14) tek seferlik temizlik', () => {
@@ -619,7 +730,7 @@ describe('otomatik-devir v1', () => {
     ]
 
     test('(V14) yalnızca OWN_TASK kimliklerini siler, temizlik-v1 koyar, esik/acik kalır', async ($, on) => {
-      const { world, clock } = setup(on, TASK_STORE, { tools: [START, GET, TASKS, DELETE] })
+      const { world, clock } = setup(on, TASK_STORE, { tools: [START, GET, TASKS, DELETE], role: 'yok' })
       world.tasks = [...TASK_LIST]
       await start($)
       await clock.advance(500)
@@ -649,7 +760,7 @@ describe('otomatik-devir v1', () => {
     })
 
     test('(V14b) $.tool.check izin vermezse silme yok, bayrak yok', async ($, on) => {
-      const { world, clock } = setup(on, TASK_STORE, { tools: [START, GET, TASKS, DELETE] })
+      const { world, clock } = setup(on, TASK_STORE, { tools: [START, GET, TASKS, DELETE], role: 'yok' })
       world.tasks = [...TASK_LIST]
       world.checkDecision = 'ask'
       await start($)
@@ -666,31 +777,32 @@ describe('otomatik-devir v1', () => {
     })
   })
 
-  test('(V15) yazılan turda en çok 4 devir bloğu; tur sonu kapıyı kapatır', async ($, on) => {
+  test('(V15) yazılan turda yönetilen alt sohbet en çok 2 dosya bloğu (d) alır; tur sonu kapıyı kapalı bırakır', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await typedTrip($, world, clock)
-    for (let i = 0; i < MAX_HANDOFF_BLOCKS; i += 1) {
-      expect((await stop($, [])).block).toBe(fileMissingText(FILE, true))
+    // M2: no Stop (c) in a managed sub-chat; (d) asks for the file at most MAX_MISSING_BLOCKS (2) times.
+    for (let i = 0; i < 2; i += 1) {
+      expect((await stop($, [])).block).toBe(fileMissingText(FILE, false))
     }
     expect((await stop($, [])).block).toBeUndefined()
     await turnEnd($)
     expect(await phase($)).toContain('aşama: handoff_running')
-    // The gate is closed: a machine turn gets the closed-turn text, start_session is refused there...
+    // The gate is closed: a machine turn gets the handoff text, start_session is refused there...
     await machine($, 'görev bildirimi')
     await turnBegin($)
-    expect((await bash($)).context).toEqual([closedTurnHandoff(40, FILE)])
+    expect((await bash($)).context).toEqual([managedHandoff(40, FILE)])
     writeFile(world, clock)
-    expect(String((await startSession($)).deny)).toContain('kullanıcının yazdığı bir tur değil')
+    expect((await startSession($)).deny).toBe(MANAGED_START_DENY)
     await turnEnd($)
     // ...and the turn end with the file written makes it ready.
     expect(await phase($)).toContain('aşama: ready')
-    // A typed message then reopens the gate with the file ready.
+    // M5: a typed message reopens nothing (no S8 note); start_session stays refused (M3).
     await typed($, 'devam')
-    expect(world.typed.at(-1)?.context).toEqual([nextMessageNote(FILE, true)])
+    expect(world.typed.at(-1)?.context).toEqual([])
     await turnBegin($)
-    expect((await startSession($)).deny).toBeUndefined()
-    expect(callsOf(world, START)).toHaveLength(1)
+    expect((await startSession($)).deny).toBe(MANAGED_START_DENY)
+    expect(callsOf(world, START)).toHaveLength(0)
   })
 })
 
@@ -719,12 +831,14 @@ describe('long-chat note', () => {
     base(on)
     await start($)
     const got = await sections($)
-    expect(got.map(s => s.id)).toEqual(['intro', 'env', 'otomatik-devir'])
+    // M8: in a managed sub-chat only, id `otomatik-devir:long-chat` (Decision 21b).
+    expect(got.map(s => s.id)).toEqual(['intro', 'env', 'otomatik-devir:long-chat'])
     const last = got.at(-1)!
     expect(last.id).toBe(LONG_CHAT_SECTION_ID)
     expect(last.scope).toBe('session')
     expect(last.text).toBe(longChatNote(60))
     expect(last.text).toContain('%60')
+    expect(last.text).toContain("%60'a")
     expect(last.text).toContain('/devir simdi')
   })
 
@@ -746,7 +860,11 @@ describe('long-chat note', () => {
     world.percent = 70
     await bash($)
     writeFile(world, clock)
-    expect((await startSession($)).deny).toBeUndefined()
+    // A managed sub-chat writes its file only (M3); the Stop makes it ready and the main
+    // chat's next child consumes it (M6, O15): done.
+    expect((await startSession($)).deny).toBe(MANAGED_START_DENY)
+    expect((await stop($, [])).block).toBeUndefined()
+    parentMovesOn(world)
     expect(await phase($)).toContain('aşama: done')
     expect((await sections($)).map(s => s.id)).toEqual(['intro', 'env'])
   })
@@ -782,7 +900,7 @@ describe('T8 review', () => {
 
   test('(R1, S11 fix) görev araçları yokken bayrak konmaz; araçlar bağlanınca aynı oturum yeniden dener', async ($, on) => {
     const tools = [START, GET]
-    const { world, clock } = setup(on, { esik: 40, mod: 'sor', 'zincir:s0': { x: 1 } }, { tools })
+    const { world, clock } = setup(on, { esik: 40, mod: 'sor', 'zincir:s0': { x: 1 } }, { tools, role: 'yok' })
     world.tasks = [{ taskId: 'otomatik-devir-1a2b3c4d-a' }, { taskId: 'baska-gorev' }]
     await start($)
     await clock.advance(500)
@@ -800,50 +918,58 @@ describe('T8 review', () => {
     expect(world.store.esik).toBe(40)
   })
 
-  test('(R2, S6) reddedilen start_session (isError) kapıyı kapatır; Stop ready yapar, START_NOW yok', async ($, on) => {
+  test('(R2, S6) yönetilen alt sohbette start_session reddedilir (isError bile denenmez); Stop ready yapar, START_NOW yok', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await typedTrip($, world, clock)
     writeFile(world, clock)
     world.startMode = 'error'
-    expect((await startSession($)).isError).toBe(true)
+    // M3 (O13): the refusal is the mod's own, before the app is reached.
+    expect((await startSession($)).deny).toBe(MANAGED_START_DENY)
+    expect(callsOf(world, START)).toHaveLength(0)
     expect(world.store[`${HANDED_PREFIX}s1`]).toBeUndefined()
     const after = await stop($, [])
     expect(after.block).toBeUndefined()
     expect(await phase($)).toContain('aşama: ready')
   })
 
-  test('(R3, S6 fix) hata fırlatan start_session da reddedilmiş sayılır: starting temizlenir, kapı kapanır', async ($, on) => {
+  test('(R3, S6 fix) yönetilen alt sohbette hata fırlatacak start_session da reddedilir: starting kalmaz, kapı kapalı, ana sohbet sıradakini açınca done', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await typedTrip($, world, clock)
     writeFile(world, clock)
     world.startMode = 'throw'
     const got: any = await startSession($).catch((error: unknown) => ({ thrown: error }))
-    expect(got.deny).toBeUndefined()
+    // M3 (O13): denied before the app is reached, so nothing throws.
+    expect(got.deny).toBe(MANAGED_START_DENY)
     expect(world.store[`${HANDED_PREFIX}s1`]).toBeUndefined()
     // Gate closed: the Stop makes it ready instead of asking for another start (START_NOW).
     expect((await stop($, [])).block).toBeUndefined()
     expect(await phase($)).toContain('aşama: ready')
-    // `starting` was cleared: the next typed message can start the child.
+    // The next typed message starts nothing here either (M3, M5).
     world.startMode = 'ok'
     await typed($, 'devam')
     await turnBegin($)
-    expect((await startSession($)).deny).toBeUndefined()
+    expect((await startSession($)).deny).toBe(MANAGED_START_DENY)
+    expect(callsOf(world, START)).toHaveLength(0)
+    // M6 (O15): the main chat starts the next child from the file; this one is done.
+    parentMovesOn(world)
     expect(await phase($)).toContain('aşama: done')
   })
 
-  test('(R4, S7c) yazılan turda dosya hazırsa Stop START_NOW ile tutar', async ($, on) => {
+  test('(R4, S7c) yazılan turda dosya hazırsa yönetilen alt sohbette Stop START_NOW ile tutmaz: (d) ready yapar', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await typedTrip($, world, clock)
     writeFile(world, clock)
+    // M2: Stop (c) does not run in a managed sub-chat; (d) with a fresh file → ready.
     const got = await stop($, [])
-    expect(got.block).toBe(START_NOW)
-    expect(got.block).toContain(START)
+    expect(got.block).toBeUndefined()
+    expect(got.block).not.toBe(START_NOW)
+    expect(await phase($)).toContain('aşama: ready')
   })
 
-  test('(R5, S8) düşürülen mesaj (drop) önceki aşamayı geri getirir', async ($, on) => {
+  test('(R5, S8) yönetilen alt sohbette yazılan mesaj (düşürülen ya da geçen) ready aşamasını değiştirmez', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await toReady($, world, clock)
@@ -851,10 +977,10 @@ describe('T8 review', () => {
     await typed($, 'şunu yap')
     expect(await phase($)).toContain('aşama: ready')
     expect(world.store[`${RUN_PREFIX}s1`]).toMatchObject({ phase: 'ready' })
-    // Not instructed: the next turn's start_session is still the typed message's job, not this one's.
+    // M5 (O12): S8 is skipped in a managed sub-chat: no note, no claim (the main chat's O7, T5 A12).
     await typed($, 'şunu yap')
-    expect(world.typed.at(-1)?.context).toEqual([nextMessageNote(FILE, true)])
-    expect(await phase($)).toContain('aşama: handoff_running')
+    expect(world.typed.at(-1)?.context).toEqual([])
+    expect(await phase($)).toContain('aşama: ready')
   })
 
   test('(R6, S2) depodaki devir:<sid> kapı kapalı geri yüklenir', async ($, on) => {
@@ -864,13 +990,13 @@ describe('T8 review', () => {
     })
     await start($)
     expect(await phase($)).toContain('aşama: handoff_running')
-    // Closed gate: a machine turn gets the closed-turn text, a typed message the next-message note.
+    // Closed gate: a machine turn gets the (managed, M1) handoff text; a typed message no note (M5).
     await machine($, 'görev bildirimi')
     await turnBegin($)
-    expect((await bash($)).context).toEqual([closedTurnHandoff(40, FILE)])
+    expect((await bash($)).context).toEqual([managedHandoff(40, FILE)])
     await turnEnd($)
     await typed($, 'devam')
-    expect(world.typed.at(-1)?.context).toEqual([nextMessageNote(FILE, false)])
+    expect(world.typed.at(-1)?.context).toEqual([])
   })
 
   test('(R7, S1) devirde durum satırı: N alt ajan bitiyor; ready iken Devir hazır', async ($, on) => {
@@ -883,7 +1009,7 @@ describe('T8 review', () => {
     expect(await phase($)).toContain('Devir: %50 / eşik %40')
   })
 
-  test('(R8, S4/S10) ready iken drain sürer; bant boştayken ve çalışırken çizilmez', async ($, on) => {
+  test('(R8, S4/S10) ready iken drain sürer; hazır bandı yönetilen alt sohbette hiç çizilmez', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     const idle = await mountBand($)
@@ -896,8 +1022,10 @@ describe('T8 review', () => {
     expect(await bandText(working)).not.toContain(READY_BAND)
     expect(await bandText(working)).toContain('"below"')
     await working.unmount()
+    // M4 (O12): idle and not working, a managed sub-chat still draws no ready band.
     const shown = await mountBand($)
-    expect(await bandText(shown)).toContain(READY_BAND)
+    expect(await bandText(shown)).not.toContain(READY_BAND)
+    expect(await bandText(shown)).toContain('"below"')
     await shown.unmount()
   })
 
@@ -1016,11 +1144,19 @@ describe('v1.0.1 hotfix', () => {
     const reply = (await devir($, 'kapat')).text as string
     expect(reply).toContain('kapatıldı')
     expect(reply).toContain('süren devri iptal edildi')
-    expect(world.store.acik).toBe(false)
+    // M7: the reply names the chain stop (O21).
+    expect(reply.endsWith(` ${KAPAT_CHAIN}`)).toBe(true)
+    // M11: the chain's settings are closed; the global key is never written.
+    expect(getChainSettings(world)).toMatchObject({ isClosed: true })
+    expect(world.store.acik).toBeUndefined()
     expect(world.store[`${RUN_PREFIX}s1`]).toBeUndefined()
     expect(world.store[`${HANDED_PREFIX}s1`]).toBeUndefined()
+    // M7 (O21): the cancelled sub-chat keeps role `alt` (its status prefix); its record is `cancelled`.
     expect(await phase($)).toContain('aşama: idle')
-    expect(world.statuses.at(-1)).toBe('Devir: kapalı')
+    expect(await phase($)).toContain(CHILD_PREFIX)
+    expect(getRecord(world, CHILD)).toMatchObject({ role: 'alt', status: 'cancelled' })
+    expect(getRecord(world, CHILD)?.file).toBeUndefined()
+    expect(world.statuses.at(-1)).toBe(`${CHILD_PREFIX}Devir: kapalı`)
     // The file already written stays.
     expect(world.files[FILE]).toBeDefined()
 
@@ -1031,9 +1167,9 @@ describe('v1.0.1 hotfix', () => {
     expect(((await spawn($, 'sonra')) as any).deny).toBeUndefined()
     expect((await stop($, [SUBAGENT])).block).toBeUndefined()
     expect((await stop($, [])).block).toBeUndefined()
-    // start_session passes untouched (no handoff): the model's own prompt, no handed-off flag.
-    expect((await startSession($)).deny).toBeUndefined()
-    expect(callsOf(world, START).at(-1)?.prompt).toBe('modelin promptu')
+    // M3 (O13): no handoff, yet a managed sub-chat's start_session stays refused; no handed-off flag.
+    expect((await startSession($)).deny).toBe(MANAGED_START_DENY)
+    expect(callsOf(world, START)).toHaveLength(0)
     expect(world.store[`${HANDED_PREFIX}s1`]).toBeUndefined()
     // No handoff starts above the threshold while off.
     expect((await bash($)).context ?? []).toEqual([])
@@ -1046,6 +1182,10 @@ describe('v1.0.1 hotfix', () => {
     await toReady($, world, clock)
     const reply = (await devir($, 'kapat')).text as string
     expect(reply).toContain('hazır devri iptal edildi')
+    // M7 (O21): the chain stop text; the sub-chat keeps role `alt`, its record `cancelled`.
+    expect(reply.endsWith(` ${KAPAT_CHAIN}`)).toBe(true)
+    expect(getRecord(world, CHILD)).toMatchObject({ role: 'alt', status: 'cancelled' })
+    expect(await phase($)).toContain(`${CHILD_PREFIX}Devir: kapalı · aşama: idle`)
     expect(world.store[`${RUN_PREFIX}s1`]).toBeUndefined()
     await clock.advance(100)
     const ui = await mountBand($)
@@ -1057,15 +1197,16 @@ describe('v1.0.1 hotfix', () => {
     expect(world.typed.at(-1)?.context).toEqual([])
   })
 
-  test('(A3) mod başka sohbette kapatılınca bu sohbet devrini bir sonraki olayında bırakır', async ($, on) => {
+  test('(A3) zincir başka sohbette kapatılınca (/devir kapat) bu alt sohbet devrini bir sonraki olayında bırakır', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await toReady($, world, clock)
+    // M4: a managed sub-chat draws no ready band at all.
     const shown = await mountBand($)
-    expect(JSON.stringify(await shown.drawn())).toContain(READY_BAND)
+    expect(JSON.stringify(await shown.drawn())).not.toContain(READY_BAND)
     await shown.unmount()
-    // Another chat runs /devir kapat: only the shared store changes.
-    world.store.acik = false
+    // M11: another chat of the chain runs /devir kapat: only the chain's settings change.
+    putChainSettings(world, { esik: 40, isClosed: true, at: NOW })
     // The band is gone even before this chat's next hook drops the handoff.
     const ui = await mountBand($)
     expect(JSON.stringify(await ui.drawn())).not.toContain(READY_BAND)
@@ -1077,15 +1218,19 @@ describe('v1.0.1 hotfix', () => {
     await clock.advance(100)
     expect(world.toasts).toContain('Otomatik devir kapalı: bu sohbetin devri iptal edildi.')
     expect(await phase($)).toContain('aşama: idle')
+    // O21: the cancelled drain is recorded, so the main chat never relays it.
+    expect(getRecord(world, CHILD)).toMatchObject({ role: 'alt', status: 'cancelled' })
   })
 
-  test('(A4) yeniden yüklemede mod kapalıysa depodaki devir:<sid> geri gelmez; devredildi kalır', async ($, on) => {
+  test('(A4) yeniden yüklemede zincir kapalıysa depodaki devir:<sid> geri gelmez; devredildi kalır', async ($, on) => {
     const { world } = setup(on, {
       esik: 40,
       acik: false,
       [`${RUN_PREFIX}s1`]: { handoffId: 's1-x', file: FILE, handoffAt: NOW - 10, phase: 'handoff_running' },
       [`${HANDED_PREFIX}s2`]: { handoffId: 's2-x', startedId: 'local_old', file: 'f', at: 1 },
     })
+    // M11: `acik: false` is this chain's `isClosed`; s2 is another sub-chat of the chain.
+    seedSecondChild(world)
     await start($)
     expect(await phase($)).toContain('aşama: idle')
     expect(world.store[`${RUN_PREFIX}s1`]).toBeUndefined()
@@ -1093,7 +1238,7 @@ describe('v1.0.1 hotfix', () => {
     // A finished handoff is not undone, by the mod off nor by /devir kapat.
     world.sid = 's2'
     expect(await phase($)).toContain('aşama: done')
-    expect((await devir($, 'kapat')).text).toBe('Otomatik devir kapatıldı.')
+    expect((await devir($, 'kapat')).text).toBe(`Otomatik devir kapatıldı. ${KAPAT_CHAIN}`)
     expect(world.store[`${HANDED_PREFIX}s2`]).toBeDefined()
     expect(await phase($)).toContain('aşama: done')
   })
@@ -1112,19 +1257,31 @@ describe('v1.0.1 hotfix', () => {
   test('(B2) devir sürerken (handoff_running) çalışan iş Stop\'u yine tutar; ready tutmaz', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
-    await toReady($, world, clock)
     const running = [{ id: 'a1', description: 'araştır' }]
-    // `ready`: the file is written and the child waits for the next typed message.
+    // `handoff_running`: the running work holds the turn end.
+    await machine($, 'görev bildirimi')
+    await turnBegin($)
+    world.percent = 50
+    await bash($)
+    await clock.advance(100)
+    expect(await phase($)).toContain('aşama: handoff_running')
+    expect((await stop($, [SUBAGENT])).block).toBe(waitText(running))
+    writeFile(world, clock)
+    expect((await stop($, [])).block).toBeUndefined()
+    await turnEnd($)
+    // `ready`: the file is written and the main chat starts the next sub-chat from it.
+    expect(await phase($)).toContain('aşama: ready')
     expect((await stop($, [SUBAGENT])).block).toBeUndefined()
     world.agents = [{ id: 'a7', description: 'yaz', type: 'general-purpose', status: 'running' }]
     expect((await $.classic.Stop({ stop_hook_active: false } as any)).block).toBeUndefined()
     world.agents = []
     expect(await phase($)).toContain('aşama: ready')
-    // The typed message makes it `handoff_running` again: the wait holds there.
+    // M5: a typed message does not make a managed sub-chat `handoff_running` again (no S8),
+    // so its running work still does not hold the turn end.
     await typed($, 'devam')
     await turnBegin($)
-    expect(await phase($)).toContain('aşama: handoff_running')
-    expect((await stop($, [SUBAGENT])).block).toBe(waitText(running))
+    expect(await phase($)).toContain('aşama: ready')
+    expect((await stop($, [SUBAGENT])).block).toBeUndefined()
   })
 
   test('(B3) 30 dk zaman aşımından sonra ready olan devir, sonraki makine turlarını beklemede tutmaz', async ($, on) => {
@@ -1165,24 +1322,36 @@ describe('v1.0.1 hotfix', () => {
       fileMissingText(FILE, true),
       fileMissingText(FILE, false),
       START_NOW,
+      managedHandoff(40, FILE),
+      managedHandoff(40, FILE, false),
+      MANAGED_START_DENY,
     ]
     for (const text of texts) {
       expect(text).not.toContain('HANDOFF.md')
       expect(text).not.toContain('STATE.md')
     }
     // Both writers (the skill's auto mode and the fallback) say the child reads only this file.
-    for (const text of [inTurnHandoff(40, FILE), inTurnHandoff(40, FILE, false), fileMissingText(FILE, true)]) {
+    for (const text of [
+      inTurnHandoff(40, FILE),
+      inTurnHandoff(40, FILE, false),
+      fileMissingText(FILE, true),
+      managedHandoff(40, FILE),
+      managedHandoff(40, FILE, false),
+    ]) {
       expect(text).toContain(`yalnızca ${FILE} dosyasını okumasını`)
     }
-    // The child's first prompt: the file (plus the message), the mod's own background.
+    // A managed sub-chat: the instruction it gets and the refusal of its own start name
+    // only the handoff file. The next child's first prompt (the file plus the message, the
+    // mod's own background) is built by the main chat's O4 (T5 A7/A10).
     const { world, clock } = setup(on)
     await start($)
-    await typedTrip($, world, clock)
+    const got = await typedTrip($, world, clock)
+    expect(got.context).toEqual([managedHandoff(40, FILE)])
     writeFile(world, clock)
-    expect((await startSession($)).deny).toBeUndefined()
-    const [sent] = callsOf(world, START)
-    expect(sent.prompt).toBe(HANDOFF_TEXT)
-    for (const text of [sent.prompt, sent.background]) {
+    const refused = await startSession($)
+    expect(refused.deny).toBe(MANAGED_START_DENY)
+    expect(callsOf(world, START)).toHaveLength(0)
+    for (const text of [got.context?.[0], refused.deny]) {
       expect(text).not.toContain('HANDOFF.md')
       expect(text).not.toContain('STATE.md')
     }

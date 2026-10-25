@@ -503,8 +503,14 @@ const orkestraStatusOf = async ($: EngineInterface, held: OtomatikDevirConv): Pr
 }
 
 const refreshStatus = async ($: EngineInterface, percent?: number): Promise<void> => {
-  const settings = await readSettings($)
   const held = await currentConv($)
+  // O20: a normal chat (cached role `yok` or unresolved) shows nothing.
+  if (held.role !== 'ana' && held.role !== 'alt') {
+    $.ui.status(undefined)
+
+    return
+  }
+  const settings = await readSettings($)
   const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
   const orkestra = await orkestraStatusOf($, held)
   $.ui.status(statusText(settings, percent ?? (await contextPercent($)), held, running, orkestra))
@@ -717,7 +723,11 @@ const currentConv = async ($: EngineInterface): Promise<OtomatikDevirConv> => {
   }
   if (now.phase === 'ready' && now.role === 'alt') now = await consumeChild($, now)
   isDraining = isDrainPhase(now.phase)
-  if (isDraining && !(await readSettings($)).isEnabled) return cancelHandoff($, sid, true)
+  if (isDraining) {
+    // O20: only a managed sub-chat drains; a leftover elsewhere goes silently.
+    if ((await roleOf($)) !== 'alt') return cancelHandoff($, sid, false)
+    if (!(await readSettings($)).isEnabled) return cancelHandoff($, sid, true)
+  }
 
   return now
 }
@@ -769,14 +779,19 @@ const claim = async (
 // ---------------------------------------------------------------------------
 
 /**
- * The trip is due: the mod is on, this session never handed off, and either
- * `/devir simdi` forced it or the fill reached this chat's threshold.
+ * The trip is due: this is a managed sub-chat whose parent chain is live and
+ * open, this session never handed off, and either `/devir simdi` forced it or
+ * the fill reached this chat's threshold.
  */
 const isDue = async ($: EngineInterface, held: OtomatikDevirConv): Promise<{ threshold: number } | undefined> => {
+  // O3, O20: only a managed sub-chat hands off by threshold; a normal chat and
+  // the main chat never measure for a trip.
+  if ((await roleOf($)) !== 'alt') return undefined
+  const chainId = await chainIdOf($)
+  const parent = chainId === undefined ? undefined : await readRecord($, chainId).catch(() => undefined)
+  if (parent?.role !== 'ana' || parent.ended !== undefined) return undefined
   const settings = await readSettings($)
   if (!settings.isEnabled) return undefined
-  // O3: the main chat never hands off by threshold.
-  if ((await roleOf($)) === 'ana') return undefined
   if ((await handedOf($, held.sid)) !== undefined) return undefined
   const threshold = thresholdOf(settings, held)
   if (held.isForced === true) return { threshold }
@@ -1390,6 +1405,8 @@ const isUnaskedSkillHandoff = async ($: EngineInterface, call: Record<string, un
   try {
     if (call.tool !== 'Skill' || typeof call.skill !== 'string' || !call.skill.endsWith(SKILL)) return false
     if (typeof call.args === 'string' && call.args.trimStart().startsWith('auto ')) return false
+    // O20: only a managed sub-chat's own handoff skill call is refused.
+    if ((await roleOf($)) !== 'alt') return false
     if (!(await readSettings($)).isEnabled) return false
     const held = await currentConv($)
 
@@ -1521,10 +1538,13 @@ const watchModelStart = async (
   next: ToolNext,
 ) => {
   // O4: the main chat's starts, before the v1 handed-off check.
-  if ((await roleOf($)) === 'ana') {
+  const role = await roleOf($)
+  if (role === 'ana') {
     const started = await orkestraStart($, call, next)
     if (started !== undefined) return started
   }
+  // O20: a normal chat's start passes untouched (role `alt` never gets here, O13).
+  if (role !== 'ana' && role !== 'alt') return next(call as unknown as ToolCallArgs)
   const sid = await $.session.id()
   const handed = await handedOf($, sid)
   if (handed !== undefined) {
@@ -1980,7 +2000,8 @@ export const register: Register = on => {
           ],
         }
       }
-      if (!settings.isEnabled || held.phase !== 'idle') return r
+      // O2, O20: the long-chat note only in a managed sub-chat; a normal chat gets no section.
+      if (held.role !== 'alt' || !settings.isEnabled || held.phase !== 'idle') return r
 
       return {
         ...r,
@@ -2068,10 +2089,11 @@ export const register: Register = on => {
     if (!isPerson || e.command !== undefined) return next(e)
     const before = await currentConv($)
     const sid = before.sid
+    // O12: a managed sub-chat hands off by its file only; no S8 there. O20: nor in a normal chat.
+    const role = await roleOf($)
+    if (role === 'alt' || role === 'yok') return next(e)
     const settings = await readSettings($)
     if (!settings.isEnabled || (await handedOf($, sid)) !== undefined) return next(e)
-    // O12: a managed sub-chat hands off by its file only; no S8 there.
-    if ((await roleOf($)) === 'alt') return next(e)
     let held: OtomatikDevirConv | undefined
     if (before.phase === 'ready' || (before.phase === 'handoff_running' && before.isGateClosed === true)) {
       const isClaimed = await claim($, sid, h => h.phase === before.phase && h.starting === undefined, {
@@ -2260,6 +2282,8 @@ export const register: Register = on => {
           return { block: decision.text }
       }
     }
+    // O20: a normal chat's turn end passes; no (a)-(d), no wait.
+    if ((await roleOf($)) === 'yok') return next(e)
     const settings = await readSettings($)
     if (!settings.isEnabled) return next(e)
     let held = await currentConv($)
@@ -2337,11 +2361,15 @@ export const register: Register = on => {
 
   on('command.run', { command: 'devir' }, async ($, e) => {
     const [verb = '', value, extra] = e.args.trim().split(/\s+/)
-    const settings = await readSettings($)
+    const role = await roleOf($)
     const held = await currentConv($)
+    const settings = await readSettings($)
+    // O20, Decision 22: a normal chat only answers; nothing is written (`dene` keeps this chat's own value).
+    const isNormal = role !== 'ana' && role !== 'alt'
 
     switch (verb.toLowerCase()) {
       case '': {
+        if (isNormal) return { text: NORMAL_INFO }
         const percent = await contextPercent($)
         const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
 
@@ -2350,6 +2378,7 @@ export const register: Register = on => {
         return { text: `${statusText(settings, percent, held, running, orkestra)} · aşama: ${held.phase}` }
       }
       case 'esik': {
+        if (isNormal) return { text: NORMAL_INFO }
         const n = Number(value)
         if (!isThreshold(n)) return { text: 'Kullanım: /devir esik <1-99>' }
         await $.store.set('esik', n)
@@ -2370,6 +2399,7 @@ export const register: Register = on => {
         const n = Number(value)
         if (!isThreshold(n)) return { text: 'Kullanım: /devir dene <1-99> (boş: kaldır)' }
         await patchConv($, held.sid, { testThreshold: n })
+        if (isNormal) return { text: normalDeneText(n) }
         // Decision 11: in the main chat the chain's later children inherit it.
         const main = isMain ? await patchMain($, held.localId as string, { testThreshold: n }) : undefined
         await refreshStatus($)
@@ -2380,8 +2410,9 @@ export const register: Register = on => {
         return { text: `Bu sohbetin deneme eşiği %${n} (yalnızca bu sohbet).` }
       }
       case 'simdi': {
-        // O3: the main chat never hands off.
-        if ((await roleOf($)) === 'ana') return { text: 'Ana sohbet devredilmez (orkestra modu).' }
+        // O3: the main chat never hands off; O20: nor does a normal chat.
+        if (role === 'ana') return { text: 'Ana sohbet devredilmez (orkestra modu).' }
+        if (isNormal) return { text: NORMAL_INFO }
         const handed = await handedOf($, held.sid)
         if (handed !== undefined || held.phase === 'done') {
           return {
@@ -2395,6 +2426,7 @@ export const register: Register = on => {
         return { text: 'Devir istendi: çalışan turda ya da bir sonraki mesajınla başlayacak.' }
       }
       case 'kapat': {
+        if (isNormal) return { text: NORMAL_INFO }
         await $.store.set('acik', false)
         // v1.0.1: this chat's running or ready handoff is cancelled (a pending
         // `/devir simdi` too); a finished one stays.
@@ -2409,6 +2441,7 @@ export const register: Register = on => {
         }
       }
       case 'ac':
+        if (isNormal) return { text: NORMAL_INFO }
         await $.store.set('acik', true)
         await refreshStatus($)
 

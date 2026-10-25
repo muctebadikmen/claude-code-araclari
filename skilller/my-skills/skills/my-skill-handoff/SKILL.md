@@ -41,7 +41,7 @@ Continue the work in this repo. First read .workflow/HANDOFF.md and .workflow/ST
 
 ## Auto mode (otomatik-devir)
 
-Trigger: args start with `auto <file>`. This replaces Steps 1–5; the template and resume prompt below still apply.
+Trigger: args start with `auto <file>`. This replaces Steps 1–5; the HANDOFF template above still applies, the resume prompt is the one in item 5 (not the template's).
 
 - No sub-agent, no question, no orchestrate dispatch. If the mod denies a tool call, continue without it.
 - Reconcile yourself with read-only `git status --short`, `git log -10 --oneline` and `git worktree list` (skip outside git).
@@ -51,5 +51,5 @@ Trigger: args start with `auto <file>`. This replaces Steps 1–5; the template 
   2. The HANDOFF template fields (Active skill … Verification status).
   3. `Yeniden çalıştır:` — each stopped agent: id, description, what to rerun. Omit if none.
   4. `Kullanıcının son mesajı:` — only if the mod gave one.
-  5. Last, `## Resume prompt` as plain text starting "Continue the work: first read <file>.", followed by the filled resume prompt line.
+  5. Last, `## Resume prompt` as plain text, filled: "Continue the work in this repo. Read only <file>; it is the whole handoff. Then invoke the `<skill>` skill and resume from <phase or task id>. The decisions listed there are final; do not re-ask them. Do not redo tasks marked done. Follow the my-skill-orchestrate skill (sub-agents, `model` set on each dispatch, parallel dispatch). <If skill is my-skill-execute: Run non-stop.>" Name no other handoff or state file in it.
 - Reply with one line `Devir dosyası yazıldı: <file>`, then follow the mod's next instruction (start_session or end the turn).

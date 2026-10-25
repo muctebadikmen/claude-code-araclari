@@ -77,6 +77,18 @@ export type OrkestraAlt = {
   at: number
 }
 
+/** A chain's settings (Decision 22), keyed by the main chat's local id; shared by the main chat and its sub-chats. */
+export type OrkestraAyar = {
+  /** This chain's threshold; unset is the default (60). */
+  esik?: number
+  /** This chain's limit of sub-chats; unset is the default (100). */
+  limit?: number
+  /** `/devir kapat` in this chain: its emergency stop. */
+  isClosed?: true
+  /** Clock ms of the last write to this record. */
+  at: number
+}
+
 /** Either side of an orchestration record. */
 export type OrkestraRecord = OrkestraAna | OrkestraAlt
 

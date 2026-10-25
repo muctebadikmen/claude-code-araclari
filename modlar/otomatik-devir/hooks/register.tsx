@@ -1,7 +1,22 @@
 import { atom, read, update } from 'claude-code'
-import type { AgentInfo, EngineInterface, Register, ToolCallArgs } from 'claude-code'
+import type {
+  AgentInfo,
+  EngineInterface,
+  PromptSubmitInput,
+  PromptSubmitResult,
+  Register,
+  ToolCallArgs,
+} from 'claude-code'
 
-import type { OtomatikDevirConv, OtomatikDevirPhase } from '../types'
+import type {
+  OrkestraAlt,
+  OrkestraAna,
+  OrkestraAyar,
+  OrkestraRecord,
+  OrkestraRole,
+  OtomatikDevirConv,
+  OtomatikDevirPhase,
+} from '../types'
 
 // ---------------------------------------------------------------------------
 // Settings ($.store, across sessions) and the per-conversation record ($.state)
@@ -159,7 +174,213 @@ const MACHINE_TURN_DENY = `otomatik-devir: bu tur kullanıcının yazdığı bir
 const CARD_DENY = `otomatik-devir: devir için kart açma (own_initiative, proposal_id); ${START_SESSION} aracını initiation "user_asked" ile çağır.`
 const HAND_OFF_DENY = `otomatik-devir: devir için ${HAND_OFF} kullanma; devir dosyasını yaz ve ${START_SESSION} aracını initiation "user_asked" ile çağır.`
 const REMOVED_VERB = "v1.0'da kaldırıldı; tek mod otomatik. Kapatmak için: /devir kapat"
-const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac]'
+const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | limit <n>]]'
+
+// ---------------------------------------------------------------------------
+// v1.1 orkestra modu (Contract): the main chat starts managed sub-chats one
+// after another and waits for each; a sub-chat hands off by writing its file.
+// ---------------------------------------------------------------------------
+
+/** The prompt-type command that starts a chain (Decision 1), bare and namespaced. */
+export const OTONOM_COMMANDS: readonly string[] = ['devir-otonom', 'otomatik-devir:devir-otonom']
+/** The first line of the command's rendered body (Decision 17). */
+export const OTONOM_MARKER = '<!-- otomatik-devir:otonom -->'
+const OTONOM_LINE = /^\s*\/(otomatik-devir:)?devir-otonom\b/
+
+/** Sub-chats per chain (Decision 18): default, and the clamp of `/devir otonom limit <n>`. */
+export const DEFAULT_LIMIT = 100
+export const LIMIT_MIN = 1
+export const LIMIT_MAX = 1000
+
+/** The integer part of `x`, clamped to LIMIT_MIN-LIMIT_MAX (not a number: DEFAULT_LIMIT). */
+export const clampLimit = (x: number): number =>
+  Number.isNaN(x) ? DEFAULT_LIMIT : Math.min(LIMIT_MAX, Math.max(LIMIT_MIN, Math.trunc(x)))
+
+/** The main chat's system-prompt section (O2); the v1 long-chat note keeps its own id. */
+export const ORKESTRA_SECTION_ID = 'otomatik-devir:orkestra'
+
+/** The prefix trigger (`orkestra: <görev>`): an undocumented alias of `/devir-otonom`. */
+export const ORKESTRA_RE = /^\s*orkestra:\s*/i
+/** Store key prefix of an orchestration record (backend `store`). */
+export const ORKESTRA_PREFIX = 'orkestra:'
+/** `kimlik:<sid>` = this chat's local id (O16). */
+export const KIMLIK_PREFIX = 'kimlik:'
+/** The managed handoff file's "no remaining work" line (Decision 12). */
+export const NONE_LEFT_RE = /^\s*Kalan:\s*yok\s*$/im
+/** A child whose id the start_session result did not name. */
+export const UNKNOWN_CHILD = 'bilinmiyor'
+/** An in-flight start older than this is a crash mid-start (O4). */
+export const STARTING_STALE_MS = 120_000
+/** Stalled child (O19): checks at least this far apart, this many in a row. */
+export const STALL_GAP_MS = 240_000
+export const STALL_CYCLES = 2
+
+/** Where the records live (store-probe.md `BACKEND: file`: the store is stale across sessions). */
+export const RECORD_BACKEND: 'store' | 'file' = 'file'
+
+const ORKESTRA_DIR = (home: string): string => `${home}/.claude/plugins/data/otomatik-devir/orkestra`
+
+/** An orchestration record's file (backend `file`). */
+export const orkestraRecordFile = (home: string, localId: string): string => `${ORKESTRA_DIR(home)}/${localId}.json`
+
+/** The sub-chat title: the task's first line, whitespace collapsed, cut to 40 chars, + ` · n`. */
+export const childTitle = (task: string, n: number): string => {
+  const head = (task.trim().split(/\r?\n/)[0] ?? '').replace(/\s+/g, ' ').slice(0, 40).trim()
+
+  return `${head === '' ? 'Orkestra' : head} · ${n}`
+}
+
+/** The start instruction for the main chat (O1, O1b, O5 `start`). */
+export const orkestraStartNote = (title: string): string =>
+  `otomatik-devir orkestra: bu sohbet otonom bir zincirin ANA sohbeti. Burada gerçek iş yapma (kod düzenleme, dosya yazma, işi yapan alt ajan yok): işi yönetilen alt sohbetler yapar. Görevi (ya da kullanıcının talimatlarından uyarlanmış kısa bir brifi) alt sohbet 1'in prompt'u olarak ver: ${START_SESSION} aracını bir kez çağır, initiation "user_asked", context "fresh", title "${title}". Sonra otomatik-devir'in notlarına uy (bekle, sıradaki alt sohbeti aç, zincir bitince özet yaz).`
+
+/** The main chat's system-prompt section (O2). */
+export const ORKESTRA_SECTION = (task: string): string =>
+  `otomatik-devir orkestra modu: bu sohbet otonom bir zincirin ana sohbeti. Burada gerçek iş yapma: işi yönetilen alt sohbetler yapar. Senin işin alt sohbetleri ${START_SESSION} ile açmak, beklemek, sıradakini açmak ve zincir bitince kullanıcıya özet yazmak; mod her adımda ne yapacağını söyler. Kendiliğinden devir yapma. Görev: ${task.slice(0, 1000)}`
+
+/** Stop block while the child runs (O5 `wait`, Decision 6); kept short (O22). */
+export const orkestraWaitText = (n: number): string =>
+  `otomatik-devir orkestra: alt sohbet ${n} çalışıyor; turu bitirme. Bash aracıyla \`perl -e 'select(undef,undef,undef,300)'\` çalıştır (5 dakika bekler); Bash aracının timeout parametresini 330000 yap (bu bir araç parametresi, kabuk komutu değil). Sonra turu yeniden bitirmeyi dene; başka iş yapma.`
+
+/** The relay to the next child (O5/O6 `relay`; n = the next child); kept short (O22). */
+export const orkestraRelayText = (n: number, title: string): string =>
+  `otomatik-devir orkestra: alt sohbet ${n - 1} devir dosyasını yazdı. Turu bitirmeden sıradaki alt sohbeti (${n}) aç: ${START_SESSION} aracını bir kez çağır, initiation "user_asked", context "fresh", title "${title}"; prompt tek satır olsun, gerisini mod doldurur (devir dosyası).`
+
+/** Why a chain ended (types/index.d.ts `OrkestraEnd`). */
+type EndKind = NonNullable<OrkestraAna['ended']>
+
+/** The chain is over (O5/O6 `end`, O19 `durdu`): the main chat summarises and opens nothing. */
+export const orkestraEndText = (
+  kind: EndKind,
+  n: number,
+  report?: string,
+  file?: string,
+  childId?: string,
+  limit?: number,
+): string => {
+  const reasons: Record<EndKind, string> = {
+    bitti: 'zincir bitti, kalan iş yok',
+    sinir: `zincir sınır ${limit ?? DEFAULT_LIMIT} alt sohbete ulaştı`,
+    durduruldu: 'zincir kullanıcının isteğiyle durduruldu (/devir otonom dur)',
+    durdu: `alt sohbet ${n} yanıt vermiyor (${childId ?? UNKNOWN_CHILD}); zincir durdu`,
+  }
+  const where = file === undefined ? '' : ` Kalan iş için son devir dosyası: ${file}.`
+  const what =
+    report !== undefined && report.trim() !== ''
+      ? ` Son alt sohbetin raporu:\n${report}\n`
+      : ` Son alt sohbetin ne yaptığını mcp__ccd_session_mgmt__list_events ile oku (session_id ${childId ?? UNKNOWN_CHILD}).`
+
+  return `otomatik-devir orkestra: ${reasons[kind]}. Bu zincirde ${n} alt sohbet açıldı.${where}${what} Kullanıcıya kısa bir özet yaz (ne yapıldı, ne kaldı); yeni sohbet açma, özeti yazınca turu bitir.`
+}
+
+/** The status line and band of a stalled chain (O19). */
+export const orkestraStalledBand = (n: number): string => `Orkestra durdu: alt sohbet ${n} yanıt vermiyor`
+
+export const ORKESTRA_END_DENY =
+  'otomatik-devir orkestra: zincir bitti; yeni sohbet açma. Kullanıcıya özet yaz ve turu bitir.'
+
+/** Context on a typed message in a live main chat (O7). */
+export const orkestraResumeNote = (n: number, state: string): string =>
+  `otomatik-devir: orkestra devam ediyor (alt sohbet ${n}: ${state}). Kullanıcının bu mesajındaki işi burada YAPMA: mod onu sıradaki alt sohbete not olarak iletir. otomatik-devir'in notlarına uy: bekle ya da sıradaki alt sohbeti aç.`
+
+/** Appended to every child's prompt (O4). */
+export const managedChildNote = (n: number, limit: number): string =>
+  `\n\n## otomatik-devir\nBu sohbet otonom bir zincirin yönetilen alt sohbeti (${n}/${limit}). Kullanıcıya soru sorma, onay bekleme: kararları kendin ver ve gerekçesini yaz. Yeni sohbet açma, kendiliğinden devir yapma: bağlam eşiğe ulaşınca mod talimat verir. İş bitince sonucu kısaca raporla.`
+
+/** A managed sub-chat's handoff (O12): the file only, the main chat starts the next one. */
+export const managedHandoff = (threshold: number, file: string, hasSkill = true): string =>
+  `Bağlam %${threshold}${dative(threshold)} ulaştı (bağlam sınırı): bu yönetilen alt sohbet devredilecek. Elindeki adımı güvenli bir noktada tamamla (yarım dosya bırakma). ${NO_NEW_WORK} Her şey bitince: ${writeStep(file, hasSkill)} Dosyanın en üstünde tek satır olsun: iş tamamen bittiyse \`Kalan: yok\`, kalan iş varsa \`Kalan: var\`. ${START_SESSION} ve ${HAND_OFF} çağırma, kart açma: sıradaki sohbeti ana sohbet açar. Dosyayı yazınca turu bitir.`
+
+export const MANAGED_START_DENY =
+  'otomatik-devir orkestra: bu yönetilen bir alt sohbet; yeni sohbet açma. Devir dosyasını yaz ve turu bitir; sıradakini ana sohbet açar.'
+
+export const ORKESTRA_PAUSED_BAND = 'Orkestra duraklatıldı: devam etmek için bir mesaj yaz.'
+export const ORKESTRA_PAUSED_DENY =
+  'otomatik-devir orkestra: zincir duraklatıldı (ana sohbetin turu kapandı); yeni alt sohbet şimdi açılamaz. Turu bitir: kullanıcının bir sonraki mesajı zinciri sürdürür.'
+
+export const orkestraBusyDeny = (n: number): string =>
+  `otomatik-devir orkestra: alt sohbet ${n} çalışıyor ya da açılıyor; ikinci kez açma. Bekle: sıradakini ne zaman açacağını mod söyler.`
+
+// O4 answers a start at the chain's limit with orkestraCapDeny(limit), and a
+// chain that ended there (`sinir`) with orkestraCapDeny too: it names the verb
+// that raises the limit.
+export const orkestraCapDeny = (limit: number): string =>
+  `otomatik-devir orkestra: zincir sınırına (${limit} alt sohbet) ulaşıldı; yeni sohbet açma. Sınırı kullanıcı /devir otonom limit <n> ile yükseltebilir. Kullanıcıya özet yaz ve turu bitir.`
+
+/** The child's background when the model's own is shorter than 80 chars (O4). */
+export const ORKESTRA_BACKGROUND =
+  "Otonom bir zincirin (otomatik-devir orkestra modu) yönetilen alt sohbeti: iş ana sohbetten ya da önceki alt sohbetin devir dosyasından devralındı. Prompt'u oku ve işe devam et."
+
+// ---------------------------------------------------------------------------
+// Records under BACKEND file (O16, Decision 10): JSON files read and written
+// with $.fs. $.fs has no rename, so a reader can catch a file mid-write: an
+// existing file that does not parse is read once more at once, and still
+// unparsable it is "not readable now" (`torn`), never "missing".
+// ---------------------------------------------------------------------------
+
+type FileRead = { kind: 'ok'; value: Record<string, unknown> } | { kind: 'missing' } | { kind: 'torn' }
+
+const readJsonFile = async ($: EngineInterface, path: string | undefined): Promise<FileRead> => {
+  if (path === undefined) return { kind: 'missing' }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let text: string
+    try {
+      text = await $.fs.read(path)
+    } catch {
+      return { kind: 'missing' }
+    }
+    try {
+      const got = record(JSON.parse(text))
+      if (got !== undefined) return { kind: 'ok', value: got }
+    } catch {
+      // cut or empty JSON: read it once more
+    }
+  }
+
+  return { kind: 'torn' }
+}
+
+const homeOf = async ($: EngineInterface): Promise<string | undefined> => nonEmpty(await $.env.get('HOME'))
+
+/** Store key prefix of a chain's settings (backend `store`); not `zincir:`, which the v1 cleanup deletes. */
+export const ZINCIR_AYAR_PREFIX = 'ayar:'
+
+/** A chain's settings file (backend `file`), keyed by its main chat's local id. */
+export const zincirAyarFile = (home: string, localId: string): string => `${ORKESTRA_DIR(home)}/ayar-${localId}.json`
+
+// The last chain settings this engine read or wrote, per chain: a torn read
+// returns it, so a chain's `esik`/`limit` never turn into the defaults for one
+// measurement (O16). Reset at session.start (O18).
+let lastAyar: Record<string, OrkestraAyar> = {}
+
+const toAyar = (got: Record<string, unknown>): OrkestraAyar => ({
+  esik: typeof got.esik === 'number' ? got.esik : undefined,
+  limit: typeof got.limit === 'number' ? got.limit : undefined,
+  isClosed: got.isClosed === true ? true : undefined,
+  at: typeof got.at === 'number' ? got.at : 0,
+})
+
+/** A chain's settings (Decision 22), or undefined when none were written. */
+export const readChainSettings = async ($: EngineInterface, mainLocalId: string): Promise<OrkestraAyar | undefined> => {
+  const home = await homeOf($)
+  const got = await readJsonFile($, home === undefined ? undefined : zincirAyarFile(home, mainLocalId))
+  if (got.kind === 'torn') return lastAyar[mainLocalId]
+  if (got.kind === 'missing') return undefined
+  const ayar = toAyar(got.value)
+  lastAyar[mainLocalId] = ayar
+
+  return ayar
+}
+
+/** That chain's limit (Decision 22): its settings' `limit` clamped, unset or invalid the default. */
+export const orkestraLimit = async ($: EngineInterface, mainLocalId: string): Promise<number> => {
+  const limit = (await readChainSettings($, mainLocalId).catch(() => undefined))?.limit
+
+  return typeof limit === 'number' && Number.isFinite(limit) ? clampLimit(limit) : DEFAULT_LIMIT
+}
+
+/** `/devir otonom …` outside a chain (Decision 22: no chain settings, so the default limit). */
+const NOT_ORCHESTRATED = `Bu sohbet orkestra modunda değil (sınır ${DEFAULT_LIMIT} alt sohbet). Başlatmak için /devir-otonom <görev> yaz.`
 
 type SelfSettings = { effort?: string; model?: string; permissionMode?: string }
 type Settings = { threshold: number; isEnabled: boolean }
@@ -193,7 +414,35 @@ const contextPercent = async ($: EngineInterface): Promise<number | undefined> =
 
 const isDrainPhase = (phase: OtomatikDevirPhase): boolean => phase === 'handoff_running' || phase === 'ready'
 
+/** This chat's part in a chain, for the status line (O9). */
+type OrkestraStatus =
+  | { role: 'ana'; main: OrkestraAna; child?: OrkestraAlt; isPaused: boolean }
+  | { role: 'alt'; n: number }
+
+/** The main chat's status line (Contract). */
+const mainStatusText = ({ main, child, isPaused }: { main: OrkestraAna; child?: OrkestraAlt; isPaused: boolean }) => {
+  if (main.ended === 'durdu') return orkestraStalledBand(main.n)
+  if (main.ended !== undefined) return `Orkestra bitti (${main.n} alt sohbet)`
+  if (isPaused || !main.isHeld) return 'Orkestra duraklatıldı'
+  if (main.n === 0) return 'Orkestra: alt sohbet 1 açılıyor'
+
+  return child?.status === 'ready' ? `Orkestra: alt sohbet ${main.n} hazır` : `Orkestra: alt sohbet ${main.n} çalışıyor`
+}
+
 const statusText = (
+  settings: Settings,
+  percent: number | undefined,
+  held: OtomatikDevirConv | null,
+  running: number,
+  orkestra?: OrkestraStatus,
+): string => {
+  if (orkestra?.role === 'ana') return mainStatusText(orkestra)
+  const text = v1StatusText(settings, percent, held, running)
+
+  return orkestra?.role === 'alt' ? `Orkestra alt sohbet ${orkestra.n} · ${text}` : text
+}
+
+const v1StatusText = (
   settings: Settings,
   percent: number | undefined,
   held: OtomatikDevirConv | null,
@@ -208,11 +457,23 @@ const statusText = (
   }`
 }
 
+/** This chat's chain part from its cached role (O9): the main record and child, or the child's number. */
+const orkestraStatusOf = async ($: EngineInterface, held: OtomatikDevirConv): Promise<OrkestraStatus | undefined> => {
+  if (held.role === 'alt') return { role: 'alt', n: held.childN ?? 1 }
+  if (held.role !== 'ana' || held.localId === undefined) return undefined
+  const main = await readMain($, held.localId).catch(() => undefined)
+  if (main === undefined) return undefined
+  const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+
+  return { role: 'ana', main, child, isPaused: held.isPaused === true }
+}
+
 const refreshStatus = async ($: EngineInterface, percent?: number): Promise<void> => {
   const settings = await readSettings($)
   const held = await currentConv($)
   const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
-  $.ui.status(statusText(settings, percent ?? (await contextPercent($)), held, running))
+  const orkestra = await orkestraStatusOf($, held)
+  $.ui.status(statusText(settings, percent ?? (await contextPercent($)), held, running, orkestra))
 }
 
 // ---------------------------------------------------------------------------
@@ -279,10 +540,77 @@ const syncStore = async ($: EngineInterface, sid: string): Promise<void> => {
   } else {
     await $.store.delete(key).catch(() => undefined)
   }
+  // O14: a managed sub-chat's record follows its phase.
+  if (held.role === 'alt') await syncChild($, held)
+}
+
+/**
+ * O14: a managed sub-chat's own record, `working` (idle, handoff_running) or
+ * `ready` with its file. A `finished` record stays; `done` (consumed) leaves it.
+ */
+const syncChild = async ($: EngineInterface, held: OtomatikDevirConv): Promise<void> => {
+  if (held.localId === undefined || held.phase === 'done') return
+  const own = await readRecord($, held.localId)
+  const base: OrkestraAlt | undefined =
+    own?.role === 'alt'
+      ? own
+      : held.parentId === undefined
+        ? undefined
+        : {
+            role: 'alt',
+            parent: held.parentId,
+            n: held.childN ?? 1,
+            sid: held.sid,
+            localId: held.localId,
+            status: 'working',
+            at: 0,
+          }
+  if (base === undefined || base.status === 'finished') return
+  const isReady = held.phase === 'ready'
+  await writeRecord($, held.localId, {
+    ...base,
+    status: isReady ? 'ready' : 'working',
+    file: isReady ? held.file : undefined,
+    at: await $.clock.now(),
+  })
+}
+
+/**
+ * O15: a `ready` sub-chat whose parent moved on (a later child, or the chain
+ * ended) is consumed: `done`, so its drain lifts.
+ */
+const consumeChild = async ($: EngineInterface, held: OtomatikDevirConv): Promise<OtomatikDevirConv> => {
+  if (held.parentId === undefined) return held
+  const parent = await readRecord($, held.parentId).catch(() => undefined)
+  if (parent?.role !== 'ana' || !(parent.n > (held.childN ?? 0) || parent.ended !== undefined)) return held
+  await setPhase($, held.sid, 'done')
+  const now = await read($, conv)
+
+  return now !== null && now.sid === held.sid ? now : held
 }
 
 /** The record of this sid, rebuilt from the store when $.state has none (a reload). */
 const restoreConv = async ($: EngineInterface, sid: string): Promise<OtomatikDevirConv> => {
+  const base = await restoreHandoff($, sid)
+  // O16: a reload keeps this chat's orchestration role (its local id and own record).
+  const localId = nonEmpty(await $.store.get(`${KIMLIK_PREFIX}${sid}`).catch(() => undefined))
+  if (localId === undefined) return base
+  const own = await readRecord($, localId).catch(() => undefined)
+  if (own === undefined) return { ...base, localId }
+  if (own.role === 'ana') {
+    return {
+      ...base,
+      localId,
+      role: 'ana',
+      childN: own.n,
+      isPaused: !own.isHeld && own.ended === undefined ? true : undefined,
+    }
+  }
+
+  return { ...base, localId, role: 'alt', parentId: own.parent, childN: own.n }
+}
+
+const restoreHandoff = async ($: EngineInterface, sid: string): Promise<OtomatikDevirConv> => {
   const handed = await handedOf($, sid)
   if (handed !== undefined) {
     return { sid, phase: 'done', handoffId: handed.handoffId, startedId: handed.startedId, file: handed.file }
@@ -353,6 +681,7 @@ const currentConv = async ($: EngineInterface): Promise<OtomatikDevirConv> => {
     const restored = now
     await update($, conv, () => restored)
   }
+  if (now.phase === 'ready' && now.role === 'alt') now = await consumeChild($, now)
   isDraining = isDrainPhase(now.phase)
   if (isDraining && !(await readSettings($)).isEnabled) return cancelHandoff($, sid, true)
 
@@ -412,6 +741,8 @@ const claim = async (
 const isDue = async ($: EngineInterface, held: OtomatikDevirConv): Promise<{ threshold: number } | undefined> => {
   const settings = await readSettings($)
   if (!settings.isEnabled) return undefined
+  // O3: the main chat never hands off by threshold.
+  if ((await roleOf($)) === 'ana') return undefined
   if ((await handedOf($, held.sid)) !== undefined) return undefined
   const threshold = thresholdOf(settings, held)
   if (held.isForced === true) return { threshold }
@@ -436,12 +767,14 @@ const claimHandoff = async (
 ): Promise<OtomatikDevirConv | undefined> => {
   const now = await $.clock.now()
   const file = handoffFile(await $.session.cwd(), sid)
+  // O12: a managed sub-chat only writes its file; the main chat starts the next one.
+  const isManaged = (await roleOf($)) === 'alt'
   const isClaimed = await claim($, sid, may, {
     phase: 'handoff_running',
     handoffId: newHandoffId(sid, now),
     handoffAt: now,
     file,
-    isGateClosed: !isPersonTurn,
+    isGateClosed: isManaged || !isPersonTurn,
     isForced: false,
     starting: undefined,
     notedTurn: undefined,
@@ -453,6 +786,17 @@ const claimHandoff = async (
 
   return held !== null && held.sid === sid ? held : undefined
 }
+
+/**
+ * The handoff instruction for this chat (O12): a managed sub-chat writes its
+ * file only; else in-turn when the person typed the turn, the closed-turn text otherwise.
+ */
+const handoffTextFor = (held: OtomatikDevirConv, threshold: number, file: string, hasSkill: boolean): string =>
+  held.role === 'alt'
+    ? managedHandoff(threshold, file, hasSkill)
+    : isPersonTurn
+      ? inTurnHandoff(threshold, file, hasSkill)
+      : closedTurnHandoff(threshold, file, hasSkill)
 
 /** The handoff file's text, when it was written for this handoff (not before `since`). */
 const readFresh = async ($: EngineInterface, file: string | undefined, since: number | undefined) => {
@@ -497,9 +841,9 @@ const hasHandoffSkill = async ($: EngineInterface): Promise<boolean> => {
 const callTool = ($: EngineInterface, input: { tool: string } & Record<string, unknown>) =>
   $.tool.call(input as unknown as ToolCallArgs)
 
-type SelfSession = SelfSettings & { id?: string; title?: string }
+type SelfSession = SelfSettings & { id?: string; title?: string; parentId?: string }
 
-/** This chat's own desktop session: its id (local_...), title, effort, model and permission mode. */
+/** This chat's own desktop session: its id (local_...), parent (local_...), title, effort, model and permission mode. */
 const selfSession = async ($: EngineInterface): Promise<SelfSession> => {
   try {
     const got = await $.tool.call({ tool: GET_SESSION, session_id: 'self' })
@@ -508,6 +852,7 @@ const selfSession = async ($: EngineInterface): Promise<SelfSession> => {
 
     return {
       id: nonEmpty(info.sessionId),
+      parentId: nonEmpty(info.parentSessionId),
       title: nonEmpty(info.title),
       effort: nonEmpty(info.effort),
       model: nonEmpty(info.model),
@@ -581,6 +926,404 @@ const noteSelf = async ($: EngineInterface, sid: string): Promise<void> => {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Orchestration records, ids and roles (O10, O11, O16). Records are keyed by
+// local id (Corrections): the main chat knows its child only by the
+// start_session result, the child its parent only by `parentSessionId`.
+// Each record has one writer: the main chat its own, a child its own.
+// ---------------------------------------------------------------------------
+
+type RecordRead = { kind: 'ok'; rec: OrkestraRecord } | { kind: 'missing' } | { kind: 'torn' }
+
+/** A parsed record; anything else (an O1 tombstone `{ gone }` too) is no record. */
+const toRecord = (got: Record<string, unknown>): OrkestraRecord | undefined => {
+  if (typeof got.localId !== 'string' || typeof got.n !== 'number') return undefined
+  if (got.role === 'ana' && typeof got.task === 'string') return got as unknown as OrkestraAna
+  if (got.role === 'alt' && typeof got.parent === 'string') return got as unknown as OrkestraAlt
+
+  return undefined
+}
+
+const readRecordState = async ($: EngineInterface, localId: string): Promise<RecordRead> => {
+  const home = await homeOf($)
+  const got = await readJsonFile($, home === undefined ? undefined : orkestraRecordFile(home, localId))
+  if (got.kind !== 'ok') return got
+  const rec = toRecord(got.value)
+
+  return rec === undefined ? { kind: 'missing' } : { kind: 'ok', rec }
+}
+
+/** The record of `localId`; missing, invalid or not readable now: undefined (O16). */
+const readRecord = async ($: EngineInterface, localId: string): Promise<OrkestraRecord | undefined> => {
+  const got = await readRecordState($, localId)
+
+  return got.kind === 'ok' ? got.rec : undefined
+}
+
+/** Writes the whole record file ($.fs.write creates the folder). */
+const writeRecord = async (
+  $: EngineInterface,
+  localId: string,
+  rec: OrkestraRecord | { gone: true; at: number },
+): Promise<void> => {
+  const home = await homeOf($)
+  if (home === undefined) return
+  await $.fs.write(orkestraRecordFile(home, localId), JSON.stringify(rec))
+}
+
+// The main chat's own record as this engine last read or wrote it: the main
+// chat is its only writer, so the copy stays true (prompt.compose and the band
+// read it on every render). Reset at session.start.
+let ownMain: OrkestraAna | undefined
+
+const readMain = async ($: EngineInterface, localId: string): Promise<OrkestraAna | undefined> => {
+  if (ownMain?.localId === localId) return ownMain
+  const rec = await readRecord($, localId)
+  if (rec?.role !== 'ana') return undefined
+  ownMain = rec
+
+  return rec
+}
+
+const writeMain = async ($: EngineInterface, rec: OrkestraAna): Promise<void> => {
+  ownMain = rec
+  await writeRecord($, rec.localId, rec)
+}
+
+/** Read, merge, write this main chat's record; undefined when it has none. */
+const patchMain = async (
+  $: EngineInterface,
+  localId: string,
+  patch: Partial<OrkestraAna>,
+): Promise<OrkestraAna | undefined> => {
+  const base = await readMain($, localId)
+  if (base === undefined) return undefined
+  const rec: OrkestraAna = { ...base, ...patch, at: await $.clock.now() }
+  await writeMain($, rec)
+
+  return rec
+}
+
+const readChild = async ($: EngineInterface, childId: string | undefined): Promise<OrkestraAlt | undefined> => {
+  if (childId === undefined || childId === UNKNOWN_CHILD) return undefined
+  const rec = await readRecord($, childId).catch(() => undefined)
+
+  return rec?.role === 'alt' ? rec : undefined
+}
+
+/** Writes a chain's settings whole (Decision 22). */
+export const writeChainSettings = async ($: EngineInterface, mainLocalId: string, rec: OrkestraAyar): Promise<void> => {
+  const home = await homeOf($)
+  if (home === undefined) return
+  lastAyar[mainLocalId] = rec
+  await $.fs.write(zincirAyarFile(home, mainLocalId), JSON.stringify(rec))
+}
+
+/** Read, merge, write a chain's settings (a torn or missing read merges over lastAyar). */
+export const patchChainSettings = async (
+  $: EngineInterface,
+  mainLocalId: string,
+  patch: Partial<OrkestraAyar>,
+): Promise<OrkestraAyar> => {
+  const base = (await readChainSettings($, mainLocalId)) ?? lastAyar[mainLocalId]
+  const rec: OrkestraAyar = { ...base, ...patch, at: await $.clock.now() }
+  await writeChainSettings($, mainLocalId, rec)
+
+  return rec
+}
+
+// This engine's one `get_session self` answer per conversation (O16, O17): the
+// local id and the parent come from the same call. A failed GET is not kept.
+let selfInfo: { sid: string; info: SelfSession } | undefined
+
+const selfOnce = async ($: EngineInterface, sid: string): Promise<SelfSession> => {
+  if (selfInfo?.sid === sid) return selfInfo.info
+  const info = await selfSession($)
+  if (info.id !== undefined) selfInfo = { sid, info }
+
+  return info
+}
+
+/** $.state holds this sid's record, rebuilt from the store first (a reload), so a role patch never hides a running handoff. */
+const ensureConv = async ($: EngineInterface, sid: string): Promise<void> => {
+  const held = await read($, conv)
+  if (held !== null && held.sid === sid) return
+  const restored = await restoreConv($, sid)
+  await update($, conv, now => (now !== null && now.sid === sid ? now : restored))
+}
+
+/** This chat's local id: conv, else `kimlik:<sid>`, else `get_session self` (then kept in both). */
+const selfLocal = async ($: EngineInterface): Promise<string | undefined> => {
+  const sid = await $.session.id()
+  await ensureConv($, sid)
+  const held = await read($, conv)
+  if (held !== null && held.sid === sid && held.localId !== undefined) return held.localId
+  const stored = nonEmpty(await $.store.get(`${KIMLIK_PREFIX}${sid}`).catch(() => undefined))
+  const id = stored ?? (await selfOnce($, sid)).id
+  if (id === undefined) return undefined
+  if (stored === undefined) await $.store.set(`${KIMLIK_PREFIX}${sid}`, id).catch(() => undefined)
+  await patchConv($, sid, { localId: id })
+
+  return id
+}
+
+/**
+ * This chat's role (O10), cached in conv. Its own record names it; else the
+ * parent from `get_session self` makes it `alt` when the parent's live main
+ * record points at this chat (or is starting one), and the child writes its
+ * own record. A failed GET or a torn file: `yok` for this call, not cached.
+ * Reads conv with `read`, never `currentConv` (O16).
+ */
+const roleOf = async ($: EngineInterface): Promise<OrkestraRole> => {
+  const sid = await $.session.id()
+  await ensureConv($, sid)
+  const held = await read($, conv)
+  if (held !== null && held.sid === sid && held.role !== undefined) return held.role
+
+  return (await resolveRole($, sid)) ?? 'yok'
+}
+
+const resolveRole = async ($: EngineInterface, sid: string): Promise<OrkestraRole | undefined> => {
+  const localId = await selfLocal($)
+  if (localId === undefined) return undefined
+  const own = await readRecordState($, localId)
+  if (own.kind === 'torn') return undefined
+  if (own.kind === 'ok') {
+    const rec = own.rec
+    await patchConv(
+      $,
+      sid,
+      rec.role === 'ana' ? { role: 'ana', childN: rec.n } : { role: 'alt', parentId: rec.parent, childN: rec.n },
+    )
+
+    return rec.role
+  }
+  const self = await selfOnce($, sid)
+  if (self.id === undefined) return undefined
+  if (self.parentId === undefined) {
+    await patchConv($, sid, { role: 'yok' })
+
+    return 'yok'
+  }
+  const got = await readRecordState($, self.parentId)
+  if (got.kind === 'torn') return undefined
+  const parent = got.kind === 'ok' && got.rec.role === 'ana' ? got.rec : undefined
+  if (
+    parent === undefined ||
+    parent.ended !== undefined ||
+    !(parent.childId === self.id || parent.childId === UNKNOWN_CHILD || parent.starting === true)
+  ) {
+    await patchConv($, sid, { role: 'yok' })
+
+    return 'yok'
+  }
+  const n = parent.starting === true ? parent.n + 1 : parent.n || 1
+  const mine: OrkestraAlt = {
+    role: 'alt',
+    parent: parent.localId,
+    n,
+    sid,
+    localId,
+    status: 'working',
+    at: await $.clock.now(),
+  }
+  await writeRecord($, localId, mine)
+  const held = await read($, conv)
+  // O11: a child with no own `/devir dene` inherits the chain's test threshold.
+  const inherited =
+    held?.testThreshold === undefined && parent.testThreshold !== undefined ? { testThreshold: parent.testThreshold } : {}
+  await patchConv($, sid, { role: 'alt', parentId: parent.localId, childN: n, ...inherited })
+
+  return 'alt'
+}
+
+/** This chat's chain (Decision 22): a main chat's own local id, a sub-chat's parent; else none. */
+export const chainIdOf = async ($: EngineInterface): Promise<string | undefined> => {
+  const role = await roleOf($)
+  if (role === 'ana') return selfLocal($)
+  if (role !== 'alt') return undefined
+  const sid = await $.session.id()
+  const held = await read($, conv)
+  if (held !== null && held.sid === sid && held.parentId !== undefined) return held.parentId
+  const localId = await selfLocal($)
+  const own = localId === undefined ? undefined : await readRecord($, localId)
+
+  return own?.role === 'alt' ? own.parent : undefined
+}
+
+// ---------------------------------------------------------------------------
+// The chain's start (O1) and a typed message in a live main chat (O7), in
+// prompt.submit before every v1 return.
+// ---------------------------------------------------------------------------
+
+type SubmitNext = (e: PromptSubmitInput) => Promise<PromptSubmitResult>
+
+// Module state of the main chat's Stop and mid-turn notes (O5, O6), reset at
+// session.start (O18) and at a new chain.
+let orkestraStartBlocks: { n: number; count: number } | undefined
+let orkestraNoted: string | undefined
+
+const ROLE_ALT_DROP = 'Bu bir alt sohbet; otonom zincir ana sohbette çalışır.'
+const LIVE_DROP = 'Bu sohbette otonom zincir zaten çalışıyor (/devir otonom).'
+const HANDED_DROP = 'Bu sohbet zaten devredildi; /devir-otonom için yeni bir sohbet aç.'
+const EMPTY_DROP = 'Görev boş: /devir-otonom <görev> yaz.'
+const NO_ID_DROP = 'otomatik-devir: oturum kimliği okunamadı; zincir başlamadı.'
+const HANDED_CONTEXT = 'otomatik-devir: bu sohbet zaten devredildi; orkestra için yeni bir sohbet aç ve bunu kullanıcıya söyle.'
+const EMPTY_CONTEXT = 'otomatik-devir orkestra: görev boş; kullanıcıya "orkestra:" sonrasına görevi yazmasını söyle.'
+const NO_ID_CONTEXT = 'otomatik-devir orkestra: oturum kimliği okunamadı; orkestra başlamadı.'
+const CONTINUE_ONLY = /^\s*(devam( et)?|continue)\s*[.!]?\s*$/i
+
+/** Who typed the turn this submission opens (or the running one), as the v1 path notes it. */
+const noteTyper = (e: PromptSubmitInput, isPerson: boolean): void => {
+  if (e.turnId === undefined) {
+    isNextTurnPerson = isPerson
+  } else {
+    if (isPerson && e.turnId === runningTurnId) isPersonTurn = true
+    if (isPerson) isNextTurnPerson = true
+  }
+}
+
+/** The start trigger (O1, Decision 17): `/devir-otonom` (cmd) or `orkestra:` (pfx), with its task. */
+const otonomStart = (e: PromptSubmitInput): { entry: 'cmd' | 'pfx'; task: string } | undefined => {
+  if (e.command !== undefined) {
+    return OTONOM_COMMANDS.includes(e.command.name) ? { entry: 'cmd', task: e.command.args.trim() } : undefined
+  }
+  const text = e.text.trimStart()
+  if (text.startsWith(OTONOM_MARKER)) {
+    // The rendered body: the task is under its `Görev:` line.
+    const body = text.slice(OTONOM_MARKER.length)
+    const goal = /^\s*Görev:[ \t]*([\s\S]*)$/m.exec(body)
+
+    return { entry: 'cmd', task: (goal?.[1] ?? body).trim() }
+  }
+  const line = OTONOM_LINE.exec(text)
+  if (line !== null) return { entry: 'cmd', task: text.slice(line[0].length).trim() }
+  if (ORKESTRA_RE.test(text)) return { entry: 'pfx', task: text.replace(ORKESTRA_RE, '').trim() }
+
+  return undefined
+}
+
+const withContext = (e: PromptSubmitInput, note: string): PromptSubmitInput => ({
+  ...e,
+  context: [...(e.context ?? []), note],
+})
+
+/**
+ * O7: a typed message in a live main chat holds the chain again; its text goes
+ * to the next child as the person's note (unless it only says "devam").
+ * Undefined when this chat is no live main chat.
+ */
+const orkestraTyped = async (
+  $: EngineInterface,
+  e: PromptSubmitInput,
+  next: SubmitNext,
+  isPerson: boolean,
+): Promise<PromptSubmitResult | undefined> => {
+  const sid = await $.session.id()
+  const held = await read($, conv)
+  if (held === null || held.sid !== sid || held.role !== 'ana' || held.localId === undefined) return undefined
+  const main = await readMain($, held.localId)
+  if (main === undefined || main.ended !== undefined) return undefined
+  const isNote = !CONTINUE_ONLY.test(e.text) && e.text.trim() !== ''
+  const pending = isNote
+    ? main.pendingMessage === undefined
+      ? e.text
+      : `${main.pendingMessage}\n\n${e.text}`
+    : main.pendingMessage
+  await patchMain($, main.localId, { isHeld: true, pendingMessage: pending })
+  await patchConv($, sid, { isPaused: undefined })
+  const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+  noteTyper(e, isPerson)
+  later($, () => refreshStatus($))
+
+  return next(withContext(e, orkestraResumeNote(main.n, child?.status ?? 'yok')))
+}
+
+/**
+ * O1 and O7, before the v1 returns of prompt.submit. Undefined: not the
+ * orchestrator's, the v1 path goes on.
+ */
+const orkestraSubmit = async (
+  $: EngineInterface,
+  e: PromptSubmitInput,
+  next: SubmitNext,
+  isPerson: boolean,
+): Promise<PromptSubmitResult | undefined> => {
+  if (!isPerson) return undefined
+  const start = otonomStart(e)
+  if (start === undefined) {
+    if (e.command !== undefined) return undefined
+    try {
+      return await orkestraTyped($, e, next, isPerson)
+    } catch (error) {
+      $.ui.log(`otomatik-devir: orkestra mesajı işlenemedi: ${String(error)}`, { to: 'debug' })
+
+      return undefined
+    }
+  }
+  const { entry, task } = start
+  const isCommand = entry === 'cmd'
+  const sid = await $.session.id()
+  if ((await roleOf($)) === 'alt') {
+    if (!isCommand) return undefined
+    noteTyper(e, isPerson)
+
+    return { drop: ROLE_ALT_DROP }
+  }
+  const localId = await selfLocal($)
+  const live = localId === undefined ? undefined : await readMain($, localId)
+  if (live !== undefined && live.ended === undefined) {
+    if (!isCommand) return orkestraTyped($, e, next, isPerson)
+    noteTyper(e, isPerson)
+
+    return { drop: LIVE_DROP }
+  }
+  noteTyper(e, isPerson)
+  if ((await handedOf($, sid)) !== undefined) {
+    return isCommand ? { drop: HANDED_DROP } : next(withContext(e, HANDED_CONTEXT))
+  }
+  if (task === '') return isCommand ? { drop: EMPTY_DROP } : next(withContext(e, EMPTY_CONTEXT))
+  if (localId === undefined) return isCommand ? { drop: NO_ID_DROP } : next(withContext(e, NO_ID_CONTEXT))
+  const now = await $.clock.now()
+  const first = childTitle(task, 1)
+  try {
+    await writeChainSettings($, localId, { at: now }) // D22: new chain settings
+    const held = await read($, conv)
+    await writeMain($, {
+      role: 'ana',
+      sid,
+      localId,
+      task,
+      title: first.slice(0, -' · 1'.length),
+      n: 0,
+      isHeld: true,
+      testThreshold: held !== null && held.sid === sid ? held.testThreshold : undefined,
+      startedAt: now,
+      at: now,
+    })
+    await patchConv($, sid, { role: 'ana', childN: 0, isPaused: undefined, stalledN: undefined, starting: undefined })
+  } catch (error) {
+    // Fail closed: no main record, so no body may start child 1.
+    $.ui.log(`otomatik-devir: zincir kaydı yazılamadı: ${String(error)}`, { to: 'debug' })
+    ownMain = undefined
+
+    return isCommand ? { drop: NO_ID_DROP } : next(withContext(e, NO_ID_CONTEXT))
+  }
+  orkestraStartBlocks = undefined
+  orkestraNoted = undefined
+  const note = orkestraStartNote(first)
+  const out = await next(isCommand ? withContext(e, note) : { ...withContext(e, note), text: task })
+  if (out.drop !== undefined) {
+    // Dropped beneath: no chain started; the record goes (a tombstone: $.fs has no delete).
+    ownMain = undefined
+    await writeRecord($, localId, { gone: true, at: await $.clock.now() })
+    await patchConv($, sid, { role: undefined, childN: undefined })
+  }
+  later($, () => refreshStatus($))
+
+  return out
+}
+
 type ToolNext = (input: ToolCallArgs) => Promise<{
   deny?: string
   isError?: true
@@ -622,6 +1365,115 @@ const isUnaskedSkillHandoff = async ($: EngineInterface, call: Record<string, un
   }
 }
 
+/** A start in flight that is not stale (O4): an older one is a crash mid-start. */
+const isLiveStarting = (main: OrkestraAna, now: number): boolean =>
+  main.starting === true && now - (main.startingAt ?? 0) < STARTING_STALE_MS
+
+/**
+ * O4: the main chat's start_session. Every refusal of the chain comes first;
+ * then one start at a time (a claim on conv), the prompt filled by the mod (the
+ * task for child 1, the previous child's file after), and the child recorded.
+ * Undefined when this chat has no main record (the v1 flow then runs).
+ */
+const orkestraStart = async (
+  $: EngineInterface,
+  call: { tool: string } & Record<string, unknown>,
+  next: ToolNext,
+): Promise<Awaited<ReturnType<ToolNext>> | undefined> => {
+  const sid = await $.session.id()
+  const localId = await selfLocal($)
+  const main = localId === undefined ? undefined : await readMain($, localId)
+  if (localId === undefined || main === undefined) return undefined
+  const limit = await orkestraLimit($, localId)
+  if (main.ended !== undefined) return { deny: main.ended === 'sinir' ? orkestraCapDeny(limit) : ORKESTRA_END_DENY }
+  if (!main.isHeld) return { deny: ORKESTRA_PAUSED_DENY }
+  const now = await $.clock.now()
+  if (isLiveStarting(main, now)) return { deny: orkestraBusyDeny(main.n + 1) }
+  const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+  let file: string | undefined
+  if (main.n >= 1) {
+    if (child?.status !== 'ready') return { deny: orkestraBusyDeny(main.n) }
+    file = child.file
+    const text = await readFresh($, file, undefined)
+    if ((text !== undefined && NONE_LEFT_RE.test(text)) || main.isStopRequested === true) {
+      return { deny: ORKESTRA_END_DENY }
+    }
+  }
+  if (main.n >= limit) return { deny: orkestraCapDeny(limit) }
+  const isClaimed = await claim($, sid, h => h.starting === undefined, { starting: 'orkestra' })
+  if (!isClaimed) return { deny: orkestraBusyDeny(main.n + 1) }
+  try {
+    const n = main.n + 1
+    let body: string
+    if (n === 1) {
+      const own = nonEmpty(call.prompt)
+      body =
+        own === undefined
+          ? main.task
+          : own.includes(main.task)
+            ? own
+            : `${own}\n\n## Kullanıcının asıl isteği\n${main.task}`
+    } else {
+      const text = await readFresh($, file, undefined)
+      if (text === undefined) {
+        return { deny: `otomatik-devir orkestra: alt sohbet ${main.n} devir dosyası okunamadı: ${file ?? ''}` }
+      }
+      body = text
+    }
+    const message = main.pendingMessage
+    const prompt =
+      body +
+      (message !== undefined && message.trim() !== '' ? `\n\n## Kullanıcının notu\n${message}` : '') +
+      managedChildNote(n, limit)
+    await patchMain($, localId, { starting: true, startingAt: now })
+    const title = childTitle(main.task, n)
+    const input: { tool: string } & Record<string, unknown> = {
+      ...call,
+      initiation: 'user_asked',
+      context: 'fresh',
+      title,
+      background:
+        typeof call.background === 'string' && call.background.length >= 80 ? call.background : ORKESTRA_BACKGROUND,
+      prompt,
+    }
+    delete input.proposal_id
+    const pause = async () => {
+      await patchMain($, localId, { starting: undefined, startingAt: undefined, isHeld: false })
+      await patchConv($, sid, { isPaused: true })
+    }
+    let result: Awaited<ReturnType<ToolNext>>
+    try {
+      result = await next(input as unknown as ToolCallArgs)
+    } catch (error) {
+      await pause()
+      throw error
+    }
+    if (result.deny !== undefined || result.isError === true) {
+      await pause()
+
+      return result
+    }
+    await patchMain($, localId, {
+      n,
+      childId: startedId(result) ?? UNKNOWN_CHILD,
+      starting: undefined,
+      startingAt: undefined,
+      stallCount: undefined,
+      stallAt: undefined,
+      pendingMessage: undefined,
+    })
+    await patchConv($, sid, { childN: n })
+    later($, async () => {
+      $.ui.toast(`Orkestra: alt sohbet ${n} açıldı`)
+      await refreshStatus($).catch(() => undefined)
+    })
+
+    return result
+  } finally {
+    await patchConv($, sid, { starting: undefined })
+  }
+}
+
 /**
  * S6: the model's own start_session during the handoff. A session that
  * handed off never starts a second child; outside a handoff the call passes
@@ -634,6 +1486,11 @@ const watchModelStart = async (
   call: { tool: string } & Record<string, unknown>,
   next: ToolNext,
 ) => {
+  // O4: the main chat's starts, before the v1 handed-off check.
+  if ((await roleOf($)) === 'ana') {
+    const started = await orkestraStart($, call, next)
+    if (started !== undefined) return started
+  }
   const sid = await $.session.id()
   const handed = await handedOf($, sid)
   if (handed !== undefined) {
@@ -725,9 +1582,7 @@ const tripMidTurn = async ($: EngineInterface): Promise<string | undefined> => {
         : 'Devir başlıyor: yeni sohbet bir sonraki mesajınla açılacak.',
     )
 
-    return isPersonTurn
-      ? inTurnHandoff(due.threshold, claimed.file, hasSkill)
-      : closedTurnHandoff(due.threshold, claimed.file, hasSkill)
+    return handoffTextFor(claimed, due.threshold, claimed.file, hasSkill)
   }
   if (
     held.phase === 'handoff_running' &&
@@ -743,7 +1598,7 @@ const tripMidTurn = async ($: EngineInterface): Promise<string | undefined> => {
     if (!isClaimed || held.file === undefined) return undefined
     const settings = await readSettings($)
 
-    return closedTurnHandoff(thresholdOf(settings, held), held.file, await hasHandoffSkill($))
+    return handoffTextFor(held, thresholdOf(settings, held), held.file, await hasHandoffSkill($))
   }
 
   return undefined
@@ -782,6 +1637,110 @@ const runningWork = async ($: EngineInterface, tasks: readonly BackgroundTask[] 
   return (await activeAgents($)).map(agent => ({ id: agent.id, description: agent.description }))
 }
 
+
+// ---------------------------------------------------------------------------
+// The main chat's next step (O5, O6, O19): start, wait, relay or end.
+// ---------------------------------------------------------------------------
+
+type OrkestraDecision =
+  | { kind: 'pass' }
+  | { kind: 'start' | 'relay' | 'wait' | 'stalled'; n: number; text: string }
+  | { kind: 'end'; n: number; end: EndKind; text: string }
+
+/** The child's `isRunning` from `get_session` (O19); undefined when it cannot tell. */
+const childRunning = async ($: EngineInterface, childId: string): Promise<boolean | undefined> => {
+  try {
+    const got = await callTool($, { tool: GET_SESSION, session_id: childId })
+    if (got.deny !== undefined || got.isError === true || got.text === undefined) return undefined
+    const isRunning = record(JSON.parse(got.text))?.isRunning
+
+    return typeof isRunning === 'boolean' ? isRunning : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * What the main chat does next, from its record and its child's; undefined
+ * outside a live main chat. Decides only: its one write is O19's stall count,
+ * under `isCycle` (the Stop's wait cycle).
+ */
+const orkestraDecision = async (
+  $: EngineInterface,
+  opts: { isCycle?: boolean } = {},
+): Promise<{ decision: OrkestraDecision; main: OrkestraAna } | undefined> => {
+  if ((await roleOf($)) !== 'ana') return undefined
+  const localId = await selfLocal($)
+  const main = localId === undefined ? undefined : await readMain($, localId)
+  if (localId === undefined || main === undefined || main.ended !== undefined) return undefined
+  const done = (decision: OrkestraDecision) => ({ decision, main })
+  // Until T2b the global switch: off, the main chat is not held.
+  if (!(await readSettings($)).isEnabled || !main.isHeld) return done({ kind: 'pass' })
+  const now = await $.clock.now()
+  const n = main.n
+  const isStarting = isLiveStarting(main, now)
+  if (n === 0) {
+    return done(
+      isStarting
+        ? { kind: 'wait', n: 1, text: orkestraWaitText(1) }
+        : { kind: 'start', n, text: orkestraStartNote(childTitle(main.task, 1)) },
+    )
+  }
+  if (isStarting) return done({ kind: 'wait', n, text: orkestraWaitText(n) })
+  const child = await readChild($, main.childId)
+  const limit = await orkestraLimit($, localId)
+  const end = (kind: EndKind) =>
+    done({ kind: 'end', n, end: kind, text: orkestraEndText(kind, n, child?.report, child?.file, main.childId, limit) })
+  if (child?.status === 'finished') return end('bitti')
+  if (child?.status === 'ready') {
+    const text = await readFresh($, child.file, undefined)
+    if (text !== undefined && NONE_LEFT_RE.test(text)) return end('bitti')
+    if (main.isStopRequested === true) return end('durduruldu')
+    if (n >= limit) return end('sinir')
+
+    return done({ kind: 'relay', n, text: orkestraRelayText(n + 1, childTitle(main.task, n + 1)) })
+  }
+  // O19: the child not running, in STALL_CYCLES checks at least STALL_GAP_MS apart.
+  if (opts.isCycle === true && main.childId !== undefined && main.childId !== UNKNOWN_CHILD) {
+    let stallCount = main.stallCount
+    if (now - (main.stallAt ?? 0) >= STALL_GAP_MS) {
+      const isRunning = await childRunning($, main.childId)
+      if (isRunning === false) {
+        stallCount = (stallCount ?? 0) + 1
+        await patchMain($, localId, { stallCount, stallAt: now })
+      } else if (isRunning === true) {
+        stallCount = undefined
+        await patchMain($, localId, { stallCount: undefined, stallAt: now })
+      }
+    }
+    if ((stallCount ?? 0) >= STALL_CYCLES) {
+      return done({ kind: 'stalled', n, text: orkestraEndText('durdu', n, undefined, child?.file, main.childId) })
+    }
+  }
+
+  return done({ kind: 'wait', n, text: orkestraWaitText(n) })
+}
+
+/** O6: the main chat's start, relay or end rides on a tool result once per (N, kind). */
+const orkestraNote = async ($: EngineInterface): Promise<string | undefined> => {
+  try {
+    const held = await read($, conv)
+    if (held === null || held.role !== 'ana') return undefined
+    const got = await orkestraDecision($)
+    if (got === undefined) return undefined
+    const { decision } = got
+    if (decision.kind !== 'start' && decision.kind !== 'relay' && decision.kind !== 'end') return undefined
+    const key = `${decision.n}:${decision.kind}`
+    if (orkestraNoted === key) return undefined
+    orkestraNoted = key
+
+    return decision.text
+  } catch (error) {
+    $.ui.log(`otomatik-devir: ${String(error)}`, { to: 'debug' })
+
+    return undefined
+  }
+}
 
 // ---------------------------------------------------------------------------
 // One-time cleanup of v0.4/v0.5 leftovers (S11)
@@ -872,19 +1831,91 @@ const cleanupOnce = async ($: EngineInterface, attempt = 1): Promise<void> => {
   await $.store.delete(CLEANUP_LOCK).catch(() => undefined)
 }
 
+/**
+ * The band's one row (O7, S10): a paused or stalled main chat, else a ready
+ * handoff (never in a managed sub-chat, O12: its status line shows the child).
+ */
+const bandRow = async ($: EngineInterface, held: OtomatikDevirConv): Promise<string | undefined> => {
+  if (held.role === 'ana') {
+    if (held.stalledN !== undefined) return orkestraStalledBand(held.stalledN)
+    if (held.isPaused !== true || held.localId === undefined) return undefined
+    const main = await readMain($, held.localId).catch(() => undefined)
+
+    return main !== undefined && main.ended === undefined ? ORKESTRA_PAUSED_BAND : undefined
+  }
+
+  return held.phase === 'ready' && held.role !== 'alt' ? READY_BAND : undefined
+}
+
+/** `/devir otonom [dur | limit <n>]` (O8; the limit is the chain's, Decision 22). */
+const otonomVerb = async (
+  $: EngineInterface,
+  held: OtomatikDevirConv,
+  sub: string,
+  value: string | undefined,
+): Promise<string> => {
+  const role = await roleOf($)
+  const chainId = role === 'ana' || role === 'alt' ? await chainIdOf($) : undefined
+  if (sub === 'limit') {
+    if (chainId === undefined) return NOT_ORCHESTRATED
+    if (value === undefined || !/^\d+$/.test(value)) return USAGE
+    const limit = clampLimit(Number(value))
+    await patchChainSettings($, chainId, { limit })
+    await refreshStatus($).catch(() => undefined)
+
+    return `Orkestra: sınır ${limit} alt sohbet.`
+  }
+  if (sub !== '' && sub !== 'dur') return USAGE
+  if (role === 'ana' && chainId !== undefined) {
+    if (sub === 'dur') {
+      const main = await patchMain($, chainId, { isStopRequested: true })
+
+      return main === undefined ? NOT_ORCHESTRATED : 'Zincir şu anki alt sohbetten sonra duracak.'
+    }
+    const main = await readMain($, chainId)
+    if (main === undefined) return NOT_ORCHESTRATED
+    const limit = await orkestraLimit($, chainId)
+    const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+    const state = main.ended !== undefined ? `bitti: ${main.ended}` : main.isHeld ? 'tutuluyor' : 'duraklatıldı'
+
+    return `Orkestra: ana sohbet · görev "${main.title}" · alt sohbet ${main.n}/${limit} · alt durum ${child?.status ?? 'yok'} · ${state}`
+  }
+  if (role === 'alt' && chainId !== undefined) {
+    if (sub === 'dur') return 'Bu bir alt sohbet; zinciri ana sohbette /devir otonom dur ile durdur.'
+    const localId = await selfLocal($)
+    const own = localId === undefined ? undefined : await readRecord($, localId)
+    const limit = await orkestraLimit($, chainId)
+    const n = own?.role === 'alt' ? own.n : (held.childN ?? 1)
+    const status = own?.role === 'alt' ? own.status : 'working'
+
+    return `Orkestra: alt sohbet ${n}/${limit} (ana: ${chainId}) · durum ${status}`
+  }
+
+  return NOT_ORCHESTRATED
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'devir',
-      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac',
-      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac]',
+      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac, otonom [dur | limit <n>]',
+      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | limit <n>]]',
     })
     isPersonTurn = false
     isNextTurnPerson = false
     runningTurnId = undefined
     handoffBlocks = 0
     missingBlocks = 0
-    await currentConv($)
+    // O18: no module state leaks from another session (or an older load).
+    timeoutFor = undefined
+    orkestraStartBlocks = undefined
+    orkestraNoted = undefined
+    lastAyar = {}
+    ownMain = undefined
+    selfInfo = undefined
+    const held = await currentConv($)
+    // O4's claim: a start a reload cut off never cleared it itself.
+    if (held.role === 'ana' && held.starting !== undefined) await patchConv($, held.sid, { starting: undefined })
     await refreshStatus($)
     // Also on a reload of a changed module, so the one-time cleanup runs there too.
     later($, () => cleanupOnce($))
@@ -902,6 +1933,19 @@ export const register: Register = on => {
     try {
       const settings = await readSettings($)
       const held = await currentConv($)
+      // O2: the main chat's own section (cached role only, never a GET); it never trips, so no long-chat note.
+      if (held.role === 'ana') {
+        const main = held.localId === undefined ? undefined : await readMain($, held.localId)
+        if (!settings.isEnabled || main === undefined || main.ended !== undefined) return r
+
+        return {
+          ...r,
+          sections: [
+            ...r.sections.filter(s => s.id !== ORKESTRA_SECTION_ID && s.id !== LONG_CHAT_SECTION_ID),
+            { id: ORKESTRA_SECTION_ID, text: ORKESTRA_SECTION(main.task), scope: 'session' as const },
+          ],
+        }
+      }
       if (!settings.isEnabled || held.phase !== 'idle') return r
 
       return {
@@ -914,6 +1958,27 @@ export const register: Register = on => {
     } catch {
       return r
     }
+  })
+
+  // O1b: the rendered `/devir-otonom` body also carries the start note (the
+  // body alone already names start_session, `user_asked` and `fresh`).
+  on('skill.prompt', async ($, e, next) => {
+    try {
+      if (e.text.includes(OTONOM_MARKER)) {
+        const sid = await $.session.id()
+        const held = await read($, conv)
+        if (held !== null && held.sid === sid && held.role === 'ana' && held.localId !== undefined) {
+          const main = await readMain($, held.localId)
+          if (main !== undefined && main.n === 0 && main.ended === undefined) {
+            return { text: `${e.text}\n\n${orkestraStartNote(childTitle(main.task, 1))}` }
+          }
+        }
+      }
+    } catch (error) {
+      $.ui.log(`otomatik-devir: ${String(error)}`, { to: 'debug' })
+    }
+
+    return next(e)
   })
 
   // A /clear (or any end) drops this conversation's $.state record; the
@@ -941,10 +2006,21 @@ export const register: Register = on => {
     // Decision 16: what the person last typed, to tell their handoff ask from the model's own.
     if (isPerson) {
       try {
-        await patchConv($, (await currentConv($)).sid, { lastTyped: e.text })
+        // O7: a person's prompt also clears the stalled band.
+        await patchConv($, (await currentConv($)).sid, { lastTyped: e.text, stalledN: undefined })
       } catch (error) {
         $.ui.log(`otomatik-devir: son istem kaydedilemedi: ${String(error)}`, { to: 'debug' })
       }
+    }
+    // O1 and O7 first, before the running-turn and command returns below.
+    const orkestra = await orkestraSubmit($, e, next, isPerson)
+    if (orkestra !== undefined) return orkestra
+    // O10: the role resolves off the dispatch, at the first submission.
+    try {
+      const known = await read($, conv)
+      if (known === null || known.role === undefined) later($, async () => void (await roleOf($)))
+    } catch {
+      // resolved at the next trip, start or Stop site instead
     }
     if (e.turnId !== undefined) {
       // Typed over a running turn: the app counts that turn as the person's
@@ -960,6 +2036,8 @@ export const register: Register = on => {
     const sid = before.sid
     const settings = await readSettings($)
     if (!settings.isEnabled || (await handedOf($, sid)) !== undefined) return next(e)
+    // O12: a managed sub-chat hands off by its file only; no S8 there.
+    if ((await roleOf($)) === 'alt') return next(e)
     let held: OtomatikDevirConv | undefined
     if (before.phase === 'ready' || (before.phase === 'handoff_running' && before.isGateClosed === true)) {
       const isClaimed = await claim($, sid, h => h.phase === before.phase && h.starting === undefined, {
@@ -1000,6 +2078,14 @@ export const register: Register = on => {
           isGateClosed: false,
         })
       }
+      // O7: a turn the person typed holds the main chat (a machine turn never does).
+      if (isPersonTurn && held.role === 'ana' && held.localId !== undefined) {
+        const main = await readMain($, held.localId)
+        if (main !== undefined && main.ended === undefined) {
+          if (!main.isHeld) await patchMain($, main.localId, { isHeld: true })
+          await patchConv($, held.sid, { isPaused: undefined })
+        }
+      }
     }
 
     return next(e)
@@ -1014,6 +2100,28 @@ export const register: Register = on => {
     isPersonTurn = false
     runningTurnId = undefined
     const held = await currentConv($)
+    // O7: the main turn closed (an Esc too): the chain pauses until a typed message.
+    if (held.role === 'ana' && held.localId !== undefined) {
+      const main = await readMain($, held.localId)
+      if (main !== undefined && main.ended === undefined) {
+        await patchMain($, main.localId, { isHeld: false })
+        await patchConv($, held.sid, { isPaused: true })
+      }
+    }
+    // O14: a managed sub-chat whose turn ends idle with nothing running is finished.
+    const childId = held.phase === 'idle' && (await roleOf($)) === 'alt' ? (await read($, conv))?.localId : undefined
+    if (childId !== undefined) {
+      const own = await readRecord($, childId)
+      if (own?.role === 'alt' && own.status !== 'finished' && (await runningWork($, undefined)).length === 0) {
+        await writeRecord($, own.localId, {
+          ...own,
+          status: 'finished',
+          report: e.answer.slice(0, 3000),
+          isAborted: e.isAborted || undefined,
+          at: await $.clock.now(),
+        })
+      }
+    }
     if (held.phase === 'handoff_running') {
       if (e.isAborted) $.ui.log('otomatik-devir: tur durduruldu; devir sürüyor', { to: 'debug' })
       await claim($, held.sid, h => h.phase === 'handoff_running', { isGateClosed: true })
@@ -1028,7 +2136,8 @@ export const register: Register = on => {
           h => h.phase === 'handoff_running' && h.starting === undefined,
           { phase: 'ready' },
         )
-        if (isReady) $.ui.toast(READY_BAND, { timeoutMs: 15000 })
+        // O12: a managed sub-chat shows no ready toast (its status line names the child).
+        if (isReady && held.role !== 'alt') $.ui.toast(READY_BAND, { timeoutMs: 15000 })
       }
     }
     await refreshStatus($).catch(() => undefined)
@@ -1046,6 +2155,10 @@ export const register: Register = on => {
     if (isDrainCall(call) && (await isDrainingNow($))) return { deny: DRAIN_DENY } as Out
     // Decision 16: the mod owns the handoff; the model's own skill call is refused.
     if (await isUnaskedSkillHandoff($, call)) return { deny: SKILL_HANDOFF_DENY } as Out
+    // O13: a managed sub-chat starts no session and forks none, whoever asks.
+    if ((call.tool === START_SESSION || call.tool === HAND_OFF) && (await roleOf($)) === 'alt') {
+      return { deny: MANAGED_START_DENY } as Out
+    }
     // Only the model's own calls (the engine's call site): another plugin's
     // $.tool.call drops `context`, and its start_session is not the handoff.
     if (next.origin.plugin !== 'engine') return next(e)
@@ -1061,6 +2174,9 @@ export const register: Register = on => {
     }
     const result = await next(e)
     if (result.deny !== undefined) return result
+    // O6: the main chat's next step rides on this result.
+    const step = await orkestraNote($)
+    if (step !== undefined) return { ...result, context: [...(result.context ?? []), step] } as typeof result
     const note = await tripMidTurn($)
     if (note === undefined) return result
 
@@ -1079,6 +2195,37 @@ export const register: Register = on => {
   // before it ends. A closed gate: once the file is written the handoff is `ready`.
   on('classic.Stop', async ($, e, next) => {
     if (e.agent_id !== undefined) return next(e)
+    // O5: the main chat's only Stop hold, before the mod-off return and (a).
+    const orkestra = await orkestraDecision($, { isCycle: true })
+    if (orkestra !== undefined) {
+      const { decision, main } = orkestra
+      switch (decision.kind) {
+        case 'pass':
+          return next(e)
+        case 'start':
+        case 'relay': {
+          // At most 3 blocks per N, then the turn ends (and the chain pauses).
+          const blocks = orkestraStartBlocks?.n === main.n ? orkestraStartBlocks : { n: main.n, count: 0 }
+          if (blocks.count >= 3) return next(e)
+          orkestraStartBlocks = { n: main.n, count: blocks.count + 1 }
+
+          return { block: decision.text }
+        }
+        case 'end':
+          await patchMain($, main.localId, { ended: decision.end })
+          later($, () => refreshStatus($))
+
+          return { block: decision.text }
+        case 'stalled':
+          await patchMain($, main.localId, { ended: 'durdu' })
+          await patchConv($, main.sid, { stalledN: decision.n })
+          later($, () => refreshStatus($))
+
+          return { block: decision.text }
+        case 'wait':
+          return { block: decision.text }
+      }
+    }
     const settings = await readSettings($)
     if (!settings.isEnabled) return next(e)
     let held = await currentConv($)
@@ -1095,11 +2242,7 @@ export const register: Register = on => {
         if (claimed?.file !== undefined) {
           const hasSkill = await hasHandoffSkill($)
 
-          return {
-            block: isPersonTurn
-              ? inTurnHandoff(due.threshold, claimed.file, hasSkill)
-              : closedTurnHandoff(due.threshold, claimed.file, hasSkill),
-          }
+          return { block: handoffTextFor(claimed, due.threshold, claimed.file, hasSkill) }
         }
         held = await currentConv($)
       }
@@ -1145,7 +2288,8 @@ export const register: Register = on => {
         { phase: 'ready' },
       )
       if (isReady) {
-        $.ui.toast(READY_BAND, { timeoutMs: 15000 })
+        // O12: a managed sub-chat shows no ready toast.
+        if (held.role !== 'alt') $.ui.toast(READY_BAND, { timeoutMs: 15000 })
         await refreshStatus($).catch(() => undefined)
       }
 
@@ -1158,7 +2302,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'devir' }, async ($, e) => {
-    const [verb = '', value] = e.args.trim().split(/\s+/)
+    const [verb = '', value, extra] = e.args.trim().split(/\s+/)
     const settings = await readSettings($)
     const held = await currentConv($)
 
@@ -1167,7 +2311,9 @@ export const register: Register = on => {
         const percent = await contextPercent($)
         const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
 
-        return { text: `${statusText(settings, percent, held, running)} · aşama: ${held.phase}` }
+        const orkestra = await orkestraStatusOf($, held)
+
+        return { text: `${statusText(settings, percent, held, running, orkestra)} · aşama: ${held.phase}` }
       }
       case 'esik': {
         const n = Number(value)
@@ -1179,8 +2325,10 @@ export const register: Register = on => {
       }
       case 'dene': {
         // Decision 13: a threshold for THIS chat only ($.state), for live tests.
+        const isMain = (await roleOf($)) === 'ana' && held.localId !== undefined
         if (value === undefined) {
           await patchConv($, held.sid, { testThreshold: undefined })
+          if (isMain) await patchMain($, held.localId as string, { testThreshold: undefined })
           await refreshStatus($)
 
           return { text: `Bu sohbetin deneme eşiği kaldırıldı; eşik %${settings.threshold}.` }
@@ -1188,11 +2336,18 @@ export const register: Register = on => {
         const n = Number(value)
         if (!isThreshold(n)) return { text: 'Kullanım: /devir dene <1-99> (boş: kaldır)' }
         await patchConv($, held.sid, { testThreshold: n })
+        // Decision 11: in the main chat the chain's later children inherit it.
+        const main = isMain ? await patchMain($, held.localId as string, { testThreshold: n }) : undefined
         await refreshStatus($)
+        if (main !== undefined) {
+          return { text: `Zincirin deneme eşiği %${n}: bundan sonra açılan alt sohbetler bunu kullanır.` }
+        }
 
         return { text: `Bu sohbetin deneme eşiği %${n} (yalnızca bu sohbet).` }
       }
       case 'simdi': {
+        // O3: the main chat never hands off.
+        if ((await roleOf($)) === 'ana') return { text: 'Ana sohbet devredilmez (orkestra modu).' }
         const handed = await handedOf($, held.sid)
         if (handed !== undefined || held.phase === 'done') {
           return {
@@ -1224,6 +2379,8 @@ export const register: Register = on => {
         await refreshStatus($)
 
         return { text: 'Otomatik devir açıldı.' }
+      case 'otonom':
+        return { text: await otonomVerb($, held, (value ?? '').toLowerCase(), extra) }
       case 'sor':
       case 'otomatik':
       case 'gec':
@@ -1249,7 +2406,9 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || e.props.isWorking) return next(e)
     const held = await read($, conv)
-    if (held === null || held.phase !== 'ready' || held.sid !== (await $.session.id())) return next(e)
+    if (held === null || held.sid !== (await $.session.id())) return next(e)
+    const row = await bandRow($, held)
+    if (row === undefined) return next(e)
     // The mod off: no band, even before this chat's next hook drops the handoff.
     if (!(await readSettings($)).isEnabled) return next(e)
 
@@ -1259,7 +2418,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Box key="devir">
-          <Text>{READY_BAND}</Text>
+          <Text>{row}</Text>
         </Box>
         {below ?? null}
       </Box>

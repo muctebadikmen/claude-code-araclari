@@ -84,6 +84,8 @@ Sürüm 1.0.0. Alt satırdaki durum çubuğunda `Devir: %X / eşik %60` görürs
 
 **Alt ajanları bekleyen tur sonu koruması.** Mod açıkken Claude, alt ajanlar ve Workflow'lar çalışırken turu bitirmez; her seferinde en fazla 5 dakikalık beklemelerle bekler ve sonra turu bitirmeyi yeniden dener. Arka plan Bash, Monitor ve geliştirme sunucuları beklenmez. Esc bu beklemeyi her zaman durdurur.
 
+Mod açıkken my-skill-orchestrate/execute kendi başına "uzun sohbet" devri yapmaz; devri eşikte mod yapar.
+
 **Eşiğe gelince:**
 1. Mod Claude'a turun içinde tek bir talimat verir: elindeki adımı bitir, yeni iş başlatma, devir dosyasını yazdır (`my-skill-handoff auto`; beceri yoksa modun kendi devir talimatı) ve yeni sohbeti aç.
 2. Çalışan alt ajanlar bitene kadar sistem yeni alt ajan, Workflow, Task ya da alt ajana mesaj başlatmayı **koda bağlı olarak** reddeder (bu yalnızca talimat değil, araç çağrısı reddedilir). Durum satırında `Devir: N alt ajan bitiyor` görünür.

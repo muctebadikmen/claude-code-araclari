@@ -109,6 +109,11 @@ const runningList = (running: Running): string =>
   running.map(work => `${work.id} (${work.description})`).join(', ')
 
 /** Stop block while subagents or Workflows run: wait inside the turn (Decision 3). */
+/** Decision 16: the system-prompt section that tells the model the mod owns the long-chat handoff. */
+export const LONG_CHAT_SECTION_ID = 'otomatik-devir'
+export const longChatNote = (threshold: number): string =>
+  `otomatik-devir bu oturumda açık: devri mod yönetir. Bağlam büyüdü diye kendiliğinden devir yapma, my-skill-handoff çağırma, yeni sohbet ya da devam prompt'u önerme; işe devam et. Bağlam %${threshold}'e ulaşınca mod talimat verir, o talimata uy. Kullanıcı açıkça devir isterse: /devir simdi.`
+
 export const waitText = (running: Running): string =>
   `otomatik-devir: turu henüz bitirme; çalışan işler var: ${runningList(running)}. Sonuçlarını bu turun içinde bekle: Bash aracıyla \`perl -e 'select(undef,undef,undef,120)'\` çalıştır (120 saniye; tek bir bekleme en çok 5 dakika olsun), gelen sonuçları işle ve hiçbiri çalışmıyorsa turu yeniden bitirmeyi dene. Yeni alt ajan ya da Workflow başlatma.`
 
@@ -792,6 +797,30 @@ export const register: Register = on => {
     later($, () => cleanupOnce($))
 
     return next(e)
+  })
+
+  // Decision 16: while the mod is on and this chat is idle, the system prompt
+  // says the mod owns the handoff. Appended last (a `shared` section after a
+  // `session` one would skip the hook). No `$.ui.invalidate` event exists for
+  // `prompt.compose`: the hook runs on every render, so each one reads the
+  // current state.
+  on('prompt.compose', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      const settings = await readSettings($)
+      const held = await currentConv($)
+      if (!settings.isEnabled || held.phase !== 'idle') return r
+
+      return {
+        ...r,
+        sections: [
+          ...r.sections.filter(s => s.id !== LONG_CHAT_SECTION_ID),
+          { id: LONG_CHAT_SECTION_ID, text: longChatNote(thresholdOf(settings, held)), scope: 'session' as const },
+        ],
+      }
+    } catch {
+      return r
+    }
   })
 
   // A /clear (or any end) drops this conversation's $.state record; the

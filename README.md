@@ -93,21 +93,21 @@ Bir alt sohbette devir başlamamışken sistem prompt'una bir bölüm ekler: Cla
 4. Devir dosyası `.workflow/handoff/<oturum-kimliği>.md` yoluna yazılır. Her sohbetin kendi dosyası olduğu için aynı klasördeki sohbetler birbirinin dosyasını ezmez. Yeni alt sohbete yalnızca bu dosyayı okuması söylenir; eski `.workflow/HANDOFF.md` ya da `STATE.md` dosyalarına yönlendirilmez.
 5. Alt sohbet dosyayı yazıp turu bitirir; durum satırında `Devir hazır` görünür. Sıradaki alt sohbeti ana sohbet açar.
 
-**Orkestra modu (v1.1).** `/devir-otonom <görev>` yazın; o sohbet ana sohbet olur. Ana sohbet işin kendisini yapmaz: iç içe alt sohbetleri `<görev> · 1`, `· 2` adlarıyla tıklamasız açar ve her birini bekler. Her alt sohbet eşikte devir dosyasını yazar, ana sohbet sıradakini o dosyadan açar. Zincir şu durumlarda durur ve ana sohbet bir özet yazar: `Kalan: yok`, biten bir alt sohbet, yanıt vermeyi bırakan bir alt sohbet, `/devir otonom dur` ya da sınır. Sınır varsayılan 100 alt sohbettir; `/devir otonom limit <n>` ile değişir (1-1000), yalnızca bu zincir için geçerlidir ve zincir sürerken de ayarlanabilir. Esc, çökme ya da yeniden başlatma olursa şeritte `Orkestra duraklatıldı: devam etmek için bir mesaj yaz.` çıkar; sonraki mesajınız zinciri sürdürür. Ana sohbette (ya da `/devir-otonom` yazmadan önce o sohbette) yazılan `/devir dene` alt sohbetlere uygulanır. `/devir ac` gerekmez: `/devir-otonom <görev>` yazmak yeter. Eşik, sınır ve `/devir kapat` ana sohbette ya da bir alt sohbette yazılınca yalnızca o zinciri etkiler; başka zincirleri ve normal sohbetleri etkilemez. `/devir kapat` bu zinciri durdurur: ana sohbet özet yazar, yeni alt sohbet açılmaz, süren alt sohbet devri iptal edilir. Yepyeni bir sohbette komut listesi önce yalnızca eklentinin ad alanlı biçimini gösterebilir (2026-10-25'te yalnızca `/otomatik-devir:devir-otonom` göründü, `/devir-otonom` ve `/devir` sonradan çıktı): `/devir-otonom` listede yoksa aynı komut olan `/otomatik-devir:devir-otonom <görev>` yazın; `/devir` henüz yoksa `/otomatik-devir:devir` komutuna bakın ya da biraz sonra yeniden bakın.
+**Orkestra modu (v1.1).** `/otomatik-devir:devir-otonom <görev>` yazın; o sohbet ana sohbet olur. Ana sohbet işin kendisini yapmaz: iç içe alt sohbetleri `<görev> · 1`, `· 2` adlarıyla tıklamasız açar ve her birini bekler. Her alt sohbet eşikte devir dosyasını yazar, ana sohbet sıradakini o dosyadan açar. Zincir şu durumlarda durur ve ana sohbet bir özet yazar: `Kalan: yok`, biten bir alt sohbet, yanıt vermeyi bırakan bir alt sohbet, `/devir otonom dur` ya da sınır. Sınır varsayılan 100 alt sohbettir; `/devir otonom limit <n>` ile değişir (1-1000), yalnızca bu zincir için geçerlidir ve zincir sürerken de ayarlanabilir. Esc, çökme ya da yeniden başlatma olursa şeritte `Orkestra duraklatıldı: devam etmek için bir mesaj yaz.` çıkar; sonraki mesajınız zinciri sürdürür. Ana sohbette (ya da `/otomatik-devir:devir-otonom` yazmadan önce o sohbette) yazılan `/devir dene` alt sohbetlere uygulanır. `/devir ac` gerekmez: `/otomatik-devir:devir-otonom <görev>` yazmak yeter. Eşik, sınır ve `/devir kapat` ana sohbette ya da bir alt sohbette yazılınca yalnızca o zinciri etkiler; başka zincirleri ve normal sohbetleri etkilemez. `/devir kapat` bu zinciri durdurur: ana sohbet özet yazar, yeni alt sohbet açılmaz, süren alt sohbet devri iptal edilir. Komut listesinde kısa `/devir-otonom` adı görünmez; `/devir` ise sohbetin ilk mesajından sonra çıkar (hemen gerekirse önce herhangi bir mesaj yazın).
 
 Mevcut kurulumunuzda eski sürümden kalan `otomatik-devir-*` zamanlanmış görevleri varsa mod bunları ilk yüklemede bir kez siler (görevlerin çalıştırma sohbetleri arşivlenir; arşivden geri alınabilir) ve eski kayıt anahtarlarını temizler.
 
 | Komut | Ne yapar |
 |---|---|
 | `/devir` | Durumu gösterir; normal sohbette tek satırla burada devir olmadığını söyler |
-| `/devir-otonom <görev>` | Otonom zinciri başlatır; bu sohbet ana sohbet olur |
+| `/otomatik-devir:devir-otonom <görev>` | Otonom zinciri başlatır; bu sohbet ana sohbet olur |
 | `/devir otonom` | Orkestra durumunu ve sınırı gösterir |
 | `/devir otonom dur` | Zinciri şu anki alt sohbetten sonra durdurur |
 | `/devir otonom limit <n>` | Bu zincirin alt sohbet sınırını ayarlar (1-1000, varsayılan 100) |
 | `/devir esik 70` | Bu zincirin alt sohbet eşiğini %70 yapar, ana ya da alt sohbette (1-99, varsayılan 60); başka zincirleri ve sohbetleri etkilemez; normal sohbette hiçbir şey değiştirmez |
 | `/devir dene 20` | Bu sohbetin deneme eşiği; alt sohbette onun, ana sohbette ya da başlatmadan önce yazılınca zincirin alt sohbetlerinin; `/devir dene` yazınca kaldırır |
 | `/devir simdi` | Alt sohbette devri hemen başlatır; normal sohbette devir yoktur |
-| `/devir kapat` / `/devir ac` | Acil durdurma: yazıldığı zinciri durdurur ve süren alt sohbet devrini iptal eder; başka zincirleri ve sohbetleri etkilemez; normal sohbette hiçbir şey değiştirmez. Yazılmış devir dosyası yerinde kalır. `/devir ac` hiçbir şey yazmaz, kapatılan ya da biten zinciri sürdürmez: yeni zincir `/devir-otonom` ile başlar. |
+| `/devir kapat` / `/devir ac` | Acil durdurma: yazıldığı zinciri durdurur ve süren alt sohbet devrini iptal eder; başka zincirleri ve sohbetleri etkilemez; normal sohbette hiçbir şey değiştirmez. Yazılmış devir dosyası yerinde kalır. `/devir ac` hiçbir şey yazmaz, kapatılan ya da biten zinciri sürdürmez: yeni zincir `/otomatik-devir:devir-otonom <görev>` ile başlar. |
 
 v0.x'teki mod ve geçiş komutları v1.0'da kaldırıldı. Eski komutları yazarsanız mod bunu söyleyen bir yanıt verir. Zinciri durdurmak için `/devir kapat`.
 
@@ -162,6 +162,7 @@ claude plugin validate modlar/ilerleme-cubugu
 ## Bilinen sınırlar
 
 - **otomatik-devir:** Alt komutlar Türkçe harfsiz yazılır: `esik`, `simdi` (`eşik` çalışmaz). Tur sonu koruması yalnızca alt ajanları ve Workflow'ları bekler; arka plan Bash, Monitor ve geliştirme sunucuları beklenmez. 30 dakikada bitmeyen alt ajanlar durdurulur ve devir dosyasında "Yeniden çalıştır" olarak kalır.
+  - Zincir `/otomatik-devir:devir-otonom <görev>` ile başlar: komut listesinde kısa `/devir-otonom` adı görünmez; `/devir` sohbetin ilk mesajından sonra çıkar.
   - Ana sohbet yazdığınız turun içinde kalmalıdır; tur kapanırsa zincir duraklar.
   - Devir dosyasını yazmadan ve bitmeden çalışmayı bırakan alt sohbet yaklaşık 10 dakikada fark edilir: zincir `Orkestra durdu: alt sohbet N yanıt vermiyor` ile durur ve ana sohbet özet yazar.
   - Hâlâ çalışırken takılan alt sohbet ana sohbeti bekletir (Esc, sonra `/devir otonom dur`).

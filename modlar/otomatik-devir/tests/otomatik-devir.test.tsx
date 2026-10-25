@@ -60,7 +60,7 @@ const MAIN_RECORD = {
   at: 0,
 }
 const CHILD_RECORD = { role: 'alt', parent: MAIN_ID, n: 1, sid: SID, localId: CHILD_ID, status: 'working', at: 0 }
-const NOT_ORCHESTRATED = `Bu sohbet orkestra modunda değil (sınır ${DEFAULT_LIMIT} alt sohbet). Başlatmak için /devir-otonom <görev> yaz.`
+const NOT_ORCHESTRATED = `Bu sohbet orkestra modunda değil (sınır ${DEFAULT_LIMIT} alt sohbet). Başlatmak için /otomatik-devir:devir-otonom <görev> yaz.`
 
 /** A record (or chain settings) file as BACKEND file keeps it (store-probe.md). */
 const seedJson = (world: any, path: string, value: unknown) => {

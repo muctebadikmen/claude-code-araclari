@@ -698,6 +698,118 @@ const runningWork = async ($: EngineInterface, tasks: readonly BackgroundTask[] 
 }
 
 export const register: Register = on => {
+  // A /clear (or any end) drops this conversation's $.state record; the
+  // store keys stay (S2), so a reload restores the handoff.
+  on('session.end', async ($, e, next) => {
+    await update($, conv, held => (held !== null && held.sid === e.sessionId ? null : held))
+
+    return next(e)
+  })
+
+  // Status line on every measured change of the fill.
+  on('session.measure', async ($, e, next) => {
+    await refreshStatus($, e.context.percent)
+
+    return next(e)
+  })
+
+  // S8: who typed the turn about to start (or the one running, for a message
+  // typed into it). A typed message while the handoff waits for one (ready, or
+  // running with the gate closed), or when it is due now, carries the handoff
+  // as context and becomes the new chat's first job. A slash command typed is
+  // left alone (it runs as typed).
+  on('prompt.submit', async ($, e, next) => {
+    const isPerson = isPersonSubmit(e)
+    if (e.turnId !== undefined) {
+      // Typed over a running turn: the app counts that turn as the person's
+      // from then on; if the message waits, it opens the next turn too.
+      if (isPerson && e.turnId === runningTurnId) isPersonTurn = true
+      if (isPerson) isNextTurnPerson = true
+
+      return next(e)
+    }
+    isNextTurnPerson = isPerson
+    if (!isPerson || e.command !== undefined) return next(e)
+    const before = await currentConv($)
+    const sid = before.sid
+    const settings = await readSettings($)
+    if (!settings.isEnabled || (await handedOf($, sid)) !== undefined) return next(e)
+    let held: OtomatikDevirConv | undefined
+    if (before.phase === 'ready' || (before.phase === 'handoff_running' && before.isGateClosed === true)) {
+      const isClaimed = await claim($, sid, h => h.phase === before.phase && h.starting === undefined, {
+        phase: 'handoff_running',
+        pendingMessage: e.text,
+        instructNext: true,
+      })
+      held = isClaimed ? await currentConv($) : undefined
+    } else if (before.phase === 'idle' && (await isDue($, before)) !== undefined) {
+      held = await claimHandoff($, sid, h => h.phase === 'idle', { pendingMessage: e.text, instructNext: true })
+    }
+    if (held?.file === undefined) return next(e)
+    const note = nextMessageNote(held.file, await isFresh($, held.file, held.handoffAt), await hasHandoffSkill($))
+    $.ui.toast('Devir: yeni sohbet bu mesajınla açılacak.')
+    const out = await next({ ...e, context: [...(e.context ?? []), note] })
+    if (out.drop !== undefined) {
+      // Dropped beneath: no turn carries the instruction; the phase goes back.
+      await update($, conv, now => (now !== null && now.sid === sid ? before : now))
+      await syncStore($, sid)
+    }
+
+    return out
+  })
+
+  on('turn.start', async ($, e, next) => {
+    if ((e as { agentId?: string }).agentId === undefined) {
+      runningTurnId = e.turnId
+      isPersonTurn = isNextTurnPerson
+      isNextTurnPerson = false
+      handoffBlocks = 0
+      missingBlocks = 0
+      // The turn an S8 message opens is the one its instruction is for.
+      const held = await currentConv($)
+      if (held.phase === 'handoff_running' && held.instructNext === true) {
+        await claim($, held.sid, h => h.phase === 'handoff_running' && h.instructNext === true, {
+          instructNext: false,
+          instructedTurn: e.turnId,
+          isGateClosed: false,
+        })
+      }
+    }
+
+    return next(e)
+  })
+
+  // S9: a main turn that ends with the handoff still running closes the gate
+  // (an Esc, `isAborted`, too: the handoff stays, it is never cancelled). The
+  // file written and nothing running: the handoff is `ready`.
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId !== undefined) return result
+    isPersonTurn = false
+    runningTurnId = undefined
+    const held = await currentConv($)
+    if (held.phase === 'handoff_running') {
+      if (e.isAborted) $.ui.log('otomatik-devir: tur durduruldu; devir sürüyor', { to: 'debug' })
+      await claim($, held.sid, h => h.phase === 'handoff_running', { isGateClosed: true })
+      if (
+        held.starting === undefined &&
+        (await isFresh($, held.file, held.handoffAt)) &&
+        (await runningWork($, undefined)).length === 0
+      ) {
+        const isReady = await claim(
+          $,
+          held.sid,
+          h => h.phase === 'handoff_running' && h.starting === undefined,
+          { phase: 'ready' },
+        )
+        if (isReady) $.ui.toast(READY_BAND, { timeoutMs: 15000 })
+      }
+    }
+    await refreshStatus($).catch(() => undefined)
+
+    return result
+  })
+
   // (a) The mid-turn channel: a tool result's `context` is read by the model
   // right after that result, inside the running turn.
   on('tool.call', async ($, e, next) => {

@@ -422,16 +422,33 @@ type Settings = { threshold: number; isEnabled: boolean }
 const isThreshold = (n: unknown): n is number =>
   typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= 99
 
+/**
+ * This chat's chain settings (Decision 22), from the cached conv role (never
+ * `currentConv`): a main chat's own chain, a sub-chat's parent's. A normal
+ * chat (role `yok` or unresolved) has none: the default threshold, off.
+ */
 const readSettings = async ($: EngineInterface): Promise<Settings> => {
-  const [esik, acik] = await Promise.all([$.store.get('esik'), $.store.get('acik')])
+  const sid = await $.session.id()
+  const held = await read($, conv)
+  const chainId =
+    held === null || held.sid !== sid
+      ? undefined
+      : held.role === 'ana'
+        ? held.localId
+        : held.role === 'alt'
+          ? held.parentId
+          : undefined
+  if (chainId === undefined) return { threshold: DEFAULT_THRESHOLD, isEnabled: false }
+  const ayar = await readChainSettings($, chainId).catch(() => lastAyar[chainId])
+  const esik = ayar?.esik
 
   return {
     threshold: isThreshold(esik) ? esik : DEFAULT_THRESHOLD,
-    isEnabled: acik !== false,
+    isEnabled: ayar?.isClosed !== true,
   }
 }
 
-/** The threshold this chat trips at: its own `/devir dene` value, else the global `esik`. */
+/** The threshold this chat trips at: its own `/devir dene` value, else its chain's `esik`. */
 const thresholdOf = (settings: Settings, held: OtomatikDevirConv | null): number =>
   held?.testThreshold ?? settings.threshold
 
@@ -2465,10 +2482,13 @@ export const register: Register = on => {
         if (isNormal) return { text: NORMAL_INFO }
         const n = Number(value)
         if (!isThreshold(n)) return { text: 'Kullanım: /devir esik <1-99>' }
-        await $.store.set('esik', n)
+        // Decision 22: this chain's threshold only.
+        const chainId = await chainIdOf($)
+        if (chainId === undefined) return { text: NORMAL_INFO }
+        await patchChainSettings($, chainId, { esik: n })
         await refreshStatus($)
 
-        return { text: `Devir eşiği %${n} olarak ayarlandı.` }
+        return { text: chainEsikText(n) }
       }
       case 'dene': {
         // Decision 13: a threshold for THIS chat only ($.state), for live tests.
@@ -2504,7 +2524,8 @@ export const register: Register = on => {
           }
         }
         if (isDrainPhase(held.phase)) return { text: 'Devir zaten çalışıyor.' }
-        if (!settings.isEnabled) return { text: 'Otomatik devir kapalı. Açmak için: /devir ac' }
+        // Decision 22: a closed chain is not reopened.
+        if (!settings.isEnabled) return { text: AC_CHAIN_STOPPED }
         await patchConv($, held.sid, { isForced: true })
 
         return { text: 'Devir istendi: çalışan turda ya da bir sonraki mesajınla başlayacak.' }
@@ -2529,12 +2550,17 @@ export const register: Register = on => {
           } ${KAPAT_CHAIN}`,
         }
       }
-      case 'ac':
+      case 'ac': {
         if (isNormal) return { text: NORMAL_INFO }
-        await $.store.set('acik', true)
-        await refreshStatus($)
+        // Decisions 20, 22: writes nothing; a closed or ended chain is not resumed.
+        const chainId = await chainIdOf($)
+        if (chainId === undefined) return { text: NORMAL_INFO }
+        const isClosed = (await readChainSettings($, chainId).catch(() => undefined))?.isClosed === true
+        const main = isClosed ? undefined : await readRecord($, chainId).catch(() => undefined)
+        const isEnded = main?.role === 'ana' && main.ended !== undefined
 
-        return { text: 'Otomatik devir açıldı.' }
+        return { text: isClosed || isEnded ? AC_CHAIN_STOPPED : AC_CHAIN_OPEN }
+      }
       case 'otonom':
         return { text: await otonomVerb($, held, (value ?? '').toLowerCase(), extra) }
       case 'sor':

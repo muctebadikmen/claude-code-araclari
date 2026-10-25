@@ -80,32 +80,36 @@ Sonra Claude Code'u yeniden başlatın.
 
 ### otomatik-devir
 
-Sürüm 1.0.1. Alt satırdaki durum çubuğunda `Devir: %X / eşik %60` görürsünüz (ilk yanıttan önce %0 görünür). Devir tek modludur ve tıklamasızdır: tek bir kurulum yolu, seçilecek bir mod yok.
+Sürüm 1.1.0. Otomatik devir artık yalnızca orkestra alt sohbetlerinde çalışır. Normal bir sohbet hiç devredilmez ve `Devir:` durum satırı göstermez; orada `/devir` yazarsanız tek satırla burada devir olmadığını söyler. Alt sohbet eşikte devir dosyasını yazar, sıradaki alt sohbeti ana sohbet açar. Devir tıklamasızdır: tek bir kurulum yolu, seçilecek bir mod yok.
 
-**Devir sırasında alt ajanları bekleyen tur sonu koruması.** Eşik aşılıp devir başladıktan sonra Claude, alt ajanlar ve Workflow'lar çalışırken turu bitirmez; her seferinde en fazla 5 dakikalık beklemelerle bekler ve sonra turu bitirmeyi yeniden dener. Devir yokken ve "Devir hazır" durumunda (dosya yazılmış, yeni sohbet bir sonraki mesajınızı bekliyor) çalışan alt ajanlar ve Workflow'lar turun bitmesini engellemez. Arka plan Bash, Monitor ve geliştirme sunucuları hiç beklenmez. Esc bu beklemeyi her zaman durdurur.
+**Devir sırasında alt ajanları bekleyen tur sonu koruması.** Alt sohbette eşik aşılıp devir başladıktan sonra Claude, alt ajanlar ve Workflow'lar çalışırken turu bitirmez; her seferinde en fazla 5 dakikalık beklemelerle bekler ve sonra turu bitirmeyi yeniden dener. Devir yokken ve "Devir hazır" durumunda (dosya yazılmış) çalışan alt ajanlar ve Workflow'lar turun bitmesini engellemez. Arka plan Bash, Monitor ve geliştirme sunucuları hiç beklenmez. Esc bu beklemeyi her zaman durdurur.
 
-Mod açıkken ve devir başlamamışken sistem prompt'una bir bölüm ekler: Claude bağlam büyüdü diye kendi başına devir yapmaz (my-skill-orchestrate/execute'un "uzun sohbet" devri dahil); devri eşikte mod yapar. Mod açıkken modelin kendi başına my-skill-handoff çağırması engellenir; devri eşikte mod yapar. Kapatmak için /devir kapat.
+Bir alt sohbette devir başlamamışken sistem prompt'una bir bölüm ekler: Claude bağlam büyüdü diye kendi başına devir yapmaz (my-skill-orchestrate/execute'un "uzun sohbet" devri dahil); devri eşikte mod yapar. Alt sohbette modelin kendi başına my-skill-handoff çağırması engellenir. Yeni sohbet açmayı da mod yasaklar: sıradakini ana sohbet açar.
 
-**Eşiğe gelince:**
-1. Mod Claude'a turun içinde tek bir talimat verir: elindeki adımı bitir, yeni iş başlatma, devir dosyasını yazdır (`my-skill-handoff auto`; beceri yoksa modun kendi devir talimatı) ve yeni sohbeti aç.
+**Eşiğe gelince (alt sohbette):**
+1. Mod Claude'a turun içinde tek bir talimat verir: elindeki adımı bitir, yeni iş başlatma, devir dosyasını yazdır (`my-skill-handoff auto`; beceri yoksa modun kendi devir talimatı). Dosyanın başına `Kalan: var` ya da `Kalan: yok` satırı konur.
 2. Çalışan alt ajanlar bitene kadar sistem yeni alt ajan, Workflow, Task ya da alt ajana mesaj başlatmayı **koda bağlı olarak** reddeder (bu yalnızca talimat değil, araç çağrısı reddedilir). Durum satırında `Devir: N alt ajan bitiyor` görünür.
 3. 30 dakika içinde bitmeyen işleri Claude `TaskStop` ile durdurur ve devir dosyasında "Yeniden çalıştır" başlığı altında listeler.
-4. Devir dosyası `.workflow/handoff/<oturum-kimliği>.md` yoluna yazılır. Her sohbetin kendi dosyası olduğu için aynı klasördeki sohbetler birbirinin dosyasını ezmez. Yeni sohbete yalnızca bu dosyayı okuması söylenir; eski `.workflow/HANDOFF.md` ya da `STATE.md` dosyalarına yönlendirilmez.
-5. Claude yeni sohbeti kendisi, tıklamasız ve iç içe (eski sohbetin altında) açar (`start_session`). Eski sohbet açık kalır. `devredildi` kaydı kalıcıdır, uygulamayı yeniden başlatsanız da aynı sohbetten ikinci bir sohbet açılmaz.
+4. Devir dosyası `.workflow/handoff/<oturum-kimliği>.md` yoluna yazılır. Her sohbetin kendi dosyası olduğu için aynı klasördeki sohbetler birbirinin dosyasını ezmez. Yeni alt sohbete yalnızca bu dosyayı okuması söylenir; eski `.workflow/HANDOFF.md` ya da `STATE.md` dosyalarına yönlendirilmez.
+5. Alt sohbet dosyayı yazıp turu bitirir; durum satırında `Devir hazır` görünür. Sıradaki alt sohbeti ana sohbet açar.
 
-**Kapı kapalıysa (Esc, çökme ya da bir bildirim turu):** uygulama, sizin yazmadığınız bir turda yeni sohbet açılmasına izin vermez. Bu durumda mod devir dosyasını yine hazırlatır ve yazı kutusunun üstünde "Devir hazır" şeridi çıkar. Bir sonraki yazdığınız mesaj önce yeni sohbeti açar; mesajınız yeni sohbetin ilk işi olur. Ping, zamanlanmış görev ya da kart yoktur.
+**Orkestra modu (v1.1).** `/devir-otonom <görev>` yazın; o sohbet ana sohbet olur. Ana sohbet işin kendisini yapmaz: iç içe alt sohbetleri `<görev> · 1`, `· 2` adlarıyla tıklamasız açar ve her birini bekler. Her alt sohbet eşikte devir dosyasını yazar, ana sohbet sıradakini o dosyadan açar. Zincir şu durumlarda durur ve ana sohbet bir özet yazar: `Kalan: yok`, biten bir alt sohbet, yanıt vermeyi bırakan bir alt sohbet, `/devir otonom dur` ya da sınır. Sınır varsayılan 100 alt sohbettir; `/devir otonom limit <n>` ile değişir (1-1000), yalnızca bu zincir için geçerlidir ve zincir sürerken de ayarlanabilir. Esc, çökme ya da yeniden başlatma olursa şeritte `Orkestra duraklatıldı: devam etmek için bir mesaj yaz.` çıkar; sonraki mesajınız zinciri sürdürür. Ana sohbette (ya da `/devir-otonom` yazmadan önce o sohbette) yazılan `/devir dene` alt sohbetlere uygulanır. `/devir ac` gerekmez: `/devir-otonom <görev>` yazmak yeter. Eşik, sınır ve `/devir kapat` ana sohbette ya da bir alt sohbette yazılınca yalnızca o zinciri etkiler; başka zincirleri ve normal sohbetleri etkilemez. `/devir kapat` bu zinciri durdurur: ana sohbet özet yazar, yeni alt sohbet açılmaz, süren alt sohbet devri iptal edilir. Yepyeni bir sohbette komut listesi önce yalnızca eklentinin ad alanlı biçimini gösterebilir (2026-10-25'te yalnızca `/otomatik-devir:devir-otonom` göründü, `/devir-otonom` ve `/devir` sonradan çıktı): `/devir-otonom` listede yoksa aynı komut olan `/otomatik-devir:devir-otonom <görev>` yazın; `/devir` henüz yoksa `/otomatik-devir:devir` komutuna bakın ya da biraz sonra yeniden bakın.
 
 Mevcut kurulumunuzda eski sürümden kalan `otomatik-devir-*` zamanlanmış görevleri varsa mod bunları ilk yüklemede bir kez siler (görevlerin çalıştırma sohbetleri arşivlenir; arşivden geri alınabilir) ve eski kayıt anahtarlarını temizler.
 
 | Komut | Ne yapar |
 |---|---|
-| `/devir` | Durumu gösterir |
-| `/devir esik 70` | Eşiği %70 yapar (1-99) |
-| `/devir dene 20` | Eşiği yalnızca bu sohbet için %20 yapar (deneme); `/devir dene` yazınca kaldırır |
-| `/devir simdi` | Devri hemen başlatır |
-| `/devir kapat` / `/devir ac` | Modu kapatır / açar. Kapatınca bu sohbette süren ya da hazır devir iptal edilir: alt ajan ve Workflow yeniden başlatılabilir, yazılmış devir dosyası yerinde kalır. Açık diğer sohbetlerdeki devirler de bir sonraki olaylarında iptal olur. Tamamlanmış bir devir geri alınmaz. |
+| `/devir` | Durumu gösterir; normal sohbette tek satırla burada devir olmadığını söyler |
+| `/devir-otonom <görev>` | Otonom zinciri başlatır; bu sohbet ana sohbet olur |
+| `/devir otonom` | Orkestra durumunu ve sınırı gösterir |
+| `/devir otonom dur` | Zinciri şu anki alt sohbetten sonra durdurur |
+| `/devir otonom limit <n>` | Bu zincirin alt sohbet sınırını ayarlar (1-1000, varsayılan 100) |
+| `/devir esik 70` | Bu zincirin alt sohbet eşiğini %70 yapar, ana ya da alt sohbette (1-99, varsayılan 60); başka zincirleri ve sohbetleri etkilemez; normal sohbette hiçbir şey değiştirmez |
+| `/devir dene 20` | Bu sohbetin deneme eşiği; alt sohbette onun, ana sohbette ya da başlatmadan önce yazılınca zincirin alt sohbetlerinin; `/devir dene` yazınca kaldırır |
+| `/devir simdi` | Alt sohbette devri hemen başlatır; normal sohbette devir yoktur |
+| `/devir kapat` / `/devir ac` | Acil durdurma: yazıldığı zinciri durdurur ve süren alt sohbet devrini iptal eder; başka zincirleri ve sohbetleri etkilemez; normal sohbette hiçbir şey değiştirmez. Yazılmış devir dosyası yerinde kalır. `/devir ac` hiçbir şey yazmaz, kapatılan ya da biten zinciri sürdürmez: yeni zincir `/devir-otonom` ile başlar. |
 
-v0.x'teki mod ve geçiş komutları v1.0'da kaldırıldı; tek mod otomatik. Eski komutları yazarsanız mod bunu söyleyen bir yanıt verir. Kapatmak için `/devir kapat`.
+v0.x'teki mod ve geçiş komutları v1.0'da kaldırıldı. Eski komutları yazarsanız mod bunu söyleyen bir yanıt verir. Zinciri durdurmak için `/devir kapat`.
 
 Kendi devir becerisi (`my-skill-handoff`) olanlarda mod onu kullanır. Olmayanlarda kendi hazır devir talimatını gönderir; ekstra bir şey kurmanız gerekmez.
 
@@ -153,11 +157,18 @@ claude plugin validate modlar/otomatik-devir
 claude plugin validate modlar/ilerleme-cubugu
 ```
 
-Çıktı, modun hangi işlemleri yaptığını listeler. İki modun listesinde de ağ çağrısı yoktur. ilerleme-cubugu yalnızca proje klasöründeki plan dosyalarını okur, hiçbir dosyaya yazmaz. otomatik-devir devam notunu Claude'a yazdırır (`.workflow/handoff/<oturum-kimliği>.md`); kendisi mod açıkken sistem prompt'una devri kendisinin yönettiğini söyleyen bir bölüm ekler, eşikte Claude'un süren turuna talimat ekler, alt ajan ve Workflow başlatmayı eşikten sonra reddeder ve devir sürerken alt ajanlar ya da Workflow'lar çalışıyorsa turun bitmesini engeller. Yeni sohbeti masaüstü uygulamasının oturum aracıyla (`start_session`) Claude'a açtırır; ilk yüklemede eski sürümün `otomatik-devir-*` zamanlanmış görevlerini siler.
+Çıktı, modun hangi işlemleri yaptığını listeler. İki modun listesinde de ağ çağrısı yoktur. ilerleme-cubugu yalnızca proje klasöründeki plan dosyalarını okur, hiçbir dosyaya yazmaz. otomatik-devir devam notunu Claude'a yazdırır (`.workflow/handoff/<oturum-kimliği>.md`); kendisi mod açıkken sistem prompt'una devri kendisinin yönettiğini söyleyen bir bölüm ekler, eşikte Claude'un süren turuna talimat ekler, alt ajan ve Workflow başlatmayı eşikten sonra reddeder ve devir sürerken alt ajanlar ya da Workflow'lar çalışıyorsa turun bitmesini engeller. Alt sohbetleri ana sohbetteki Claude'a masaüstü uygulamasının oturum aracıyla (`start_session`) açtırır. Orkestra modu bu sohbet için `get_session` çağırır ve küçük JSON kayıtlarını `~/.claude/plugins/data/otomatik-devir/orkestra/` altına yazar. Her zincirin eşiğini, sınırını ve durdurma bayrağını ana sohbetin kimliğiyle anahtarlanan tek bir küçük ayar kaydında tutar (dosya olarak `ayar-<kimlik>.json`, aynı klasörde); genel `esik`/`acik` anahtarları artık kullanılmaz. İlk yüklemede eski sürümün `otomatik-devir-*` zamanlanmış görevlerini siler.
 
 ## Bilinen sınırlar
 
-- **otomatik-devir:** Alt komutlar Türkçe harfsiz yazılır: `esik`, `simdi` (`eşik` çalışmaz). Yeni sohbet yalnızca sizin yazdığınız bir turda tıklamasız açılabilir; Esc, çökme ya da bildirim turunda devir hazırlanır, "Devir hazır" şeridi çıkar ve sonraki mesajınız yeni sohbeti açar. Tur sonu koruması yalnızca alt ajanları ve Workflow'ları bekler; arka plan Bash, Monitor ve geliştirme sunucuları beklenmez. 30 dakikada bitmeyen alt ajanlar durdurulur ve devir dosyasında "Yeniden çalıştır" olarak kalır. Eşik tüm açık sohbetleri etkiler; tek bir sohbette denemek için `/devir dene <n>` kullanın.
+- **otomatik-devir:** Alt komutlar Türkçe harfsiz yazılır: `esik`, `simdi` (`eşik` çalışmaz). Tur sonu koruması yalnızca alt ajanları ve Workflow'ları bekler; arka plan Bash, Monitor ve geliştirme sunucuları beklenmez. 30 dakikada bitmeyen alt ajanlar durdurulur ve devir dosyasında "Yeniden çalıştır" olarak kalır.
+  - Ana sohbet yazdığınız turun içinde kalmalıdır; tur kapanırsa zincir duraklar.
+  - Devir dosyasını yazmadan ve bitmeden çalışmayı bırakan alt sohbet yaklaşık 10 dakikada fark edilir: zincir `Orkestra durdu: alt sohbet N yanıt vermiyor` ile durur ve ana sohbet özet yazar.
+  - Hâlâ çalışırken takılan alt sohbet ana sohbeti bekletir (Esc, sonra `/devir otonom dur`).
+  - Başlatma çağrısının tam ortasında bir çökme aynı alt sohbetin iki kez açılmasına yol açabilir.
+  - `/devir kapat` kendi zincirini ana sohbetin sonraki adımında durdurur; devir dışında çalışan bir alt sohbet o anki turunu bitirir (öldürülmez).
+  - Ana sohbetin kendi bağlamı %80'e gelirse zincir sıradaki alt sohbet sınırında bir özetle biter; özet, hazır devir dosyasından yeni bir zincirde nasıl devam edileceğini söyler.
+  - Ayarlar zincire özgüdür: bir zincirin eşiği, sınırı ya da durdurması o zincirin ana sohbetinde ya da alt sohbetlerinden birinde yazılmalıdır. Bir alt sohbet devir yaparken durumu `Devir hazır` görünür; `/devir kapat` o devri iptal eder ve ana sohbet sonraki adımında durur.
 - **ilerleme-cubugu:** Plan dosyasını editörde elle değiştirirseniz çubuğun güncellenmesi birkaç saniye sürebilir. Plan çubuğu yalnız o dosyalardan bahseden sohbette görünür. İş bitince çubuk kısa bir süre "✓ Tamamlandı" gösterip kaybolur.
 - **Yazı kutusunun üstündeki şerit paylaşılır:** iki mod (ve varsa başka modlar) aynı şeride çizer. Başka modun düğmeleri (ör. "Geç / Bekle") her zaman üstte kalır; adım listesi açıkken bile onları ekrandan itmez.
 

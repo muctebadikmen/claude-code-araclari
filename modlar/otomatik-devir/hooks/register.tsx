@@ -497,6 +497,26 @@ const syncStore = async ($: EngineInterface, sid: string): Promise<void> => {
 
 /** The record of this sid, rebuilt from the store when $.state has none (a reload). */
 const restoreConv = async ($: EngineInterface, sid: string): Promise<OtomatikDevirConv> => {
+  const base = await restoreHandoff($, sid)
+  // O16: a reload keeps this chat's orchestration role (its local id and own record).
+  const localId = nonEmpty(await $.store.get(`${KIMLIK_PREFIX}${sid}`).catch(() => undefined))
+  if (localId === undefined) return base
+  const own = await readRecord($, localId).catch(() => undefined)
+  if (own === undefined) return { ...base, localId }
+  if (own.role === 'ana') {
+    return {
+      ...base,
+      localId,
+      role: 'ana',
+      childN: own.n,
+      isPaused: !own.isHeld && own.ended === undefined ? true : undefined,
+    }
+  }
+
+  return { ...base, localId, role: 'alt', parentId: own.parent, childN: own.n }
+}
+
+const restoreHandoff = async ($: EngineInterface, sid: string): Promise<OtomatikDevirConv> => {
   const handed = await handedOf($, sid)
   if (handed !== undefined) {
     return { sid, phase: 'done', handoffId: handed.handoffId, startedId: handed.startedId, file: handed.file }
@@ -711,9 +731,9 @@ const hasHandoffSkill = async ($: EngineInterface): Promise<boolean> => {
 const callTool = ($: EngineInterface, input: { tool: string } & Record<string, unknown>) =>
   $.tool.call(input as unknown as ToolCallArgs)
 
-type SelfSession = SelfSettings & { id?: string; title?: string }
+type SelfSession = SelfSettings & { id?: string; title?: string; parentId?: string }
 
-/** This chat's own desktop session: its id (local_...), title, effort, model and permission mode. */
+/** This chat's own desktop session: its id (local_...), parent (local_...), title, effort, model and permission mode. */
 const selfSession = async ($: EngineInterface): Promise<SelfSession> => {
   try {
     const got = await $.tool.call({ tool: GET_SESSION, session_id: 'self' })
@@ -722,6 +742,7 @@ const selfSession = async ($: EngineInterface): Promise<SelfSession> => {
 
     return {
       id: nonEmpty(info.sessionId),
+      parentId: nonEmpty(info.parentSessionId),
       title: nonEmpty(info.title),
       effort: nonEmpty(info.effort),
       model: nonEmpty(info.model),
@@ -793,6 +814,231 @@ const noteSelf = async ($: EngineInterface, sid: string): Promise<void> => {
     model: self.model,
     permissionMode: self.permissionMode,
   })
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration records, ids and roles (O10, O11, O16). Records are keyed by
+// local id (Corrections): the main chat knows its child only by the
+// start_session result, the child its parent only by `parentSessionId`.
+// Each record has one writer: the main chat its own, a child its own.
+// ---------------------------------------------------------------------------
+
+type RecordRead = { kind: 'ok'; rec: OrkestraRecord } | { kind: 'missing' } | { kind: 'torn' }
+
+/** A parsed record; anything else (an O1 tombstone `{ gone }` too) is no record. */
+const toRecord = (got: Record<string, unknown>): OrkestraRecord | undefined => {
+  if (typeof got.localId !== 'string' || typeof got.n !== 'number') return undefined
+  if (got.role === 'ana' && typeof got.task === 'string') return got as unknown as OrkestraAna
+  if (got.role === 'alt' && typeof got.parent === 'string') return got as unknown as OrkestraAlt
+
+  return undefined
+}
+
+const readRecordState = async ($: EngineInterface, localId: string): Promise<RecordRead> => {
+  const home = await homeOf($)
+  const got = await readJsonFile($, home === undefined ? undefined : orkestraRecordFile(home, localId))
+  if (got.kind !== 'ok') return got
+  const rec = toRecord(got.value)
+
+  return rec === undefined ? { kind: 'missing' } : { kind: 'ok', rec }
+}
+
+/** The record of `localId`; missing, invalid or not readable now: undefined (O16). */
+const readRecord = async ($: EngineInterface, localId: string): Promise<OrkestraRecord | undefined> => {
+  const got = await readRecordState($, localId)
+
+  return got.kind === 'ok' ? got.rec : undefined
+}
+
+/** Writes the whole record file ($.fs.write creates the folder). */
+const writeRecord = async (
+  $: EngineInterface,
+  localId: string,
+  rec: OrkestraRecord | { gone: true; at: number },
+): Promise<void> => {
+  const home = await homeOf($)
+  if (home === undefined) return
+  await $.fs.write(orkestraRecordFile(home, localId), JSON.stringify(rec))
+}
+
+// The main chat's own record as this engine last read or wrote it: the main
+// chat is its only writer, so the copy stays true (prompt.compose and the band
+// read it on every render). Reset at session.start.
+let ownMain: OrkestraAna | undefined
+
+const readMain = async ($: EngineInterface, localId: string): Promise<OrkestraAna | undefined> => {
+  if (ownMain?.localId === localId) return ownMain
+  const rec = await readRecord($, localId)
+  if (rec?.role !== 'ana') return undefined
+  ownMain = rec
+
+  return rec
+}
+
+const writeMain = async ($: EngineInterface, rec: OrkestraAna): Promise<void> => {
+  ownMain = rec
+  await writeRecord($, rec.localId, rec)
+}
+
+/** Read, merge, write this main chat's record; undefined when it has none. */
+const patchMain = async (
+  $: EngineInterface,
+  localId: string,
+  patch: Partial<OrkestraAna>,
+): Promise<OrkestraAna | undefined> => {
+  const base = await readMain($, localId)
+  if (base === undefined) return undefined
+  const rec: OrkestraAna = { ...base, ...patch, at: await $.clock.now() }
+  await writeMain($, rec)
+
+  return rec
+}
+
+const readChild = async ($: EngineInterface, childId: string | undefined): Promise<OrkestraAlt | undefined> => {
+  if (childId === undefined || childId === UNKNOWN_CHILD) return undefined
+  const rec = await readRecord($, childId).catch(() => undefined)
+
+  return rec?.role === 'alt' ? rec : undefined
+}
+
+/** Writes a chain's settings whole (Decision 22). */
+export const writeChainSettings = async ($: EngineInterface, mainLocalId: string, rec: OrkestraAyar): Promise<void> => {
+  const home = await homeOf($)
+  if (home === undefined) return
+  lastAyar[mainLocalId] = rec
+  await $.fs.write(zincirAyarFile(home, mainLocalId), JSON.stringify(rec))
+}
+
+/** Read, merge, write a chain's settings (a torn or missing read merges over lastAyar). */
+export const patchChainSettings = async (
+  $: EngineInterface,
+  mainLocalId: string,
+  patch: Partial<OrkestraAyar>,
+): Promise<OrkestraAyar> => {
+  const base = (await readChainSettings($, mainLocalId)) ?? lastAyar[mainLocalId]
+  const rec: OrkestraAyar = { ...base, ...patch, at: await $.clock.now() }
+  await writeChainSettings($, mainLocalId, rec)
+
+  return rec
+}
+
+// This engine's one `get_session self` answer per conversation (O16, O17): the
+// local id and the parent come from the same call. A failed GET is not kept.
+let selfInfo: { sid: string; info: SelfSession } | undefined
+
+const selfOnce = async ($: EngineInterface, sid: string): Promise<SelfSession> => {
+  if (selfInfo?.sid === sid) return selfInfo.info
+  const info = await selfSession($)
+  if (info.id !== undefined) selfInfo = { sid, info }
+
+  return info
+}
+
+/** $.state holds this sid's record, rebuilt from the store first (a reload), so a role patch never hides a running handoff. */
+const ensureConv = async ($: EngineInterface, sid: string): Promise<void> => {
+  const held = await read($, conv)
+  if (held !== null && held.sid === sid) return
+  const restored = await restoreConv($, sid)
+  await update($, conv, now => (now !== null && now.sid === sid ? now : restored))
+}
+
+/** This chat's local id: conv, else `kimlik:<sid>`, else `get_session self` (then kept in both). */
+const selfLocal = async ($: EngineInterface): Promise<string | undefined> => {
+  const sid = await $.session.id()
+  await ensureConv($, sid)
+  const held = await read($, conv)
+  if (held !== null && held.sid === sid && held.localId !== undefined) return held.localId
+  const stored = nonEmpty(await $.store.get(`${KIMLIK_PREFIX}${sid}`).catch(() => undefined))
+  const id = stored ?? (await selfOnce($, sid)).id
+  if (id === undefined) return undefined
+  if (stored === undefined) await $.store.set(`${KIMLIK_PREFIX}${sid}`, id).catch(() => undefined)
+  await patchConv($, sid, { localId: id })
+
+  return id
+}
+
+/**
+ * This chat's role (O10), cached in conv. Its own record names it; else the
+ * parent from `get_session self` makes it `alt` when the parent's live main
+ * record points at this chat (or is starting one), and the child writes its
+ * own record. A failed GET or a torn file: `yok` for this call, not cached.
+ * Reads conv with `read`, never `currentConv` (O16).
+ */
+const roleOf = async ($: EngineInterface): Promise<OrkestraRole> => {
+  const sid = await $.session.id()
+  await ensureConv($, sid)
+  const held = await read($, conv)
+  if (held !== null && held.sid === sid && held.role !== undefined) return held.role
+
+  return (await resolveRole($, sid)) ?? 'yok'
+}
+
+const resolveRole = async ($: EngineInterface, sid: string): Promise<OrkestraRole | undefined> => {
+  const localId = await selfLocal($)
+  if (localId === undefined) return undefined
+  const own = await readRecordState($, localId)
+  if (own.kind === 'torn') return undefined
+  if (own.kind === 'ok') {
+    const rec = own.rec
+    await patchConv(
+      $,
+      sid,
+      rec.role === 'ana' ? { role: 'ana', childN: rec.n } : { role: 'alt', parentId: rec.parent, childN: rec.n },
+    )
+
+    return rec.role
+  }
+  const self = await selfOnce($, sid)
+  if (self.id === undefined) return undefined
+  if (self.parentId === undefined) {
+    await patchConv($, sid, { role: 'yok' })
+
+    return 'yok'
+  }
+  const got = await readRecordState($, self.parentId)
+  if (got.kind === 'torn') return undefined
+  const parent = got.kind === 'ok' && got.rec.role === 'ana' ? got.rec : undefined
+  if (
+    parent === undefined ||
+    parent.ended !== undefined ||
+    !(parent.childId === self.id || parent.childId === UNKNOWN_CHILD || parent.starting === true)
+  ) {
+    await patchConv($, sid, { role: 'yok' })
+
+    return 'yok'
+  }
+  const n = parent.starting === true ? parent.n + 1 : parent.n || 1
+  const mine: OrkestraAlt = {
+    role: 'alt',
+    parent: parent.localId,
+    n,
+    sid,
+    localId,
+    status: 'working',
+    at: await $.clock.now(),
+  }
+  await writeRecord($, localId, mine)
+  const held = await read($, conv)
+  // O11: a child with no own `/devir dene` inherits the chain's test threshold.
+  const inherited =
+    held?.testThreshold === undefined && parent.testThreshold !== undefined ? { testThreshold: parent.testThreshold } : {}
+  await patchConv($, sid, { role: 'alt', parentId: parent.localId, childN: n, ...inherited })
+
+  return 'alt'
+}
+
+/** This chat's chain (Decision 22): a main chat's own local id, a sub-chat's parent; else none. */
+export const chainIdOf = async ($: EngineInterface): Promise<string | undefined> => {
+  const role = await roleOf($)
+  if (role === 'ana') return selfLocal($)
+  if (role !== 'alt') return undefined
+  const sid = await $.session.id()
+  const held = await read($, conv)
+  if (held !== null && held.sid === sid && held.parentId !== undefined) return held.parentId
+  const localId = await selfLocal($)
+  const own = localId === undefined ? undefined : await readRecord($, localId)
+
+  return own?.role === 'alt' ? own.parent : undefined
 }
 
 type ToolNext = (input: ToolCallArgs) => Promise<{

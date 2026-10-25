@@ -664,6 +664,39 @@ const tripMidTurn = async ($: EngineInterface): Promise<string | undefined> => {
   return undefined
 }
 
+
+// ---------------------------------------------------------------------------
+// The Stop guard (S7, probe RESULT M: a mod Stop block keeps the typed turn
+// open across blocks, so the model waits and starts the child in that turn).
+// ---------------------------------------------------------------------------
+
+// Stop blocks in the running main turn (reset at turn.start), and the
+// timeout blocks of one handoff (by its id).
+let handoffBlocks = 0
+let missingBlocks = 0
+let timeoutFor: { id: string; n: number } | undefined
+
+type BackgroundTask = { id: string; type: string; status: string; description: string }
+
+/**
+ * The work the turn waits on (Decision 15): subagents and Workflows running or
+ * pending in `background_tasks`; `$.agent.list()` only when the hook got none.
+ * Background Bash, Monitor and dev servers are never waited on.
+ */
+const runningWork = async ($: EngineInterface, tasks: readonly BackgroundTask[] | undefined): Promise<Running> => {
+  if (tasks !== undefined) {
+    return tasks
+      .filter(
+        task =>
+          (task.type === 'subagent' || task.type === 'workflow') &&
+          (task.status === 'running' || task.status === 'pending'),
+      )
+      .map(task => ({ id: task.id, description: task.description }))
+  }
+
+  return (await activeAgents($)).map(agent => ({ id: agent.id, description: agent.description }))
+}
+
 export const register: Register = on => {
   // (a) The mid-turn channel: a tool result's `context` is read by the model
   // right after that result, inside the running turn.
@@ -700,4 +733,83 @@ export const register: Register = on => {
   on('agent.spawn', async ($, e, next) => ((await isDrainingNow($)) ? { deny: DRAIN_DENY } : next(e))).catch(
     ($, e, next) => (next.called ? next(e) : isDraining ? { deny: DRAIN_DENY } : next(e)),
   )
+
+  // S7: the main loop's turn end. Idle and due: trip here. Running work: wait
+  // in the turn. A typed turn's handoff: start the child before it ends. A
+  // closed gate: once the file is written the handoff is `ready`.
+  on('classic.Stop', async ($, e, next) => {
+    if (e.agent_id !== undefined) return next(e)
+    const settings = await readSettings($)
+    if (!settings.isEnabled) return next(e)
+    let held = await currentConv($)
+    // (a)
+    if (held.phase === 'idle') {
+      const due = await isDue($, held)
+      if (due !== undefined) {
+        const claimed = await claimHandoff(
+          $,
+          held.sid,
+          h => h.phase === 'idle',
+          isPersonTurn ? {} : { notedTurn: runningTurnId },
+        )
+        if (claimed?.file !== undefined) {
+          const hasSkill = await hasHandoffSkill($)
+
+          return {
+            block: isPersonTurn
+              ? inTurnHandoff(due.threshold, claimed.file, hasSkill)
+              : closedTurnHandoff(due.threshold, claimed.file, hasSkill),
+          }
+        }
+        held = await currentConv($)
+      }
+    }
+    // (b)
+    const running = await runningWork($, e.background_tasks)
+    if (running.length > 0) {
+      const now = await $.clock.now()
+      const isTimedOut =
+        held.phase === 'handoff_running' &&
+        held.handoffAt !== undefined &&
+        now - held.handoffAt >= DRAIN_TIMEOUT_MS
+      if (!isTimedOut) return { block: waitText(running) }
+      const id = held.handoffId ?? ''
+      const n = timeoutFor?.id === id ? timeoutFor.n : 0
+      if (n < MAX_TIMEOUT_BLOCKS) {
+        timeoutFor = { id, n: n + 1 }
+
+        return { block: timeoutText(running) }
+      }
+      // Two timeout blocks given: the running work no longer holds the turn.
+    }
+    if (held.phase !== 'handoff_running') return next(e)
+    const file = held.file ?? handoffFile(await $.session.cwd(), held.sid)
+    const isFileFresh = await isFresh($, file, held.handoffAt)
+    // (c)
+    if (isPersonTurn && held.isGateClosed !== true) {
+      if (handoffBlocks >= MAX_HANDOFF_BLOCKS) return next(e)
+      handoffBlocks += 1
+
+      return { block: isFileFresh ? START_NOW : fileMissingText(file, true) }
+    }
+    // (d)
+    if (isFileFresh) {
+      const isReady = await claim(
+        $,
+        held.sid,
+        h => h.phase === 'handoff_running' && h.starting === undefined,
+        { phase: 'ready' },
+      )
+      if (isReady) {
+        $.ui.toast(READY_BAND, { timeoutMs: 15000 })
+        await refreshStatus($).catch(() => undefined)
+      }
+
+      return next(e)
+    }
+    if (missingBlocks >= MAX_MISSING_BLOCKS) return next(e)
+    missingBlocks += 1
+
+    return { block: fileMissingText(file, false) }
+  })
 }

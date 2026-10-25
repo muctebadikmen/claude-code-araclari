@@ -136,9 +136,9 @@ const runningList = (running: Running): string =>
  * long-chat handoff. The bare id is accepted at runtime (the engine's section
  * check wants only a non-empty, unique id).
  */
-export const LONG_CHAT_SECTION_ID = 'otomatik-devir'
+export const LONG_CHAT_SECTION_ID = 'otomatik-devir:long-chat'
 export const longChatNote = (threshold: number): string =>
-  `otomatik-devir bu oturumda açık: devri mod yönetir. Bağlam büyüdü diye kendiliğinden devir yapma, my-skill-handoff çağırma, yeni sohbet ya da devam prompt'u önerme; işe devam et. Bağlam %${threshold}'e ulaşınca mod talimat verir, o talimata uy. Kullanıcı açıkça devir isterse: /devir simdi.`
+  `otomatik-devir bu oturumda açık: devri mod yönetir. Bağlam büyüdü diye kendiliğinden devir yapma, my-skill-handoff çağırma, yeni sohbet ya da devam prompt'u önerme; işe devam et. Bağlam %${threshold}${dative(threshold)} ulaşınca mod talimat verir, o talimata uy. Kullanıcı açıkça devir isterse: /devir simdi.`
 
 /** Stop block while subagents or Workflows run during a handoff (`handoff_running`): wait inside the turn (v1.0.1: only then). */
 export const waitText = (running: Running): string =>
@@ -198,6 +198,34 @@ export const clampLimit = (x: number): number =>
 
 /** The main chat's system-prompt section (O2); the v1 long-chat note keeps its own id. */
 export const ORKESTRA_SECTION_ID = 'otomatik-devir:orkestra'
+
+/** At a relay point with its own context at this fill or more, the main chat ends the chain (O22). */
+export const MAIN_FULL_PERCENT = 80
+
+/** How the person starts a chain (store-probe.md `TRIGGER: command`). */
+export const START_HINT = '/devir-otonom <görev>'
+
+/** The one-line answer of `/devir`, `esik`, `kapat`, `ac` and `simdi` in a normal chat (O20, Decision 22). */
+export const NORMAL_INFO =
+  'Normal sohbet: burada otomatik devir yok, bu sohbet devredilmez ve buradaki ayar hiçbir zinciri değiştirmez. Zincir için ' +
+  START_HINT +
+  ' yaz; eşik ve kapatma o zincirin ana ya da alt sohbetinde ayarlanır.'
+
+/** `/devir dene <n>` in a normal chat: kept in this chat for a chain started here later (Decision 20). */
+export const normalDeneText = (n: number): string =>
+  `Normal sohbet devredilmez. Deneme eşiği %${n} kaydedildi: bu sohbette ${START_HINT} ile başlatılan zincirin alt sohbetleri bunu kullanır.`
+
+/** Appended to the `/devir kapat` reply in a chain (O21). */
+export const KAPAT_CHAIN =
+  'Bu zincir durur: ana sohbet bir sonraki adımda özet yazar, yeni alt sohbet açılmaz; başka sohbetler etkilenmez.'
+
+/** `/devir esik <n>` in a chain (Decision 22). */
+export const chainEsikText = (n: number): string =>
+  `Bu zincirin devir eşiği %${n}: ana sohbet ve alt sohbetleri için geçerli; başka sohbetleri etkilemez.`
+
+/** `/devir ac` in a chain: it writes nothing (Decisions 20, 22). */
+export const AC_CHAIN_OPEN = 'Bu zincir açık; durdurmak için /devir kapat.'
+export const AC_CHAIN_STOPPED = 'Bu zincir durdu ve sürdürülmez; yeni zincir için ' + START_HINT + ' yaz.'
 
 /** The prefix trigger (`orkestra: <görev>`): an undocumented alias of `/devir-otonom`. */
 export const ORKESTRA_RE = /^\s*orkestra:\s*/i
@@ -263,8 +291,14 @@ export const orkestraEndText = (
     sinir: `zincir sınır ${limit ?? DEFAULT_LIMIT} alt sohbete ulaştı`,
     durduruldu: 'zincir kullanıcının isteğiyle durduruldu (/devir otonom dur)',
     durdu: `alt sohbet ${n} yanıt vermiyor (${childId ?? UNKNOWN_CHILD}); zincir durdu`,
+    kapatildi: 'otomatik devir kapatıldı (/devir kapat); zincir durdu',
+    dolu: `ana sohbet dolu (bağlam %${MAIN_FULL_PERCENT} ya da fazlası); zincir burada bitiyor`,
   }
-  const where = file === undefined ? '' : ` Kalan iş için son devir dosyası: ${file}.`
+  const where =
+    (file === undefined ? '' : ` Kalan iş için son devir dosyası: ${file}.`) +
+    (kind === 'dolu'
+      ? ` Kullanıcıya söyle: devam etmek için yeni bir sohbette ${START_HINT} yazsın, görev olarak "${file ?? 'son devir dosyası'} dosyasından devam et".`
+      : '')
   const what =
     report !== undefined && report.trim() !== ''
       ? ` Son alt sohbetin raporu:\n${report}\n`
@@ -388,16 +422,33 @@ type Settings = { threshold: number; isEnabled: boolean }
 const isThreshold = (n: unknown): n is number =>
   typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= 99
 
+/**
+ * This chat's chain settings (Decision 22), from the cached conv role (never
+ * `currentConv`): a main chat's own chain, a sub-chat's parent's. A normal
+ * chat (role `yok` or unresolved) has none: the default threshold, off.
+ */
 const readSettings = async ($: EngineInterface): Promise<Settings> => {
-  const [esik, acik] = await Promise.all([$.store.get('esik'), $.store.get('acik')])
+  const sid = await $.session.id()
+  const held = await read($, conv)
+  const chainId =
+    held === null || held.sid !== sid
+      ? undefined
+      : held.role === 'ana'
+        ? held.localId
+        : held.role === 'alt'
+          ? held.parentId
+          : undefined
+  if (chainId === undefined) return { threshold: DEFAULT_THRESHOLD, isEnabled: false }
+  const ayar = await readChainSettings($, chainId).catch(() => lastAyar[chainId])
+  const esik = ayar?.esik
 
   return {
     threshold: isThreshold(esik) ? esik : DEFAULT_THRESHOLD,
-    isEnabled: acik !== false,
+    isEnabled: ayar?.isClosed !== true,
   }
 }
 
-/** The threshold this chat trips at: its own `/devir dene` value, else the global `esik`. */
+/** The threshold this chat trips at: its own `/devir dene` value, else its chain's `esik`. */
 const thresholdOf = (settings: Settings, held: OtomatikDevirConv | null): number =>
   held?.testThreshold ?? settings.threshold
 
@@ -469,8 +520,14 @@ const orkestraStatusOf = async ($: EngineInterface, held: OtomatikDevirConv): Pr
 }
 
 const refreshStatus = async ($: EngineInterface, percent?: number): Promise<void> => {
-  const settings = await readSettings($)
   const held = await currentConv($)
+  // O20: a normal chat (cached role `yok` or unresolved) shows nothing.
+  if (held.role !== 'ana' && held.role !== 'alt') {
+    $.ui.status(undefined)
+
+    return
+  }
+  const settings = await readSettings($)
   const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
   const orkestra = await orkestraStatusOf($, held)
   $.ui.status(statusText(settings, percent ?? (await contextPercent($)), held, running, orkestra))
@@ -565,7 +622,7 @@ const syncChild = async ($: EngineInterface, held: OtomatikDevirConv): Promise<v
             status: 'working',
             at: 0,
           }
-  if (base === undefined || base.status === 'finished') return
+  if (base === undefined || base.status === 'finished' || base.status === 'cancelled') return
   const isReady = held.phase === 'ready'
   await writeRecord($, held.localId, {
     ...base,
@@ -632,26 +689,51 @@ const restoreHandoff = async ($: EngineInterface, sid: string): Promise<Otomatik
 
 /**
  * Cancels this chat's handoff whose child has not started (v1.0.1): back to
- * `idle` (this chat's `/devir dene` and last typed message kept), `devir:<sid>`
+ * `idle`, only the handoff fields cleared (O21: the role, ids, chain fields,
+ * `/devir dene`, last typed message and noted settings kept), `devir:<sid>`
  * deleted, the drain lifted, the band and status redrawn. `/devir kapat` runs
- * it, and so does any chat that sees the mod off (`isNoticed`: a toast says
- * so). A finished handoff (`done`, `devredildi:<sid>`) is never undone; a
- * handoff file already written stays on disk.
+ * it, and so does any chat that sees its chain closed (`isNoticed`: a toast
+ * says so). A finished handoff (`done`, `devredildi:<sid>`) is never undone; a
+ * handoff file already written stays on disk. A managed sub-chat whose drain
+ * it cancelled records itself `cancelled` (never relayed).
  */
 const cancelHandoff = async ($: EngineInterface, sid: string, isNoticed: boolean): Promise<OtomatikDevirConv> => {
   let now: OtomatikDevirConv = { sid, phase: 'idle' }
+  let wasDrain = false
   await update($, conv, (held): OtomatikDevirConv | null => {
     if (held !== null && held.sid !== sid) return held
     if (held?.phase === 'done') {
       now = held
       return held
     }
-    now = { sid, phase: 'idle', testThreshold: held?.testThreshold, lastTyped: held?.lastTyped }
+    wasDrain = held !== null && isDrainPhase(held.phase)
+    now = {
+      ...held,
+      sid,
+      phase: 'idle',
+      handoffId: undefined,
+      handoffAt: undefined,
+      file: undefined,
+      isGateClosed: undefined,
+      isForced: undefined,
+      starting: undefined,
+      pendingMessage: undefined,
+      instructNext: undefined,
+      instructedTurn: undefined,
+      notedTurn: undefined,
+    }
     return now
   })
   if (now.phase === 'done') return now
   isDraining = false
   await $.store.delete(`${RUN_PREFIX}${sid}`).catch(() => undefined)
+  // O14, O21: the cancelled drain of a managed sub-chat; its main chat ends `kapatildi`.
+  if (wasDrain && now.role === 'alt' && now.localId !== undefined) {
+    const own = await readRecord($, now.localId).catch(() => undefined)
+    if (own?.role === 'alt' && own.status !== 'finished' && own.status !== 'cancelled') {
+      await writeRecord($, own.localId, { ...own, status: 'cancelled', file: undefined, at: await $.clock.now() })
+    }
+  }
   later($, async () => {
     try {
       $.ui.invalidate('ui.render')
@@ -683,7 +765,11 @@ const currentConv = async ($: EngineInterface): Promise<OtomatikDevirConv> => {
   }
   if (now.phase === 'ready' && now.role === 'alt') now = await consumeChild($, now)
   isDraining = isDrainPhase(now.phase)
-  if (isDraining && !(await readSettings($)).isEnabled) return cancelHandoff($, sid, true)
+  if (isDraining) {
+    // O20: only a managed sub-chat drains; a leftover elsewhere goes silently.
+    if ((await roleOf($)) !== 'alt') return cancelHandoff($, sid, false)
+    if (!(await readSettings($)).isEnabled) return cancelHandoff($, sid, true)
+  }
 
   return now
 }
@@ -735,14 +821,19 @@ const claim = async (
 // ---------------------------------------------------------------------------
 
 /**
- * The trip is due: the mod is on, this session never handed off, and either
- * `/devir simdi` forced it or the fill reached this chat's threshold.
+ * The trip is due: this is a managed sub-chat whose parent chain is live and
+ * open, this session never handed off, and either `/devir simdi` forced it or
+ * the fill reached this chat's threshold.
  */
 const isDue = async ($: EngineInterface, held: OtomatikDevirConv): Promise<{ threshold: number } | undefined> => {
+  // O3, O20: only a managed sub-chat hands off by threshold; a normal chat and
+  // the main chat never measure for a trip.
+  if ((await roleOf($)) !== 'alt') return undefined
+  const chainId = await chainIdOf($)
+  const parent = chainId === undefined ? undefined : await readRecord($, chainId).catch(() => undefined)
+  if (parent?.role !== 'ana' || parent.ended !== undefined) return undefined
   const settings = await readSettings($)
   if (!settings.isEnabled) return undefined
-  // O3: the main chat never hands off by threshold.
-  if ((await roleOf($)) === 'ana') return undefined
   if ((await handedOf($, held.sid)) !== undefined) return undefined
   const threshold = thresholdOf(settings, held)
   if (held.isForced === true) return { threshold }
@@ -1223,7 +1314,28 @@ const orkestraTyped = async (
   const held = await read($, conv)
   if (held === null || held.sid !== sid || held.role !== 'ana' || held.localId === undefined) return undefined
   const main = await readMain($, held.localId)
-  if (main === undefined || main.ended !== undefined) return undefined
+  if (main === undefined) return undefined
+  if (main.ended !== undefined) {
+    // O7: a chain that ended while paused gives the next typed message its end text, once.
+    if (held.isPaused !== true) return undefined
+    await patchConv($, sid, { isPaused: undefined })
+    const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+    const limit = await orkestraLimit($, main.localId)
+    noteTyper(e, isPerson)
+    later($, () => refreshStatus($))
+
+    return next(withContext(e, orkestraEndText(main.ended, main.n, child?.report, child?.file, main.childId, limit)))
+  }
+  // O21: this chain closed: it ends here, nothing resumes.
+  if ((await readChainSettings($, main.localId).catch(() => undefined))?.isClosed === true) {
+    const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+    await patchMain($, main.localId, { ended: 'kapatildi' })
+    await patchConv($, sid, { isPaused: undefined })
+    noteTyper(e, isPerson)
+    later($, () => refreshStatus($))
+
+    return next(withContext(e, orkestraEndText('kapatildi', main.n, child?.report, child?.file, main.childId)))
+  }
   const isNote = !CONTINUE_ONLY.test(e.text) && e.text.trim() !== ''
   const pending = isNote
     ? main.pendingMessage === undefined
@@ -1356,6 +1468,8 @@ const isUnaskedSkillHandoff = async ($: EngineInterface, call: Record<string, un
   try {
     if (call.tool !== 'Skill' || typeof call.skill !== 'string' || !call.skill.endsWith(SKILL)) return false
     if (typeof call.args === 'string' && call.args.trimStart().startsWith('auto ')) return false
+    // O20: only a managed sub-chat's own handoff skill call is refused.
+    if ((await roleOf($)) !== 'alt') return false
     if (!(await readSettings($)).isEnabled) return false
     const held = await currentConv($)
 
@@ -1384,6 +1498,10 @@ const orkestraStart = async (
   const localId = await selfLocal($)
   const main = localId === undefined ? undefined : await readMain($, localId)
   if (localId === undefined || main === undefined) return undefined
+  // O21: no new sub-chat once this chain is closed (`ended` is written by O5/O6/O7).
+  if (main.ended === undefined && (await readChainSettings($, localId).catch(() => undefined))?.isClosed === true) {
+    return { deny: ORKESTRA_END_DENY }
+  }
   const limit = await orkestraLimit($, localId)
   if (main.ended !== undefined) return { deny: main.ended === 'sinir' ? orkestraCapDeny(limit) : ORKESTRA_END_DENY }
   if (!main.isHeld) return { deny: ORKESTRA_PAUSED_DENY }
@@ -1392,12 +1510,17 @@ const orkestraStart = async (
   const child = main.n >= 1 ? await readChild($, main.childId) : undefined
   let file: string | undefined
   if (main.n >= 1) {
+    // O21: a cancelled child is never relayed.
+    if (child?.status === 'cancelled') return { deny: ORKESTRA_END_DENY }
     if (child?.status !== 'ready') return { deny: orkestraBusyDeny(main.n) }
     file = child.file
     const text = await readFresh($, file, undefined)
     if ((text !== undefined && NONE_LEFT_RE.test(text)) || main.isStopRequested === true) {
       return { deny: ORKESTRA_END_DENY }
     }
+    // O22: a full main chat starts no next child (O5/O6 write the end).
+    const percent = await contextPercent($)
+    if (percent !== undefined && percent >= MAIN_FULL_PERCENT) return { deny: ORKESTRA_END_DENY }
   }
   if (main.n >= limit) return { deny: orkestraCapDeny(limit) }
   const isClaimed = await claim($, sid, h => h.starting === undefined, { starting: 'orkestra' })
@@ -1487,10 +1610,13 @@ const watchModelStart = async (
   next: ToolNext,
 ) => {
   // O4: the main chat's starts, before the v1 handed-off check.
-  if ((await roleOf($)) === 'ana') {
+  const role = await roleOf($)
+  if (role === 'ana') {
     const started = await orkestraStart($, call, next)
     if (started !== undefined) return started
   }
+  // O20: a normal chat's start passes untouched (role `alt` never gets here, O13).
+  if (role !== 'ana' && role !== 'alt') return next(call as unknown as ToolCallArgs)
   const sid = await $.session.id()
   const handed = await handedOf($, sid)
   if (handed !== undefined) {
@@ -1618,6 +1744,11 @@ let timeoutFor: { id: string; n: number } | undefined
 
 type BackgroundTask = { id: string; type: string; status: string; description: string }
 
+// Decision 21a: the background tasks of this turn's last main-loop Stop, so
+// turn.complete's `ready` check sees Workflows ($.agent.list() does not).
+// Reset at session.start (O18).
+let lastStopTasks: { turnId: string | undefined; tasks: readonly BackgroundTask[] | undefined } | undefined
+
 /**
  * The work the turn waits on (Decision 15): subagents and Workflows running or
  * pending in `background_tasks`; `$.agent.list()` only when the hook got none.
@@ -1674,10 +1805,20 @@ const orkestraDecision = async (
   const main = localId === undefined ? undefined : await readMain($, localId)
   if (localId === undefined || main === undefined || main.ended !== undefined) return undefined
   const done = (decision: OrkestraDecision) => ({ decision, main })
-  // Until T2b the global switch: off, the main chat is not held.
-  if (!(await readSettings($)).isEnabled || !main.isHeld) return done({ kind: 'pass' })
-  const now = await $.clock.now()
   const n = main.n
+  // O21: this chain closed (`/devir kapat`) or its child cancelled: the chain ends first, paused too.
+  const isClosed = (await readChainSettings($, localId).catch(() => undefined))?.isClosed === true
+  const last = n >= 1 ? await readChild($, main.childId) : undefined
+  if (isClosed || last?.status === 'cancelled') {
+    return done({
+      kind: 'end',
+      n,
+      end: 'kapatildi',
+      text: orkestraEndText('kapatildi', n, last?.report, last?.file, main.childId),
+    })
+  }
+  if (!main.isHeld) return done({ kind: 'pass' })
+  const now = await $.clock.now()
   const isStarting = isLiveStarting(main, now)
   if (n === 0) {
     return done(
@@ -1687,7 +1828,7 @@ const orkestraDecision = async (
     )
   }
   if (isStarting) return done({ kind: 'wait', n, text: orkestraWaitText(n) })
-  const child = await readChild($, main.childId)
+  const child = last
   const limit = await orkestraLimit($, localId)
   const end = (kind: EndKind) =>
     done({ kind: 'end', n, end: kind, text: orkestraEndText(kind, n, child?.report, child?.file, main.childId, limit) })
@@ -1697,6 +1838,9 @@ const orkestraDecision = async (
     if (text !== undefined && NONE_LEFT_RE.test(text)) return end('bitti')
     if (main.isStopRequested === true) return end('durduruldu')
     if (n >= limit) return end('sinir')
+    // O22: the main chat's own context is full: the chain ends here (never mid-child).
+    const percent = await contextPercent($)
+    if (percent !== undefined && percent >= MAIN_FULL_PERCENT) return end('dolu')
 
     return done({ kind: 'relay', n, text: orkestraRelayText(n + 1, childTitle(main.task, n + 1)) })
   }
@@ -1908,6 +2052,7 @@ export const register: Register = on => {
     missingBlocks = 0
     // O18: no module state leaks from another session (or an older load).
     timeoutFor = undefined
+    lastStopTasks = undefined
     orkestraStartBlocks = undefined
     orkestraNoted = undefined
     lastAyar = {}
@@ -1946,7 +2091,8 @@ export const register: Register = on => {
           ],
         }
       }
-      if (!settings.isEnabled || held.phase !== 'idle') return r
+      // O2, O20: the long-chat note only in a managed sub-chat; a normal chat gets no section.
+      if (held.role !== 'alt' || !settings.isEnabled || held.phase !== 'idle') return r
 
       return {
         ...r,
@@ -2034,10 +2180,11 @@ export const register: Register = on => {
     if (!isPerson || e.command !== undefined) return next(e)
     const before = await currentConv($)
     const sid = before.sid
+    // O12: a managed sub-chat hands off by its file only; no S8 there. O20: nor in a normal chat.
+    const role = await roleOf($)
+    if (role === 'alt' || role === 'yok') return next(e)
     const settings = await readSettings($)
     if (!settings.isEnabled || (await handedOf($, sid)) !== undefined) return next(e)
-    // O12: a managed sub-chat hands off by its file only; no S8 there.
-    if ((await roleOf($)) === 'alt') return next(e)
     let held: OtomatikDevirConv | undefined
     if (before.phase === 'ready' || (before.phase === 'handoff_running' && before.isGateClosed === true)) {
       const isClaimed = await claim($, sid, h => h.phase === before.phase && h.starting === undefined, {
@@ -2112,7 +2259,12 @@ export const register: Register = on => {
     const childId = held.phase === 'idle' && (await roleOf($)) === 'alt' ? (await read($, conv))?.localId : undefined
     if (childId !== undefined) {
       const own = await readRecord($, childId)
-      if (own?.role === 'alt' && own.status !== 'finished' && (await runningWork($, undefined)).length === 0) {
+      if (
+        own?.role === 'alt' &&
+        own.status !== 'finished' &&
+        own.status !== 'cancelled' &&
+        (await runningWork($, undefined)).length === 0
+      ) {
         await writeRecord($, own.localId, {
           ...own,
           status: 'finished',
@@ -2125,10 +2277,12 @@ export const register: Register = on => {
     if (held.phase === 'handoff_running') {
       if (e.isAborted) $.ui.log('otomatik-devir: tur durduruldu; devir sürüyor', { to: 'debug' })
       await claim($, held.sid, h => h.phase === 'handoff_running', { isGateClosed: true })
+      // Decision 21a: this turn's last Stop saw its Workflows too.
+      const tasks = lastStopTasks?.turnId === e.turnId ? lastStopTasks.tasks : undefined
       if (
         held.starting === undefined &&
         (await isFresh($, held.file, held.handoffAt)) &&
-        (await runningWork($, undefined)).length === 0
+        (await runningWork($, tasks)).length === 0
       ) {
         const isReady = await claim(
           $,
@@ -2195,6 +2349,7 @@ export const register: Register = on => {
   // before it ends. A closed gate: once the file is written the handoff is `ready`.
   on('classic.Stop', async ($, e, next) => {
     if (e.agent_id !== undefined) return next(e)
+    lastStopTasks = { turnId: runningTurnId, tasks: e.background_tasks }
     // O5: the main chat's only Stop hold, before the mod-off return and (a).
     const orkestra = await orkestraDecision($, { isCycle: true })
     if (orkestra !== undefined) {
@@ -2214,6 +2369,8 @@ export const register: Register = on => {
         case 'end':
           await patchMain($, main.localId, { ended: decision.end })
           later($, () => refreshStatus($))
+          // A paused main chat (O21): no block; its next typed message gets the end text (O7).
+          if (!main.isHeld) return next(e)
 
           return { block: decision.text }
         case 'stalled':
@@ -2226,6 +2383,8 @@ export const register: Register = on => {
           return { block: decision.text }
       }
     }
+    // O20: a normal chat's turn end passes; no (a)-(d), no wait.
+    if ((await roleOf($)) === 'yok') return next(e)
     const settings = await readSettings($)
     if (!settings.isEnabled) return next(e)
     let held = await currentConv($)
@@ -2303,11 +2462,15 @@ export const register: Register = on => {
 
   on('command.run', { command: 'devir' }, async ($, e) => {
     const [verb = '', value, extra] = e.args.trim().split(/\s+/)
-    const settings = await readSettings($)
+    const role = await roleOf($)
     const held = await currentConv($)
+    const settings = await readSettings($)
+    // O20, Decision 22: a normal chat only answers; nothing is written (`dene` keeps this chat's own value).
+    const isNormal = role !== 'ana' && role !== 'alt'
 
     switch (verb.toLowerCase()) {
       case '': {
+        if (isNormal) return { text: NORMAL_INFO }
         const percent = await contextPercent($)
         const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
 
@@ -2316,12 +2479,16 @@ export const register: Register = on => {
         return { text: `${statusText(settings, percent, held, running, orkestra)} · aşama: ${held.phase}` }
       }
       case 'esik': {
+        if (isNormal) return { text: NORMAL_INFO }
         const n = Number(value)
         if (!isThreshold(n)) return { text: 'Kullanım: /devir esik <1-99>' }
-        await $.store.set('esik', n)
+        // Decision 22: this chain's threshold only.
+        const chainId = await chainIdOf($)
+        if (chainId === undefined) return { text: NORMAL_INFO }
+        await patchChainSettings($, chainId, { esik: n })
         await refreshStatus($)
 
-        return { text: `Devir eşiği %${n} olarak ayarlandı.` }
+        return { text: chainEsikText(n) }
       }
       case 'dene': {
         // Decision 13: a threshold for THIS chat only ($.state), for live tests.
@@ -2336,6 +2503,7 @@ export const register: Register = on => {
         const n = Number(value)
         if (!isThreshold(n)) return { text: 'Kullanım: /devir dene <1-99> (boş: kaldır)' }
         await patchConv($, held.sid, { testThreshold: n })
+        if (isNormal) return { text: normalDeneText(n) }
         // Decision 11: in the main chat the chain's later children inherit it.
         const main = isMain ? await patchMain($, held.localId as string, { testThreshold: n }) : undefined
         await refreshStatus($)
@@ -2346,8 +2514,9 @@ export const register: Register = on => {
         return { text: `Bu sohbetin deneme eşiği %${n} (yalnızca bu sohbet).` }
       }
       case 'simdi': {
-        // O3: the main chat never hands off.
-        if ((await roleOf($)) === 'ana') return { text: 'Ana sohbet devredilmez (orkestra modu).' }
+        // O3: the main chat never hands off; O20: nor does a normal chat.
+        if (role === 'ana') return { text: 'Ana sohbet devredilmez (orkestra modu).' }
+        if (isNormal) return { text: NORMAL_INFO }
         const handed = await handedOf($, held.sid)
         if (handed !== undefined || held.phase === 'done') {
           return {
@@ -2355,13 +2524,18 @@ export const register: Register = on => {
           }
         }
         if (isDrainPhase(held.phase)) return { text: 'Devir zaten çalışıyor.' }
-        if (!settings.isEnabled) return { text: 'Otomatik devir kapalı. Açmak için: /devir ac' }
+        // Decision 22: a closed chain is not reopened.
+        if (!settings.isEnabled) return { text: AC_CHAIN_STOPPED }
         await patchConv($, held.sid, { isForced: true })
 
         return { text: 'Devir istendi: çalışan turda ya da bir sonraki mesajınla başlayacak.' }
       }
       case 'kapat': {
-        await $.store.set('acik', false)
+        if (isNormal) return { text: NORMAL_INFO }
+        // O21: this chain's emergency stop; no other chain and no global key changes.
+        const chainId = await chainIdOf($)
+        if (chainId === undefined) return { text: NORMAL_INFO }
+        await patchChainSettings($, chainId, { isClosed: true })
         // v1.0.1: this chat's running or ready handoff is cancelled (a pending
         // `/devir simdi` too); a finished one stays.
         const wasHandoff = isDrainPhase(held.phase)
@@ -2369,16 +2543,24 @@ export const register: Register = on => {
         await refreshStatus($)
 
         return {
-          text: wasHandoff
-            ? `Otomatik devir kapatıldı; bu sohbetin ${held.phase === 'ready' ? 'hazır' : 'süren'} devri iptal edildi. Alt ajan ve Workflow yeniden başlatılabilir; yazılmış devir dosyası yerinde kalır.`
-            : 'Otomatik devir kapatıldı.',
+          text: `${
+            wasHandoff
+              ? `Otomatik devir kapatıldı; bu sohbetin ${held.phase === 'ready' ? 'hazır' : 'süren'} devri iptal edildi. Alt ajan ve Workflow yeniden başlatılabilir; yazılmış devir dosyası yerinde kalır.`
+              : 'Otomatik devir kapatıldı.'
+          } ${KAPAT_CHAIN}`,
         }
       }
-      case 'ac':
-        await $.store.set('acik', true)
-        await refreshStatus($)
+      case 'ac': {
+        if (isNormal) return { text: NORMAL_INFO }
+        // Decisions 20, 22: writes nothing; a closed or ended chain is not resumed.
+        const chainId = await chainIdOf($)
+        if (chainId === undefined) return { text: NORMAL_INFO }
+        const isClosed = (await readChainSettings($, chainId).catch(() => undefined))?.isClosed === true
+        const main = isClosed ? undefined : await readRecord($, chainId).catch(() => undefined)
+        const isEnded = main?.role === 'ana' && main.ended !== undefined
 
-        return { text: 'Otomatik devir açıldı.' }
+        return { text: isClosed || isEnded ? AC_CHAIN_STOPPED : AC_CHAIN_OPEN }
+      }
       case 'otonom':
         return { text: await otonomVerb($, held, (value ?? '').toLowerCase(), extra) }
       case 'sor':

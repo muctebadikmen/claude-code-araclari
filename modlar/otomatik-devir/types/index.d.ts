@@ -10,8 +10,8 @@ export type OtomatikDevirPhase =
 /** This chat's part in an orchestration: the main chat, a child, or none. */
 export type OrkestraRole = 'ana' | 'alt' | 'yok'
 
-/** Why a chain ended: finished, hit the limit, stopped by the person, or stalled. */
-export type OrkestraEnd = 'bitti' | 'sinir' | 'durduruldu' | 'durdu'
+/** Why a chain ended: finished, hit the limit, stopped by the person, stalled, closed by `/devir kapat`, or the main chat's own context full. */
+export type OrkestraEnd = 'bitti' | 'sinir' | 'durduruldu' | 'durdu' | 'kapatildi' | 'dolu'
 
 /** The main chat's orchestration record, keyed by its local id. */
 export type OrkestraAna = {
@@ -65,8 +65,8 @@ export type OrkestraAlt = {
   sid: string
   /** The child's local session id; the record's key. */
   localId: string
-  /** Where the child stands: working, handoff file ready, or the whole task finished. */
-  status: 'working' | 'ready' | 'finished'
+  /** Where the child stands: working, handoff file ready, the whole task finished, or its handoff cancelled by `/devir kapat` (never relayed). */
+  status: 'working' | 'ready' | 'finished' | 'cancelled'
   /** The handoff file the child wrote, once ready. */
   file?: string
   /** The child's final report, once finished. */

@@ -1285,22 +1285,30 @@ const orkestraSubmit = async (
   if (task === '') return isCommand ? { drop: EMPTY_DROP } : next(withContext(e, EMPTY_CONTEXT))
   if (localId === undefined) return isCommand ? { drop: NO_ID_DROP } : next(withContext(e, NO_ID_CONTEXT))
   const now = await $.clock.now()
-  await writeChainSettings($, localId, { at: now }) // D22: new chain settings
   const first = childTitle(task, 1)
-  const held = await read($, conv)
-  await writeMain($, {
-    role: 'ana',
-    sid,
-    localId,
-    task,
-    title: first.slice(0, -' · 1'.length),
-    n: 0,
-    isHeld: true,
-    testThreshold: held !== null && held.sid === sid ? held.testThreshold : undefined,
-    startedAt: now,
-    at: now,
-  })
-  await patchConv($, sid, { role: 'ana', childN: 0, isPaused: undefined, stalledN: undefined, starting: undefined })
+  try {
+    await writeChainSettings($, localId, { at: now }) // D22: new chain settings
+    const held = await read($, conv)
+    await writeMain($, {
+      role: 'ana',
+      sid,
+      localId,
+      task,
+      title: first.slice(0, -' · 1'.length),
+      n: 0,
+      isHeld: true,
+      testThreshold: held !== null && held.sid === sid ? held.testThreshold : undefined,
+      startedAt: now,
+      at: now,
+    })
+    await patchConv($, sid, { role: 'ana', childN: 0, isPaused: undefined, stalledN: undefined, starting: undefined })
+  } catch (error) {
+    // Fail closed: no main record, so no body may start child 1.
+    $.ui.log(`otomatik-devir: zincir kaydı yazılamadı: ${String(error)}`, { to: 'debug' })
+    ownMain = undefined
+
+    return isCommand ? { drop: NO_ID_DROP } : next(withContext(e, NO_ID_CONTEXT))
+  }
   orkestraStartBlocks = undefined
   orkestraNoted = undefined
   const note = orkestraStartNote(first)
@@ -2128,7 +2136,8 @@ export const register: Register = on => {
           h => h.phase === 'handoff_running' && h.starting === undefined,
           { phase: 'ready' },
         )
-        if (isReady) $.ui.toast(READY_BAND, { timeoutMs: 15000 })
+        // O12: a managed sub-chat shows no ready toast (its status line names the child).
+        if (isReady && held.role !== 'alt') $.ui.toast(READY_BAND, { timeoutMs: 15000 })
       }
     }
     await refreshStatus($).catch(() => undefined)
@@ -2279,7 +2288,8 @@ export const register: Register = on => {
         { phase: 'ready' },
       )
       if (isReady) {
-        $.ui.toast(READY_BAND, { timeoutMs: 15000 })
+        // O12: a managed sub-chat shows no ready toast.
+        if (held.role !== 'alt') $.ui.toast(READY_BAND, { timeoutMs: 15000 })
         await refreshStatus($).catch(() => undefined)
       }
 

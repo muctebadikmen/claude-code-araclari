@@ -500,6 +500,53 @@ const syncStore = async ($: EngineInterface, sid: string): Promise<void> => {
   } else {
     await $.store.delete(key).catch(() => undefined)
   }
+  // O14: a managed sub-chat's record follows its phase.
+  if (held.role === 'alt') await syncChild($, held)
+}
+
+/**
+ * O14: a managed sub-chat's own record, `working` (idle, handoff_running) or
+ * `ready` with its file. A `finished` record stays; `done` (consumed) leaves it.
+ */
+const syncChild = async ($: EngineInterface, held: OtomatikDevirConv): Promise<void> => {
+  if (held.localId === undefined || held.phase === 'done') return
+  const own = await readRecord($, held.localId)
+  const base: OrkestraAlt | undefined =
+    own?.role === 'alt'
+      ? own
+      : held.parentId === undefined
+        ? undefined
+        : {
+            role: 'alt',
+            parent: held.parentId,
+            n: held.childN ?? 1,
+            sid: held.sid,
+            localId: held.localId,
+            status: 'working',
+            at: 0,
+          }
+  if (base === undefined || base.status === 'finished') return
+  const isReady = held.phase === 'ready'
+  await writeRecord($, held.localId, {
+    ...base,
+    status: isReady ? 'ready' : 'working',
+    file: isReady ? held.file : undefined,
+    at: await $.clock.now(),
+  })
+}
+
+/**
+ * O15: a `ready` sub-chat whose parent moved on (a later child, or the chain
+ * ended) is consumed: `done`, so its drain lifts.
+ */
+const consumeChild = async ($: EngineInterface, held: OtomatikDevirConv): Promise<OtomatikDevirConv> => {
+  if (held.parentId === undefined) return held
+  const parent = await readRecord($, held.parentId).catch(() => undefined)
+  if (parent?.role !== 'ana' || !(parent.n > (held.childN ?? 0) || parent.ended !== undefined)) return held
+  await setPhase($, held.sid, 'done')
+  const now = await read($, conv)
+
+  return now !== null && now.sid === held.sid ? now : held
 }
 
 /** The record of this sid, rebuilt from the store when $.state has none (a reload). */
@@ -594,6 +641,7 @@ const currentConv = async ($: EngineInterface): Promise<OtomatikDevirConv> => {
     const restored = now
     await update($, conv, () => restored)
   }
+  if (now.phase === 'ready' && now.role === 'alt') now = await consumeChild($, now)
   isDraining = isDrainPhase(now.phase)
   if (isDraining && !(await readSettings($)).isEnabled) return cancelHandoff($, sid, true)
 
@@ -1747,7 +1795,16 @@ export const register: Register = on => {
     runningTurnId = undefined
     handoffBlocks = 0
     missingBlocks = 0
-    await currentConv($)
+    // O18: no module state leaks from another session (or an older load).
+    timeoutFor = undefined
+    orkestraStartBlocks = undefined
+    orkestraNoted = undefined
+    lastAyar = {}
+    ownMain = undefined
+    selfInfo = undefined
+    const held = await currentConv($)
+    // O4's claim: a start a reload cut off never cleared it itself.
+    if (held.role === 'ana' && held.starting !== undefined) await patchConv($, held.sid, { starting: undefined })
     await refreshStatus($)
     // Also on a reload of a changed module, so the one-time cleanup runs there too.
     later($, () => cleanupOnce($))
@@ -1897,6 +1954,14 @@ export const register: Register = on => {
           isGateClosed: false,
         })
       }
+      // O7: a turn the person typed holds the main chat (a machine turn never does).
+      if (isPersonTurn && held.role === 'ana' && held.localId !== undefined) {
+        const main = await readMain($, held.localId)
+        if (main !== undefined && main.ended === undefined) {
+          if (!main.isHeld) await patchMain($, main.localId, { isHeld: true })
+          await patchConv($, held.sid, { isPaused: undefined })
+        }
+      }
     }
 
     return next(e)
@@ -1911,6 +1976,28 @@ export const register: Register = on => {
     isPersonTurn = false
     runningTurnId = undefined
     const held = await currentConv($)
+    // O7: the main turn closed (an Esc too): the chain pauses until a typed message.
+    if (held.role === 'ana' && held.localId !== undefined) {
+      const main = await readMain($, held.localId)
+      if (main !== undefined && main.ended === undefined) {
+        await patchMain($, main.localId, { isHeld: false })
+        await patchConv($, held.sid, { isPaused: true })
+      }
+    }
+    // O14: a managed sub-chat whose turn ends idle with nothing running is finished.
+    const childId = held.phase === 'idle' && (await roleOf($)) === 'alt' ? (await read($, conv))?.localId : undefined
+    if (childId !== undefined) {
+      const own = await readRecord($, childId)
+      if (own?.role === 'alt' && own.status !== 'finished' && (await runningWork($, undefined)).length === 0) {
+        await writeRecord($, own.localId, {
+          ...own,
+          status: 'finished',
+          report: e.answer.slice(0, 3000),
+          isAborted: e.isAborted || undefined,
+          at: await $.clock.now(),
+        })
+      }
+    }
     if (held.phase === 'handoff_running') {
       if (e.isAborted) $.ui.log('otomatik-devir: tur durduruldu; devir sürüyor', { to: 'debug' })
       await claim($, held.sid, h => h.phase === 'handoff_running', { isGateClosed: true })

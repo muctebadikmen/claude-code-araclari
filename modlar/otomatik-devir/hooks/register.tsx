@@ -65,6 +65,78 @@ const MAX_MISSING_BLOCKS = 2
 export const handoffFile = (cwd: string, sid: string): string =>
   `${cwd.replace(/\/+$/, '')}/.workflow/handoff/${sid}.md`
 
+// ---------------------------------------------------------------------------
+// Texts the model reads (Contract)
+// ---------------------------------------------------------------------------
+
+/** How the handoff file gets written: the skill's inline auto mode, or the built-in steps. */
+const writeStep = (file: string, hasSkill: boolean): string =>
+  hasSkill
+    ? `Skill aracıyla /${SKILL} becerisini \`auto ${file}\` argümanıyla çalıştır (alt ajan yok, soru yok); devir dosyasını o yazar.`
+    : `Devir notunu ${file} dosyasına yaz (klasör yoksa oluştur): hedef, yapılanlar, kalanlar, alınan kararlar ve dikkat edilecekler; durdurulan işler varsa "Yeniden çalıştır:" altında. En sona \`## Devam prompt'u\` başlığını koy ve altına yeni sohbetin ilk mesajı olacak devam prompt'unu düz metin olarak yaz.`
+
+const NO_NEW_WORK =
+  "Yeni alt ajan, Workflow, alt ajana mesaj ya da yeni bir iş BAŞLATMA (mod bunları reddeder); çalışan alt ajanların ve Workflow'ların sonuçlarını geldikçe işle."
+
+const START_CALL = `${START_SESSION} aracını bir kez çağır: initiation "user_asked", context "fresh", background = bu sohbetin neden devredildiğini anlatan en az 80 karakter; prompt'u mod devir dosyasından doldurur. cwd, model, effort ve permission_mode verme. Kullanıcı otomatik devri açtı; bu çağrı onun isteğidir. Çağrı reddedilirse yeniden deneme, own_initiative ya da proposal_id ile kart açma: ne yapacağını mod söyler. Başarılı olunca bu sohbete yalnızca yeni sohbetin açıldığını söyleyen tek bir satır yaz.`
+
+/**
+ * (a) The threshold tripped inside a turn the person typed: finish, start
+ * nothing new, write the file, then start the nested child before this turn ends.
+ */
+export const inTurnHandoff = (threshold: number, file: string, hasSkill = true): string =>
+  `Bağlam %${threshold}${dative(threshold)} ulaştı (bağlam sınırı): otomatik devir bu turda yapılacak. Elindeki adımı güvenli bir noktada tamamla (yarım dosya bırakma). ${NO_NEW_WORK} Çalışan iş varken turu bitirmeye çalışırsan mod seni bekletir. Her şey bitince: ${writeStep(file, hasSkill)} Dosya yazılınca turu bitirmeden ${START_CALL}`
+
+/**
+ * (b) The threshold tripped in a turn no person typed (a notification, an
+ * auto-resume): the app refuses start_session there, so the file is written
+ * now and the person's next typed message opens the chat.
+ */
+export const closedTurnHandoff = (threshold: number, file: string, hasSkill = true): string =>
+  `Bağlam %${threshold}${dative(threshold)} ulaştı (bağlam sınırı) ve bu tur kullanıcının yazdığı bir tur değil: yeni sohbet bu turda açılamaz. Elindeki adımı güvenli bir noktada tamamla. ${NO_NEW_WORK} Her şey bitince: ${writeStep(file, hasSkill)} ${START_SESSION} ve ${HAND_OFF} çağırma, kart açma: yeni sohbet kullanıcının bir sonraki mesajıyla açılır. Dosyayı yazınca turu bitir.`
+
+/** Context on the person's typed message while a handoff waits for it (S8). */
+export const nextMessageNote = (file: string, isFileReady: boolean, hasSkill = true): string =>
+  `otomatik-devir: bağlam eşiği geçildi; devir bu mesajla, bu turda yapılacak. Kullanıcının bu mesajındaki isteği bu sohbette YAPMA: yeni sohbetin ilk işi o olacak (mod onu devam prompt'unun altına ekler). ` +
+  (isFileReady
+    ? `Devir dosyası hazır (${file}); yeniden yazma.`
+    : `${NO_NEW_WORK} Her şey bitince: ${writeStep(file, hasSkill)}`) +
+  ` Sonra turu bitirmeden ${START_CALL}`
+
+type Running = { id: string; description: string }[]
+
+const runningList = (running: Running): string =>
+  running.map(work => `${work.id} (${work.description})`).join(', ')
+
+/** Stop block while subagents or Workflows run: wait inside the turn (Decision 3). */
+export const waitText = (running: Running): string =>
+  `otomatik-devir: turu henüz bitirme; çalışan işler var: ${runningList(running)}. Sonuçlarını bu turun içinde bekle: Bash aracıyla \`perl -e 'select(undef,undef,undef,120)'\` çalıştır (120 saniye; tek bir bekleme en çok 5 dakika olsun), gelen sonuçları işle ve hiçbiri çalışmıyorsa turu yeniden bitirmeyi dene. Yeni alt ajan ya da Workflow başlatma.`
+
+/** Stop block once the drain ran 30 minutes (Decision 4). */
+export const timeoutText = (running: Running): string =>
+  `otomatik-devir: çalışan işler 30 dakikadır bitmedi: ${runningList(running)}. Her birini TaskStop aracıyla durdur ve devir dosyasında "Yeniden çalıştır:" altında listele (kimlik, açıklama, neyin yeniden çalıştırılacağı). Sonra devri tamamla.`
+
+/** Stop block when the handoff file is missing, empty or older than this handoff. */
+export const fileMissingText = (file: string, isOpenTurn: boolean): string =>
+  `otomatik-devir: devir dosyası yok ya da bu devirden eski: ${file}. Turu bitirmeden önce dosyayı yaz (/${SKILL} \`auto ${file}\`, ya da hedef/yapılanlar/kalanlar/kararlar/dikkat ve en sonda \`## Devam prompt'u\`). ` +
+  (isOpenTurn
+    ? `Sonra turu bitirmeden ${START_SESSION} aracını initiation "user_asked" ve context "fresh" ile bir kez çağır.`
+    : `${START_SESSION} çağırma: yeni sohbet kullanıcının bir sonraki mesajıyla açılır. Dosyayı yazınca turu bitir.`)
+
+/** Stop block in an open typed turn once the file is written. */
+export const START_NOW = `otomatik-devir: devir dosyası hazır. Turu bitirme: şimdi ${START_CALL}`
+
+export const DRAIN_DENY =
+  'otomatik-devir: devir sürüyor; yeni alt ajan, Workflow ya da alt ajana mesaj başlatılamaz. Çalışan işlerin sonuçlarını işle ve devri tamamla.'
+
+export const READY_BAND = 'Devir hazır: bir sonraki mesajınla yeni sohbet açılacak.'
+
+const MACHINE_TURN_DENY = `otomatik-devir: bu tur kullanıcının yazdığı bir tur değil; yeni sohbet bu turda açılamaz. Yeniden deneme, kart açma: kullanıcının bir sonraki mesajı yeni sohbeti açacak. Devir dosyasını yazdıysan turu bitir.`
+const CARD_DENY = `otomatik-devir: devir için kart açma (own_initiative, proposal_id); ${START_SESSION} aracını initiation "user_asked" ile çağır.`
+const HAND_OFF_DENY = `otomatik-devir: devir için ${HAND_OFF} kullanma; devir dosyasını yaz ve ${START_SESSION} aracını initiation "user_asked" ile çağır.`
+const REMOVED_VERB = "v1.0'da kaldırıldı; tek mod otomatik. Kapatmak için: /devir kapat"
+const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac]'
+
 type SelfSettings = { effort?: string; model?: string; permissionMode?: string }
 type Settings = { threshold: number; isEnabled: boolean }
 

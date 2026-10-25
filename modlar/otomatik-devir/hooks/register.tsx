@@ -1,12 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type {
-  AgentInfo,
-  EngineInterface,
-  Register,
-  RenderSurface,
-  Timer,
-  ToolCallArgs,
-} from 'claude-code'
+import type { AgentInfo, EngineInterface, Register, ToolCallArgs } from 'claude-code'
 
 import type { OtomatikDevirConv, OtomatikDevirPhase } from '../types'
 
@@ -15,16 +8,23 @@ import type { OtomatikDevirConv, OtomatikDevirPhase } from '../types'
 // ---------------------------------------------------------------------------
 
 const conv = atom({ plugin: 'otomatik-devir', key: 'conv' } as const, null)
+
 const SKILL = 'my-skill-handoff'
 const DEFAULT_THRESHOLD = 60
 
-// Claude desktop's session tools: the continuation runs in a new sibling chat.
+// Claude desktop's session tools: the continuation runs in a new chat nested
+// under this one (Decision 9: no detach).
 const START_SESSION = 'mcp__ccd_session__start_session'
+const HAND_OFF = 'mcp__ccd_session__hand_off_to_session'
 const TITLE_LIMIT = 59
 const CONTINUE_SUFFIX = ' (devam)'
 const CONTINUE_BACKGROUND =
   "Önceki sohbet bağlam eşiğine ulaştı; iş otomatik devirle bu yeni sohbete aktarıldı. Bu prompt, kaldığı yerden sürdürülecek iştir: önce onu oku, sonra devam et."
-const ACTIVE_AGENT: ReadonlySet<AgentInfo['status']> = new Set(['pending', 'running', 'waiting'])
+
+// Subagents in these states still owe the main loop a result (Decision 15:
+// `waiting` never ends by itself, so it is not waited on).
+const ACTIVE_AGENT: ReadonlySet<AgentInfo['status']> = new Set(['pending', 'running'])
+
 /**
  * Turkish dative suffix for a whole number 1-99 as it is read aloud ("yüzde
  * altmış'a", "yüzde yetmiş'e", "yüzde elli'ye"): vowel harmony and the
@@ -37,37 +37,52 @@ const dative = (n: number): string => {
 
   return unit !== 0 ? (units[unit] ?? "'a") : (tens[Math.floor(n / 10) % 10] ?? "'a")
 }
-/** The start_session step: in this turn, once, with the user's standing request named. */
-const startStep = (prompt: string): string =>
-  ` Devam prompt'u hazır olunca, turu bitirmeden, bu turun içinde ${START_SESSION} aracını bir kez çağır: initiation "user_asked", context "fresh", prompt = ${prompt}, background = bu sohbetin neden devredildiğini anlatan en az 80 karakter. Kullanıcı "/devir otomatik" ile eşikte sormadan yeni sohbete geçilmesini istedi; bu çağrı onun isteğidir. cwd, model, effort ve permission_mode verme: yeni sohbet bunları bu oturumdan alır. Çağrı reddedilirse yeniden deneme, own_initiative ya da proposal_id ile kart açma: ne yapacağını mod araç sonucunda söyler. Başarılı olunca bu sohbete yalnızca yeni sohbetin açıldığını söyleyen tek bir satır yaz.`
+
+// The v0.4/v0.5 scheduled tasks, deleted once by the v1 cleanup (S11).
 const DELETE_TASK = 'mcp__scheduled-tasks__delete_scheduled_task'
 const LIST_TASKS = 'mcp__scheduled-tasks__list_scheduled_tasks'
 const GET_SESSION = 'mcp__ccd_session_mgmt__get_session'
+// Exactly the mod's own task ids (any folder's): the v0.4 pair `-a`/`-b` and
+// the v0.5 generations `-<gen>a`/`-<gen>b`, so a person's own
+// `otomatik-devir-...` task is left alone.
 const OWN_TASK = /^otomatik-devir-[0-9a-f]{8}-(?:[1-9]\d*)?[ab]$/
+
 const isOwnTask = (id: unknown): id is string => typeof id === 'string' && OWN_TASK.test(id)
+
+// Durable store keys (S2): the running handoff, and the handed-off flag that
+// keeps a second child from ever starting for this session.
+export const HANDED_PREFIX = 'devredildi:'
+export const RUN_PREFIX = 'devir:'
+export const CLEANUP_FLAG = 'temizlik-v1'
+const CLEANUP_LOCK = 'temizlik-kilit'
+export const DRAIN_TIMEOUT_MS = 30 * 60 * 1000
+export const MAX_HANDOFF_BLOCKS = 4
+// Blocks with timeoutText per handoff, and with fileMissingText per turn when the gate is closed.
+const MAX_TIMEOUT_BLOCKS = 2
+const MAX_MISSING_BLOCKS = 2
+
+/** The per-session handoff file: `<cwd>/.workflow/handoff/<sid>.md`. */
+export const handoffFile = (cwd: string, sid: string): string =>
+  `${cwd.replace(/\/+$/, '')}/.workflow/handoff/${sid}.md`
+
 type SelfSettings = { effort?: string; model?: string; permissionMode?: string }
-type Mode = 'sor' | 'otomatik'
-type Settings = { threshold: number; mode: Mode; isEnabled: boolean }
+type Settings = { threshold: number; isEnabled: boolean }
+
+const isThreshold = (n: unknown): n is number =>
+  typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= 99
 
 const readSettings = async ($: EngineInterface): Promise<Settings> => {
-  const [esik, mod, acik] = await Promise.all([
-    $.store.get('esik'),
-    $.store.get('mod'),
-    $.store.get('acik'),
-  ])
-  const threshold =
-    typeof esik === 'number' && Number.isInteger(esik) && esik >= 1 && esik <= 99
-      ? esik
-      : DEFAULT_THRESHOLD
+  const [esik, acik] = await Promise.all([$.store.get('esik'), $.store.get('acik')])
 
   return {
-    threshold,
-    // v0.5 chain default: a run of the mod's own task is part of the chain,
-    // otomatik whatever the store says (the off switch still holds).
-    mode: mod === 'otomatik' || isChainRun ? 'otomatik' : 'sor',
+    threshold: isThreshold(esik) ? esik : DEFAULT_THRESHOLD,
     isEnabled: acik !== false,
   }
 }
+
+/** The threshold this chat trips at: its own `/devir dene` value, else the global `esik`. */
+const thresholdOf = (settings: Settings, held: OtomatikDevirConv | null): number =>
+  held?.testThreshold ?? settings.threshold
 
 /** Context fill as a whole percentage, or undefined before the first response. */
 const contextPercent = async ($: EngineInterface): Promise<number | undefined> => {
@@ -80,23 +95,131 @@ const contextPercent = async ($: EngineInterface): Promise<number | undefined> =
   return undefined
 }
 
-const statusText = (settings: Settings, percent: number | undefined): string =>
-  settings.isEnabled
-    ? `Devir: %${percent ?? 0} / eşik %${settings.threshold}`
-    : 'Devir: kapalı'
+const isDrainPhase = (phase: OtomatikDevirPhase): boolean => phase === 'handoff_running' || phase === 'ready'
+
+const statusText = (
+  settings: Settings,
+  percent: number | undefined,
+  held: OtomatikDevirConv | null,
+  running: number,
+): string => {
+  if (!settings.isEnabled) return 'Devir: kapalı'
+  if (held?.phase === 'ready') return 'Devir hazır'
+  if (held?.phase === 'handoff_running' && running > 0) return `Devir: ${running} alt ajan bitiyor`
+
+  return `Devir: %${percent ?? 0} / eşik %${thresholdOf(settings, held)}${
+    held?.testThreshold !== undefined ? ' (bu sohbet)' : ''
+  }`
+}
 
 const refreshStatus = async ($: EngineInterface, percent?: number): Promise<void> => {
   const settings = await readSettings($)
-  $.ui.status(statusText(settings, percent ?? (await contextPercent($))))
+  const held = await currentConv($)
+  const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
+  $.ui.status(statusText(settings, percent ?? (await contextPercent($)), held, running))
 }
+
+// ---------------------------------------------------------------------------
+// Durable state (S2): `devir:<sid>` while a handoff runs, `devredildi:<sid>`
+// once its child started. $.state is lost on a reload; the store is not.
+// ---------------------------------------------------------------------------
+
+type RunRecord = { handoffId: string; file: string; handoffAt: number; phase: 'handoff_running' | 'ready' }
+type HandedRecord = { handoffId: string; startedId: string; file: string; at: number }
+
+const record = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+
+const nonEmpty = (value: unknown): string | undefined =>
+  typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+
+/** The handed-off flag of this session, when its child already started. */
+const handedOf = async ($: EngineInterface, sid: string): Promise<HandedRecord | undefined> => {
+  const got = record(await $.store.get(`${HANDED_PREFIX}${sid}`).catch(() => undefined))
+  if (got === undefined) return undefined
+
+  return {
+    handoffId: nonEmpty(got.handoffId) ?? '',
+    startedId: nonEmpty(got.startedId) ?? '',
+    file: nonEmpty(got.file) ?? '',
+    at: typeof got.at === 'number' ? got.at : 0,
+  }
+}
+
+const runOf = async ($: EngineInterface, sid: string): Promise<RunRecord | undefined> => {
+  const got = record(await $.store.get(`${RUN_PREFIX}${sid}`).catch(() => undefined))
+  const handoffId = nonEmpty(got?.handoffId)
+  const file = nonEmpty(got?.file)
+  if (got === undefined || handoffId === undefined || file === undefined) return undefined
+  if (got.phase !== 'handoff_running' && got.phase !== 'ready') return undefined
+
+  return { handoffId, file, handoffAt: typeof got.handoffAt === 'number' ? got.handoffAt : 0, phase: got.phase }
+}
+
+// Mirrors whether this session's handoff drains (handoff_running or ready);
+// the guards' `.catch` reads it when the hook itself failed (S4).
+let isDraining = false
+
+/**
+ * Writes this session's record to the store after a claim or a phase change:
+ * `devir:<sid>` while it drains, deleted otherwise (`done` writes
+ * `devredildi:<sid>` itself, before this runs).
+ */
+const syncStore = async ($: EngineInterface, sid: string): Promise<void> => {
+  const held = await read($, conv)
+  if (held === null || held.sid !== sid) return
+  isDraining = isDrainPhase(held.phase)
+  const key = `${RUN_PREFIX}${sid}`
+  if (isDraining && held.handoffId !== undefined && held.file !== undefined) {
+    const run: RunRecord = {
+      handoffId: held.handoffId,
+      file: held.file,
+      handoffAt: held.handoffAt ?? 0,
+      phase: held.phase as RunRecord['phase'],
+    }
+    await $.store.set(key, run)
+  } else {
+    await $.store.delete(key).catch(() => undefined)
+  }
+}
+
+/** The record of this sid, rebuilt from the store when $.state has none (a reload). */
+const restoreConv = async ($: EngineInterface, sid: string): Promise<OtomatikDevirConv> => {
+  const handed = await handedOf($, sid)
+  if (handed !== undefined) {
+    return { sid, phase: 'done', handoffId: handed.handoffId, startedId: handed.startedId, file: handed.file }
+  }
+  const run = await runOf($, sid)
+  if (run !== undefined) {
+    return {
+      sid,
+      phase: run.phase,
+      handoffId: run.handoffId,
+      file: run.file,
+      handoffAt: run.handoffAt,
+      isGateClosed: true,
+    }
+  }
+
+  return { sid, phase: 'idle' }
+}
+
+/** The record of the conversation now running; a new session id restores it from the store. */
 const currentConv = async ($: EngineInterface): Promise<OtomatikDevirConv> => {
   const sid = await $.session.id()
   const held = await read($, conv)
-  if (held !== null && held.sid === sid) return held
-  const fresh: OtomatikDevirConv = { sid, phase: 'idle' }
-  await update($, conv, () => fresh)
+  if (held !== null && held.sid === sid) {
+    isDraining = isDrainPhase(held.phase)
 
-  return fresh
+    return held
+  }
+  const restored = await restoreConv($, sid)
+  await update($, conv, () => restored)
+  isDraining = isDrainPhase(restored.phase)
+
+  return restored
 }
 
 const patchConv = async (
@@ -107,17 +230,12 @@ const patchConv = async (
   await update($, conv, (held): OtomatikDevirConv =>
     held !== null && held.sid === sid ? { ...held, ...patch } : { sid, phase: 'idle', ...patch },
   )
+  if (patch.phase !== undefined || patch.handoffId !== undefined) await syncStore($, sid)
 }
 
 const setPhase = ($: EngineInterface, sid: string, phase: OtomatikDevirPhase) =>
   patchConv($, sid, { phase })
 
-/**
- * Re-arms the trigger in the same conversation: `done` (and, with `orWarned`,
- * `warned`) goes back to `idle`, atomically. Called when the fill is measured
- * under the threshold again (a /compact), or the person changes the threshold
- * or switches the mod on. Without it a finished, aborted or failed handoff left
- * the mod silent until a new session id appeared.
 /**
  * Check-and-set in one `update` (ifVersion, retried on a miss): applies `patch`
  * only when `may` allows the record as it stands, and says whether this call
@@ -141,9 +259,81 @@ const claim = async (
     isClaimed = may(now)
     return isClaimed ? { ...now, ...patch } : held
   })
+  if (isClaimed && (patch.phase !== undefined || patch.handoffId !== undefined)) await syncStore($, sid)
 
   return isClaimed
 }
+
+// ---------------------------------------------------------------------------
+// Due and claim (S3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The trip is due: the mod is on, this session never handed off, and either
+ * `/devir simdi` forced it or the fill reached this chat's threshold.
+ */
+const isDue = async ($: EngineInterface, held: OtomatikDevirConv): Promise<{ threshold: number } | undefined> => {
+  const settings = await readSettings($)
+  if (!settings.isEnabled) return undefined
+  if ((await handedOf($, held.sid)) !== undefined) return undefined
+  const threshold = thresholdOf(settings, held)
+  if (held.isForced === true) return { threshold }
+  const percent = await contextPercent($)
+  if (percent === undefined || percent < threshold) return undefined
+
+  return { threshold }
+}
+
+const newHandoffId = (sid: string, now: number): string => `${sid.slice(0, 8)}-${now.toString(36)}`
+
+/**
+ * Starts a handoff: `handoff_running` with a new id, its time and file, and the
+ * gate closed unless the person typed the running turn. Returns the claimed
+ * record, or undefined when another caller won (or `may` refused).
+ */
+const claimHandoff = async (
+  $: EngineInterface,
+  sid: string,
+  may: (held: OtomatikDevirConv) => boolean,
+  extra: Partial<OtomatikDevirConv> = {},
+): Promise<OtomatikDevirConv | undefined> => {
+  const now = await $.clock.now()
+  const file = handoffFile(await $.session.cwd(), sid)
+  const isClaimed = await claim($, sid, may, {
+    phase: 'handoff_running',
+    handoffId: newHandoffId(sid, now),
+    handoffAt: now,
+    file,
+    isGateClosed: !isPersonTurn,
+    isForced: false,
+    starting: undefined,
+    notedTurn: undefined,
+    ...extra,
+  })
+  if (!isClaimed) return undefined
+  later($, () => noteSelf($, sid))
+  const held = await read($, conv)
+
+  return held !== null && held.sid === sid ? held : undefined
+}
+
+/** The handoff file's text, when it was written for this handoff (not before `since`). */
+const readFresh = async ($: EngineInterface, file: string | undefined, since: number | undefined) => {
+  if (file === undefined) return undefined
+  try {
+    const stat = await $.fs.stat(file)
+    if (stat.kind !== 'file' || (since !== undefined && stat.mtimeMs < since)) return undefined
+    const body = (await $.fs.read(file)).trim()
+
+    return body === '' ? undefined : body
+  } catch {
+    return undefined
+  }
+}
+
+const isFresh = async ($: EngineInterface, file: string | undefined, since: number | undefined) =>
+  (await readFresh($, file, since)) !== undefined
+
 const hasHandoffSkill = async ($: EngineInterface): Promise<boolean> => {
   try {
     if ((await $.command.list()).some(command => command.name === SKILL)) return true
@@ -161,6 +351,7 @@ const hasHandoffSkill = async ($: EngineInterface): Promise<boolean> => {
 
   return false
 }
+
 /**
  * `$.tool.call` for a tool the saved MCP typings may not declare yet (they list
  * the tools connected when the mod was last saved): the input goes through
@@ -169,26 +360,18 @@ const hasHandoffSkill = async ($: EngineInterface): Promise<boolean> => {
 const callTool = ($: EngineInterface, input: { tool: string } & Record<string, unknown>) =>
   $.tool.call(input as unknown as ToolCallArgs)
 
-type SelfSession = SelfSettings & { id?: string; title?: string; taskId?: string }
+type SelfSession = SelfSettings & { id?: string; title?: string }
 
-const nonEmpty = (value: unknown): string | undefined =>
-  typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
-
-/**
- * This chat's own desktop session: its id (local_...), title, scheduled-task
- * linkage, effort, model and permission mode; each unknown on failure.
- */
+/** This chat's own desktop session: its id (local_...), title, effort, model and permission mode. */
 const selfSession = async ($: EngineInterface): Promise<SelfSession> => {
   try {
     const got = await $.tool.call({ tool: GET_SESSION, session_id: 'self' })
     if (got.deny !== undefined || got.isError === true || got.text === undefined) return {}
     const info = JSON.parse(got.text) as Record<string, unknown>
-    const linked = info.scheduledTask as { taskId?: unknown; id?: unknown } | undefined
 
     return {
       id: nonEmpty(info.sessionId),
       title: nonEmpty(info.title),
-      taskId: nonEmpty(info.scheduledTaskId) ?? nonEmpty(linked?.taskId) ?? nonEmpty(linked?.id),
       effort: nonEmpty(info.effort),
       model: nonEmpty(info.model),
       permissionMode: nonEmpty(info.permissionMode),
@@ -205,15 +388,14 @@ const continueTitle = (title: string | undefined): string => {
 
   return `${title.slice(0, room).trimEnd()}${CONTINUE_SUFFIX}`
 }
+
 /** The new session's id from a start_session result, when it started one. */
 const startedId = (result: { deny?: string; isError?: boolean; text?: string }): string | undefined =>
   result.deny !== undefined || result.isError === true
     ? undefined
     : /\b(local_[A-Za-z0-9-]+)/.exec(result.text ?? '')?.[1]
 
-/** Whether this surface has Claude desktop's start_session tool (none in a terminal). */
-const hasStartTool = async ($: EngineInterface): Promise<boolean> =>
-  (await $.tool.list().catch(() => [])).some(tool => tool.name === START_SESSION)
+/** Work that must not run inside the dispatch the turn waits on. */
 const later = ($: EngineInterface, work: () => Promise<void>): void => {
   $.clock.after(50, () => {
     work().catch(error => $.ui.log(`otomatik-devir: ${String(error)}`, { to: 'debug' }))
@@ -230,25 +412,14 @@ const activeAgents = async ($: EngineInterface): Promise<AgentInfo[]> => {
     return []
   }
 }
-// The main loop's turn is running (turn.start .. turn.complete).
-let isTurnRunning = false
-// Since when no main turn has run (clock ms); undefined while one runs.
-let idleSince: number | undefined
-// One handoff guard per loaded module.
-let isGuarding = false
+
 // Who typed the running main turn. prompt.submit's `origin` (engine-stamped,
 // a closed set) is read for the turn it starts and kept until that turn ends;
-// a turn no prompt.submit of a person opened (a mod's own message, a task
-// notification, a continuation) is not the person's.
+// a turn no prompt.submit of a person opened (a task notification, a
+// continuation) is not the person's.
 let isPersonTurn = false
 let isNextTurnPerson = false
 let runningTurnId: string | undefined
-// The main turn in which the model started this handoff's chat.
-let startedInTurn: string | undefined
-// What the gate (or the app's R1 refusal) said of the running main turn:
-// true = start_session may run, false = it may not; undefined = not known,
-// the prompt's origin stands in.
-let gateOpen: boolean | undefined
 
 /**
  * The person's own message: Enter at the terminal, the Remote Control bridge,
@@ -257,21 +428,22 @@ let gateOpen: boolean | undefined
  */
 const PERSON_ORIGINS: ReadonlySet<string> = new Set(['composer', 'bridge', 'sdk'])
 
-/** A person's own submission: a person origin, not one the engine marks isMeta (review H1). */
+/** A person's own submission: a person origin, not one the engine marks isMeta. */
 const isPersonSubmit = (e: { origin: { kind: string }; isMeta?: true }): boolean =>
   PERSON_ORIGINS.has(e.origin.kind) && e.isMeta !== true
-/** Notes the continuation title and this chat's id for the model's start_session call. */
+
+/** Notes the continuation title and this chat's settings for the start_session call. */
 const noteSelf = async ($: EngineInterface, sid: string): Promise<void> => {
   const self = await selfSession($)
   await patchConv($, sid, {
     title: continueTitle(self.title),
     selfId: self.id,
-    selfTaskId: self.taskId,
     effort: self.effort,
     model: self.model,
     permissionMode: self.permissionMode,
   })
 }
+
 type ToolNext = (input: ToolCallArgs) => Promise<{
   deny?: string
   isError?: true
@@ -330,7 +502,3 @@ const watchModelStart = async (
     const id = startedId(result)
     startedInTurn = runningTurnId
     await patchConv($, sid, { phase: 'done', startedId: id ?? title, starting: undefined })
-const record = (value: unknown): Record<string, unknown> | undefined =>
-  value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined

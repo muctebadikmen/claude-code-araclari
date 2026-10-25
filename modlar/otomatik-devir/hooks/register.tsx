@@ -414,7 +414,35 @@ const contextPercent = async ($: EngineInterface): Promise<number | undefined> =
 
 const isDrainPhase = (phase: OtomatikDevirPhase): boolean => phase === 'handoff_running' || phase === 'ready'
 
+/** This chat's part in a chain, for the status line (O9). */
+type OrkestraStatus =
+  | { role: 'ana'; main: OrkestraAna; child?: OrkestraAlt; isPaused: boolean }
+  | { role: 'alt'; n: number }
+
+/** The main chat's status line (Contract). */
+const mainStatusText = ({ main, child, isPaused }: { main: OrkestraAna; child?: OrkestraAlt; isPaused: boolean }) => {
+  if (main.ended === 'durdu') return orkestraStalledBand(main.n)
+  if (main.ended !== undefined) return `Orkestra bitti (${main.n} alt sohbet)`
+  if (isPaused || !main.isHeld) return 'Orkestra duraklatıldı'
+  if (main.n === 0) return 'Orkestra: alt sohbet 1 açılıyor'
+
+  return child?.status === 'ready' ? `Orkestra: alt sohbet ${main.n} hazır` : `Orkestra: alt sohbet ${main.n} çalışıyor`
+}
+
 const statusText = (
+  settings: Settings,
+  percent: number | undefined,
+  held: OtomatikDevirConv | null,
+  running: number,
+  orkestra?: OrkestraStatus,
+): string => {
+  if (orkestra?.role === 'ana') return mainStatusText(orkestra)
+  const text = v1StatusText(settings, percent, held, running)
+
+  return orkestra?.role === 'alt' ? `Orkestra alt sohbet ${orkestra.n} · ${text}` : text
+}
+
+const v1StatusText = (
   settings: Settings,
   percent: number | undefined,
   held: OtomatikDevirConv | null,
@@ -429,11 +457,23 @@ const statusText = (
   }`
 }
 
+/** This chat's chain part from its cached role (O9): the main record and child, or the child's number. */
+const orkestraStatusOf = async ($: EngineInterface, held: OtomatikDevirConv): Promise<OrkestraStatus | undefined> => {
+  if (held.role === 'alt') return { role: 'alt', n: held.childN ?? 1 }
+  if (held.role !== 'ana' || held.localId === undefined) return undefined
+  const main = await readMain($, held.localId).catch(() => undefined)
+  if (main === undefined) return undefined
+  const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+
+  return { role: 'ana', main, child, isPaused: held.isPaused === true }
+}
+
 const refreshStatus = async ($: EngineInterface, percent?: number): Promise<void> => {
   const settings = await readSettings($)
   const held = await currentConv($)
   const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
-  $.ui.status(statusText(settings, percent ?? (await contextPercent($)), held, running))
+  const orkestra = await orkestraStatusOf($, held)
+  $.ui.status(statusText(settings, percent ?? (await contextPercent($)), held, running, orkestra))
 }
 
 // ---------------------------------------------------------------------------
@@ -1783,6 +1823,69 @@ const cleanupOnce = async ($: EngineInterface, attempt = 1): Promise<void> => {
   await $.store.delete(CLEANUP_LOCK).catch(() => undefined)
 }
 
+/**
+ * The band's one row (O7, S10): a paused or stalled main chat, else a ready
+ * handoff (never in a managed sub-chat, O12: its status line shows the child).
+ */
+const bandRow = async ($: EngineInterface, held: OtomatikDevirConv): Promise<string | undefined> => {
+  if (held.role === 'ana') {
+    if (held.stalledN !== undefined) return orkestraStalledBand(held.stalledN)
+    if (held.isPaused !== true || held.localId === undefined) return undefined
+    const main = await readMain($, held.localId).catch(() => undefined)
+
+    return main !== undefined && main.ended === undefined ? ORKESTRA_PAUSED_BAND : undefined
+  }
+
+  return held.phase === 'ready' && held.role !== 'alt' ? READY_BAND : undefined
+}
+
+/** `/devir otonom [dur | limit <n>]` (O8; the limit is the chain's, Decision 22). */
+const otonomVerb = async (
+  $: EngineInterface,
+  held: OtomatikDevirConv,
+  sub: string,
+  value: string | undefined,
+): Promise<string> => {
+  const role = await roleOf($)
+  const chainId = role === 'ana' || role === 'alt' ? await chainIdOf($) : undefined
+  if (sub === 'limit') {
+    if (chainId === undefined) return NOT_ORCHESTRATED
+    if (value === undefined || !/^\d+$/.test(value)) return USAGE
+    const limit = clampLimit(Number(value))
+    await patchChainSettings($, chainId, { limit })
+    await refreshStatus($).catch(() => undefined)
+
+    return `Orkestra: sınır ${limit} alt sohbet.`
+  }
+  if (sub !== '' && sub !== 'dur') return USAGE
+  if (role === 'ana' && chainId !== undefined) {
+    if (sub === 'dur') {
+      const main = await patchMain($, chainId, { isStopRequested: true })
+
+      return main === undefined ? NOT_ORCHESTRATED : 'Zincir şu anki alt sohbetten sonra duracak.'
+    }
+    const main = await readMain($, chainId)
+    if (main === undefined) return NOT_ORCHESTRATED
+    const limit = await orkestraLimit($, chainId)
+    const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+    const state = main.ended !== undefined ? `bitti: ${main.ended}` : main.isHeld ? 'tutuluyor' : 'duraklatıldı'
+
+    return `Orkestra: ana sohbet · görev "${main.title}" · alt sohbet ${main.n}/${limit} · alt durum ${child?.status ?? 'yok'} · ${state}`
+  }
+  if (role === 'alt' && chainId !== undefined) {
+    if (sub === 'dur') return 'Bu bir alt sohbet; zinciri ana sohbette /devir otonom dur ile durdur.'
+    const localId = await selfLocal($)
+    const own = localId === undefined ? undefined : await readRecord($, localId)
+    const limit = await orkestraLimit($, chainId)
+    const n = own?.role === 'alt' ? own.n : (held.childN ?? 1)
+    const status = own?.role === 'alt' ? own.status : 'working'
+
+    return `Orkestra: alt sohbet ${n}/${limit} (ana: ${chainId}) · durum ${status}`
+  }
+
+  return NOT_ORCHESTRATED
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -1822,6 +1925,19 @@ export const register: Register = on => {
     try {
       const settings = await readSettings($)
       const held = await currentConv($)
+      // O2: the main chat's own section (cached role only, never a GET); it never trips, so no long-chat note.
+      if (held.role === 'ana') {
+        const main = held.localId === undefined ? undefined : await readMain($, held.localId)
+        if (!settings.isEnabled || main === undefined || main.ended !== undefined) return r
+
+        return {
+          ...r,
+          sections: [
+            ...r.sections.filter(s => s.id !== ORKESTRA_SECTION_ID && s.id !== LONG_CHAT_SECTION_ID),
+            { id: ORKESTRA_SECTION_ID, text: ORKESTRA_SECTION(main.task), scope: 'session' as const },
+          ],
+        }
+      }
       if (!settings.isEnabled || held.phase !== 'idle') return r
 
       return {
@@ -2176,7 +2292,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'devir' }, async ($, e) => {
-    const [verb = '', value] = e.args.trim().split(/\s+/)
+    const [verb = '', value, extra] = e.args.trim().split(/\s+/)
     const settings = await readSettings($)
     const held = await currentConv($)
 
@@ -2185,7 +2301,9 @@ export const register: Register = on => {
         const percent = await contextPercent($)
         const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
 
-        return { text: `${statusText(settings, percent, held, running)} · aşama: ${held.phase}` }
+        const orkestra = await orkestraStatusOf($, held)
+
+        return { text: `${statusText(settings, percent, held, running, orkestra)} · aşama: ${held.phase}` }
       }
       case 'esik': {
         const n = Number(value)
@@ -2197,8 +2315,10 @@ export const register: Register = on => {
       }
       case 'dene': {
         // Decision 13: a threshold for THIS chat only ($.state), for live tests.
+        const isMain = (await roleOf($)) === 'ana' && held.localId !== undefined
         if (value === undefined) {
           await patchConv($, held.sid, { testThreshold: undefined })
+          if (isMain) await patchMain($, held.localId as string, { testThreshold: undefined })
           await refreshStatus($)
 
           return { text: `Bu sohbetin deneme eşiği kaldırıldı; eşik %${settings.threshold}.` }
@@ -2206,7 +2326,12 @@ export const register: Register = on => {
         const n = Number(value)
         if (!isThreshold(n)) return { text: 'Kullanım: /devir dene <1-99> (boş: kaldır)' }
         await patchConv($, held.sid, { testThreshold: n })
+        // Decision 11: in the main chat the chain's later children inherit it.
+        const main = isMain ? await patchMain($, held.localId as string, { testThreshold: n }) : undefined
         await refreshStatus($)
+        if (main !== undefined) {
+          return { text: `Zincirin deneme eşiği %${n}: bundan sonra açılan alt sohbetler bunu kullanır.` }
+        }
 
         return { text: `Bu sohbetin deneme eşiği %${n} (yalnızca bu sohbet).` }
       }
@@ -2244,6 +2369,8 @@ export const register: Register = on => {
         await refreshStatus($)
 
         return { text: 'Otomatik devir açıldı.' }
+      case 'otonom':
+        return { text: await otonomVerb($, held, (value ?? '').toLowerCase(), extra) }
       case 'sor':
       case 'otomatik':
       case 'gec':
@@ -2269,7 +2396,9 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || e.props.isWorking) return next(e)
     const held = await read($, conv)
-    if (held === null || held.phase !== 'ready' || held.sid !== (await $.session.id())) return next(e)
+    if (held === null || held.sid !== (await $.session.id())) return next(e)
+    const row = await bandRow($, held)
+    if (row === undefined) return next(e)
     // The mod off: no band, even before this chat's next hook drops the handoff.
     if (!(await readSettings($)).isEnabled) return next(e)
 
@@ -2279,7 +2408,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Box key="devir">
-          <Text>{READY_BAND}</Text>
+          <Text>{row}</Text>
         </Box>
         {below ?? null}
       </Box>

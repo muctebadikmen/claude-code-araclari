@@ -9,15 +9,15 @@ A fresh chat resumes exactly here without re-asking anything.
 
 REQUIRED SUB-SKILL: my-skill-orchestrate
 
-Orchestrate rule 13 invokes this at a phase boundary when context is heavy. No 🛑, no questions (rule 12): run start to finish, ending with the resume prompt. STATE.md is a claim; git is evidence.
+Orchestrate's long-chat handoff invokes this at a phase boundary when context is heavy. No 🛑, no questions: run start to finish, ending with the resume prompt. STATE.md is a claim; git is evidence.
 
 ## Steps
 
-1. **Reconcile.** Dispatch `Reconcile state vs reality` (Explore, `model: sonnet`). Inputs: `.workflow/STATE.md`, any active `PLAN.md`/`PROGRESS.md`, `git status --short`, `git log -15 --oneline`, `git log --merges --oneline` (ledger shas), `git worktree list`, `git stash list`, `git diff --stat`. Output contract, ≤15 lines: (a) tasks marked done whose sha is absent from `git log` or whose files show no matching change, (b) work in the tree but absent from STATE.md, (c) uncommitted paths, (d) every worktree with its branch. It runs no tests, reads no source; you inspect nothing (rule 1).
-2. **Fix state.** Rewrite `.workflow/STATE.md` from the delta, keeping the headings `## Done`/`In progress`/`Remaining`/`Decisions`/`Gotchas`/`Files`. No ledger: Done = verification passed or commit exists, else In progress noting why; one section per task. Ledger (orchestrate's `progress-template.md`): merge commit → `[x]`, unmerged dispatch → `[~]` with note, `[!]` kept, one line each; `Progress:` count matches.
-3. **Update plan.** Active PLAN.md: tick completed checkboxes, add a `Deviations:` line under each changed task.
-4. **Write `.workflow/HANDOFF.md`** (never the repo root) from the template. Git repo: un-ignore per `my-skill-init`, commit it and STATE.md/PLAN.md/PROGRESS.md alone; never push.
-5. **Print the resume prompt** filled from the template, in a code block, last in your reply. No table after it.
+1. **Reconcile.** Dispatch `Reconcile state vs reality` (Explore, `model: sonnet`) over `.workflow/STATE.md`, any active `PLAN.md`/`PROGRESS.md`, `git status --short`, `git log -15 --oneline`, `git log --merges --oneline`, `git worktree list`, `git stash list`, `git diff --stat`. It reads no source and runs no tests; you inspect nothing yourself. It returns ≤15 lines: (a) tasks marked done whose sha is not in `git log` or whose files show no matching change, (b) work in the tree absent from STATE.md, (c) uncommitted paths, (d) every worktree with its branch.
+2. **Fix state.** Rewrite `.workflow/STATE.md` from the delta, keeping its headings. No ledger: Done means verification passed or a commit exists, otherwise In progress with the reason. Ledger plan (orchestrate's progress template): merge commit → `[x]`, unmerged dispatch → `[~]` with a note, `[!]` kept, and the `Progress:` count matches.
+3. **Update plan.** Checkbox plan: tick done boxes. Ledger plan: PROGRESS.md. Add `Deviations:` per changed task.
+4. **Write `.workflow/HANDOFF.md`** (never the repo root) from the template. In a git repo make sure it is not ignored (init's `.gitignore` rule), commit it with STATE.md/PLAN.md/PROGRESS.md and nothing else, never push.
+5. **Print the resume prompt**, filled, in a code block, last in the reply. No table after it.
 
 ## HANDOFF.md template
 
@@ -33,23 +33,23 @@ Gotchas: <bullets>
 Verification status: <last command run and its result, or "not run">
 ```
 
-## Resume prompt (print verbatim, filled)
+## Resume prompt
 
 ```
-Continue the work in this repo. First read .workflow/HANDOFF.md and .workflow/STATE.md. Then invoke the `<skill>` skill and resume from <phase or task id>. The decisions listed there are final; do not re-ask them. Do not redo tasks marked done. Follow the my-skill-orchestrate skill (sub-agents, `model` set on each dispatch, parallel dispatch). <If skill is my-skill-execute: Run non-stop.>
+Continue the work in this repo. First read .workflow/HANDOFF.md and .workflow/STATE.md. Then invoke the `<skill>` skill and resume from <phase or task id>. The decisions listed there are final; do not re-ask them. Do not redo tasks marked done. Follow the my-skill-orchestrate skill. <If skill is my-skill-execute: Run non-stop.>
 ```
 
 ## Auto mode (otomatik-devir)
 
-Trigger: args start with `auto <file>`. This replaces Steps 1–5; the HANDOFF template above still applies, the resume prompt is the one in item 5 (not the template's).
+Trigger: args start with `auto <file>`. This replaces steps 1-5. The HANDOFF template still applies; the resume prompt is the one below, not the one above.
 
 - No sub-agent, no question, no orchestrate dispatch. If the mod denies a tool call, continue without it.
-- Reconcile yourself with read-only `git status --short`, `git log -10 --oneline` and `git worktree list` (skip outside git).
+- Reconcile yourself with read-only `git status --short`, `git log -10 --oneline`, `git worktree list` (skip outside git).
 - If `.workflow/STATE.md` exists, update only its In progress/Remaining lines. No commit, no push.
-- Write `<file>` (create dirs), in this order:
-  1. First line: `# HANDOFF <ISO datetime> · <handoff id if the mod gave one>`.
+- Write `<file>` (create directories), in this order:
+  1. If the mod asks for a `Kalan: yok` / `Kalan: var` line, put it alone above everything else (the mod's placement wins). Then `# HANDOFF <ISO datetime> · <handoff id if the mod gave one>`.
   2. The HANDOFF template fields (Active skill … Verification status).
   3. `Yeniden çalıştır:` — each stopped agent: id, description, what to rerun. Omit if none.
   4. `Kullanıcının son mesajı:` — only if the mod gave one.
-  5. Last, `## Resume prompt` as plain text, filled: "Continue the work in this repo. Read only <file>; it is the whole handoff. Then invoke the `<skill>` skill and resume from <phase or task id>. The decisions listed there are final; do not re-ask them. Do not redo tasks marked done. Follow the my-skill-orchestrate skill (sub-agents, `model` set on each dispatch, parallel dispatch). <If skill is my-skill-execute: Run non-stop.>" Name no other handoff or state file in it.
+  5. Last, `## Resume prompt` as plain text, filled: "Continue the work in this repo. Read only <file>; it is the whole handoff. Then invoke the `<skill>` skill and resume from <phase or task id>. The decisions listed there are final; do not re-ask them. Do not redo tasks marked done. Follow the my-skill-orchestrate skill. <If skill is my-skill-execute: Run non-stop.>" Name no other handoff or state file in it.
 - Reply with one line `Devir dosyası yazıldı: <file>`, then follow the mod's next instruction (start_session or end the turn).

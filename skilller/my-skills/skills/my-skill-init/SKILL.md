@@ -5,18 +5,16 @@ description: Use when starting or setting up a project for the my-skills workflo
 
 # Init
 
-Set up the project's workflow files and rules. Idempotent: a second run changes nothing. No sub-agents, no questions, unless the project folder is ambiguous (not a git repo and holding several projects): then ask which one.
+Set up the project's workflow files and rules. Idempotent: a second run changes nothing. No sub-agents and no questions, except when the folder is not a git repo and holds several projects: then ask which one.
 
-Project root = `git rev-parse --show-toplevel`, else the current folder. Before editing, note `git status --porcelain -- AGENTS.md CLAUDE.md .gitignore .workflow/STATE.md .workflow/PLAN.md`; a path listed there already holds uncommitted user changes.
+Project root = `git rev-parse --show-toplevel`, else the current folder. Before editing, note `git status --porcelain -- AGENTS.md CLAUDE.md .gitignore .workflow/STATE.md .workflow/PLAN.md`: a listed path already holds uncommitted user changes.
 
-## Steps
-
-1. **State.** If `.workflow/STATE.md` is missing, write it from my-skill-orchestrate's `state-template.md`, `Active skill: none`. Write `.workflow/PLAN.md` only if the user described work to plan (`# PLAN`, `Goal:`, then `- [ ] T1 — <step>` lines); otherwise leave planning to `my-skill-masterplan`.
-2. **Rules.** In `AGENTS.md` (create if missing), replace everything between the markers with the block below, or append the block if the markers are absent. Never touch text outside the markers.
-3. **CLAUDE.md.** Missing: create it containing `@AGENTS.md`. Present without an `@AGENTS.md` line: add that line at the top. Claude Code imports it.
-4. **`.gitignore`.** Add each missing entry: `.workflow/research/`, `.workflow/dispatch/`, `.workflow/audit/`, `.workflow/runs/`, `.workflow/plans/*/check-*.md`, `.worktrees/`. A line ignoring all of `.workflow` (`.workflow/`, `.workflow`, `/.workflow/`, `.workflow/*`) is replaced by these entries. Never ignore the whole folder.
-5. **Commit.** Git repo and files changed: `git add -- <changed paths>`, then `git commit -m "chore: set up my-skills workflow files" -- <changed paths>`, nothing else included; an attribution trailer only if this session supplied one. If a changed path held uncommitted user changes before step 1, stage and commit nothing; say so.
-6. **Report** in 3 lines: what was created or changed, commit sha or why not, next step (`my-skill-masterplan`, or the plan's first step).
+1. **State.** Missing `.workflow/STATE.md`: write it from my-skill-orchestrate's state template, `Active skill: none`. Write `.workflow/PLAN.md` (`# PLAN`, `Goal:`, `- [ ] T1 — <step>` lines) only if the user described work to plan; otherwise planning is `my-skill-masterplan`'s job.
+2. **Rules.** In `AGENTS.md` (create if missing) replace everything between the markers with the block below, or append the block if the markers are absent. Never touch text outside the markers.
+3. **CLAUDE.md.** Missing: create it containing `@AGENTS.md`. Present without that line: add it at the top.
+4. **`.gitignore`.** Add each missing entry: `.workflow/research/`, `.workflow/dispatch/`, `.workflow/audit/`, `.workflow/runs/`, `.workflow/plans/*/check-*.md`, `.worktrees/`. A line ignoring all of `.workflow` (`.workflow/`, `.workflow`, `/.workflow/`, `.workflow/*`) is replaced by these. Never ignore the whole folder.
+5. **Commit** (git repo, files changed): stage and commit only the changed paths with `chore: set up my-skills workflow files`, plus an attribution trailer only if this session supplied one. If a changed path held uncommitted user changes before step 1, commit nothing and say so.
+6. **Report** in 3 lines: what changed, commit sha or why none, next step (`my-skill-masterplan`, or the plan's first step).
 
 ## AGENTS.md block
 

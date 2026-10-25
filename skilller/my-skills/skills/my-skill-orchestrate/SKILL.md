@@ -5,41 +5,29 @@ description: Use when the main chat is about to do multi-step codebase work (ana
 
 # Orchestrate
 
-The main chat decides, dispatches, relays, keeps state; sub-agents do the work.
-
-In Cloudroom (`CLOUDROOM_WORKLOAD` or `ROOM_THREAD_ID` set), dispatches, resumes and questions follow `references/cloudroom.md`.
+The main chat decides, dispatches, relays and keeps state; sub-agents do the work. In Cloudroom (`ROOM_THREAD_ID` set), follow `references/cloudroom.md` for dispatches, resumes and questions.
 
 ## Rules
 
-1. **Delegate.** Reading, searching, analysing, implementing, testing, reviewing are sub-agent work. The orchestrator reads only its own state and plan files, plus one known file for one fact.
-2. **Right-size, then parallelise.** One agent per independent part or question group, dispatched together, never in sequence. No agent for a part the project lacks.
-3. **Dispatch mode.** Foreground batch (all Agent calls in one message, `run_in_background: false`) when the next step needs every result (lanes → synthesis, collect → verify, check rounds). Background (`run_in_background: true`) when each return is acted on alone as it arrives (implement → review → merge).
-4. **One deliverable per dispatch**, about 20 minutes and ≤15 files. An agent at its budget stops, writes what it has and reports what remains; the orchestrator re-dispatches the rest, on opus if the agent was sonnet. Resume (SendMessage) only to answer a question or apply review findings. Every dispatch fills all six slots of `references/dispatch-template.md`.
-5. **Summaries, not dumps.** Heavy output goes to a `.workflow/` file; the agent returns the path plus ≤10 lines.
-6. **Caps are hard.** A cap a skill declares (rounds, retries, agents) is exceeded only after a 🛑 where the user chooses. Open-ended work is scoped in ≤6 lines before the first dispatch, smallest version first.
-7. **Model routing.** Pass `model` on every dispatch; table below. In doubt between sonnet and opus: opus.
-8. **Overload fallback.** An agent dying with a 529/5xx is re-dispatched once; a second failure drops a model (opus → sonnet), noted in STATE.md.
-9. **Task name = `verb object`**, e.g. `Verify auth findings`; model travels in `model`, not the name.
-10. **State.** Read `.workflow/STATE.md` first (none: `my-skill-init`); write it from `references/state-template.md` before the first dispatch, at every 🛑, after every phase. Commit STATE.md/PLAN.md/PROGRESS.md/HANDOFF.md, never scratch.
-11. **🛑 means stop.** Write STATE.md, report done/next in 3 lines, wait. Non-stop skills (execute) skip the wait.
-12. **Questions.** Research and masterplan ask whatever they need: AskUserQuestion, ≤4 per call, more calls allowed, recommended first, marked "(Recommended)". Execute, ship and handoff never ask.
-13. **Long chats.** With heavy context (≈300K tokens or after compaction), finish the phase, invoke `my-skill-handoff`, continue in a new chat. Non-stop skills included.
-14. **Honesty.** Report only what a sub-agent verified; "not run" is valid. Before telling the user to act outside the repo (portal, console), dispatch a diagnosis.
+- **Delegate heavy work.** Reading code, searching, analysing, implementing, testing and reviewing are sub-agent work. The orchestrator reads its own state and plan files and may check something itself when it takes a handful of tool calls; anything bigger is a dispatch.
+- **Right-size, then parallelise.** One agent per independent part or question group, all sent in one message; none for a part the project lacks. Foreground batch when the next step needs every result; background when each result is acted on alone (implement → review → merge).
+- **One deliverable per dispatch**, small enough to finish in one sitting. An agent that outgrows it stops, writes what it has and reports what remains; re-dispatch the rest on the same model with that report. Resume an agent only to answer its question or hand it review findings. Fill `references/dispatch-template.md`.
+- **Summaries, not dumps.** Heavy output goes to a `.workflow/` file; the agent returns the path plus ≤10 lines.
+- **Caps are hard.** A cap a skill declares (rounds, retries, agents) is exceeded only after a 🛑 where the user chooses. Scope open-ended work in a few lines first, smallest useful version first.
+- **State.** Read `.workflow/STATE.md` first (none: `my-skill-init`); write it from `references/state-template.md` before the first dispatch, at every 🛑 and after every phase. STATE/PLAN/PROGRESS/HANDOFF.md are committed; scratch is not.
+- **Honesty.** Report only what a sub-agent verified; "not run" is valid. Before telling the user to act outside the repo (portal, console), dispatch a diagnosis.
+- **Stop points (🛑).** Write STATE.md, report found / done / next in three lines, wait. Non-stop skills (execute) skip the wait.
+- **Questions policy.** Research and masterplan ask whatever they need: AskUserQuestion, ≤4 per call, more calls allowed, recommended option first, marked "(Recommended)". Execute, ship and handoff never ask.
+- **Long-chat handoff.** With heavy context (≈300K tokens, or after a compaction), finish the phase, invoke `my-skill-handoff`, continue in a new chat. Non-stop skills included.
+- **Overload fallback.** An agent dying with a 529/5xx is re-dispatched once; a second failure switches it to the other of sonnet/opus, noted in STATE.md.
 
 ## Model routing
 
-| Model | Use for |
-|---|---|
-| haiku | listing, grep sweeps, counting, format-only edits |
-| sonnet | mapping one module, web research, bounded implementation, small reviews |
-| opus | cross-cutting analysis, verification, synthesis, plan drafting and checking, implementation spanning modules or UI/widget tests, reviews of opus tasks or >2 files, merge conflicts |
-| fable | opt-in only: the user's message asks or contains `--fable` |
+The only place routing is defined. Pass `model` on every dispatch.
 
-## Red flags
+- **sonnet**, the default for delegated work: reading, mapping, research, implementing a planned task, tests, reviews, verification.
+- **opus** only where its extra judgment pays for itself: (1) drafting a plan or design, or synthesising conflicting findings the rest depends on; (2) work where a mistake could still pass the tests: concurrency, persistence/migrations, security, numeric or scheduling logic, cross-module contracts; (3) escalation: a sonnet task failed review twice, or is blocked by something inside its own scope → re-dispatch on opus with its report.
+- **haiku**: mechanical work only (listing, counting, running one fixed command and reporting).
+- **fable**: only when the user asks (`--fable` or in words).
 
-| Thought | Do instead |
-|---|---|
-| "This cap is unreasonable" | 🛑, user chooses (rule 6) |
-| "I'll wait for the batch" | Background, act per return (rule 3) |
-| "One more phase fits here" | Handoff now (rule 13) |
-| "The portal needs a manual step" | Diagnose first (rule 14) |
+In doubt: sonnet; escalation makes a wrong guess cheap. A project file (e.g. `.workflow/.../MODEL-ROUTING.md`) may name project-specific opus areas; it overrides this default.

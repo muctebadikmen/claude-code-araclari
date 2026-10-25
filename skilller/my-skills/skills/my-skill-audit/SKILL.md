@@ -7,34 +7,40 @@ description: Use when the user wants to find bugs, defects, mistakes, or risks i
 
 Find every real problem, prove it, rank it. Never propose a feature.
 
-REQUIRED SUB-SKILL: my-skill-orchestrate
-Read it first; fill all six dispatch slots.
+REQUIRED SUB-SKILL: my-skill-orchestrate — read it first; it governs dispatch, model routing (pass `model` explicitly) and `.workflow/STATE.md`.
 
-## Inputs
-Cwd; optional scope. `.workflow/STATE.md` per orchestrate rule 10.
+Input: cwd, optional scope. Foreground batches (all agents of a phase in one message). Scratch lives in `.workflow/audit/`.
 
 ## Phases
-Foreground batches (rule 3); models per rule 7.
 
-### 1. Map — `model: sonnet`, general-purpose
-One mapper per concern present: `screens-routes`, `data-models`, `services-integrations`, `state-dataflow`, `build-test-config`. Skip a concern the project lacks (a CLI has no screens), noting it in STATE.md `## Gotchas`. Under ~15 source files: one mapper for all. Each writes `.workflow/audit/map-<concern>.md` (≤150 lines: components, entry points, key files), returns ≤8 lines.
-Relay one line per concern. 🛑 (rule 11) only if the project is far larger than expected, or the user asks to pick a scope.
+### 1. Map
+One `sonnet` mapper per concern the project actually has: `screens-routes`, `data-models`, `services-integrations`, `state-dataflow`, `build-test-config` (a CLI has no screens; note skipped concerns in STATE.md `## Gotchas`). A small project gets one mapper. Each writes `map-<concern>.md` (components, entry points, key files; short) and returns a few lines. Stop for the user only if the project is far larger than expected or they want to pick a scope.
 
 ### 2. Analyze
-- Area analyzers, `model: sonnet`, one per map file; input: that map and the files it names.
-- Dimension analyzers, `model: opus`: `correctness`, `error-handling`, `security`, `data-integrity`, `performance`, `concurrency`. Input: all map files; under ~15 source files pair them: `correctness+error-handling`, `security+data-integrity`, `performance+concurrency`.
+All `sonnet`, all read-only, each writing `findings-<name>.json`:
+- Area analyzers, one per map file, reading that map and the files it names.
+- Dimension analyzers, reading all maps: `correctness`, `error-handling`, `security`, `data-integrity`, `performance`, `concurrency`. On a small project pair them.
 
-Prompt `references/analyzer-prompt.md`, schema `references/finding-schema.md`. Each writes `.workflow/audit/findings-<name>.json`, returns ≤5 lines with counts.
+Brief: you are auditing for real defects — wrong results, crashes, data corruption, security holes, unhandled errors, races, hot-path performance traps, dead code that hides a bug. Report nothing else: no features, no style or naming. Zero findings is a valid result.
+
+Finding schema, a JSON array of objects:
+`id` (`<area>-<dimension>-<n>`), `title`, `file`, `line` (first line of the offending code; open the file, never guess), `evidence` (quote, ≤3 lines), `root_cause`, `severity_guess`, `dimension`, `reproduce` (a concrete safe call or command, else "read-only reasoning").
 
 ### 3. Verify
-`Merge findings` (`model: sonnet`, `references/report-prompt.md`) merges `findings-*.json` into `all-findings.json`: one entry per defect (same file, same broken behaviour, lines ±3), not per title. Then one `Verify findings <n>` (`model: opus`, `references/verifier-prompt.md`) per 10 findings → `verified-<n>.json`. Verdicts: CONFIRMED, PLAUSIBLE, REJECTED (with reason).
+A `sonnet` agent merges `findings-*.json` into `all-findings.json`: one entry per defect, not per title — same file, lines within ±3, same broken behaviour judged from evidence and root cause (different defects at one line stay separate). It keeps the clearest title, strongest evidence, highest severity, joins dimensions, records `merged_from`, and numbers survivors `AUD-1..n`. It reads only the findings files.
+
+Then `sonnet` verifiers, one per slice of about ten findings, write `verified-<n>.json`. They are adversarial: try to disprove each finding by opening the cited code and its callers, and run `reproduce` only if it is safe and cheap (pure call, read-only). Verdict plus reason per finding: CONFIRMED (observed, or the code plainly entails it), PLAUSIBLE (likely, but proof needs something forbidden such as an install; say what would prove it), REJECTED (say exactly why the claim is wrong). Fix an off line number; keep or adjust severity by the rules below; add `effort` (S/M/L). Verifiers never modify project code or install anything; scratch goes under `.workflow/audit/scratch/`. They don't add findings, trust the analyzer's word, or reject because a fix is hard.
 
 ### 4. Report
-`Write audit report` (`model: opus`, same prompt file) writes `.workflow/audit/YYYY-MM-DD-audit.md`. Findings sharing a root cause fold into one `AUD-n`: highest severity, folded ids beneath, no row or section. Part 1, summary table, Critical first, one row per survivor: `| AUD-n | Severity | Confidence | path:line | title |`. Part 2, `#### AUD-n — title` sections by severity: Severity, Confidence (verdict word), Effort, Location `path:line`, Evidence, Root cause, Affected areas, Folded. Rejected findings in an appendix. Returns the path and top 10 rows, relayed unopened.
-🛑 Offer: "Next: `my-skill-masterplan` with this report as input."
+One `opus` agent writes `.workflow/audit/YYYY-MM-DD-audit.md` from the `verified-*.json` files (not the source). Opus here because folding findings by root cause and ranking them is a judgement across the whole system; on a small audit sonnet is enough.
+- Fold findings that share a root cause (fixing one fixes the other, even across files) into one `AUD-n`: lowest id, highest severity, strongest verdict, smallest effort, folded ids listed beneath, no row or section of their own. Rejected findings are never folded; they go to the appendix.
+- Part 1, summary table, Critical first: `| AUD-n | Severity | Confidence | path:line | title |`.
+- Part 2, `#### AUD-n — title` sections grouped by severity: Severity, Confidence (verdict word), Effort, Location (`path:line` plus function), Evidence, Root cause, Affected areas, Folded.
+- Part 3, appendix of rejected findings with the verifier's reason.
+
+It returns the path and the top 10 table rows; relay them unopened. Offer: "Next: `my-skill-masterplan` with this report as input."
 
 ## Hard rules
-- No feature suggestions. Banned anywhere in the report, even negated: "consider adding", "would be nice", "enhancement", "new feature", "nice to have".
-- Refactor suggestions only where behaviour is wrong.
-- Every finding cites `path:line`. No citation, no finding.
+- Verified findings only; every finding cites `path:line`. No citation, no finding.
+- No feature suggestions anywhere in the report, even negated ("consider adding", "would be nice", "enhancement", "new feature", "nice to have" are banned). Suggest a refactor only where behaviour is wrong.
 - Severity: Critical = data loss, security hole, or crash on a main path. High = wrong result on a common path. Medium = wrong on an edge path or degraded. Low = cosmetic, logging, dead code.

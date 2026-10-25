@@ -1,12 +1,13 @@
 # Running inside Cloudroom
 
-Cloudroom forbids native sub-agents (Agent tool, SendMessage) and AskUserQuestion. Every orchestrate rule still holds; only the primitive changes.
+Cloudroom hides native sub-agents (Agent tool, SendMessage), so never use them there. Every orchestrate rule still holds; only the primitive changes.
 
 ## Detect the runtime
 
-1. `CLOUDROOM_WORKLOAD` set → Cloud thread, CLI `cloudroom`. Children run in the same sandbox and folder.
-2. Else `ROOM_THREAD_ID` set → Local thread, CLI `room-cli` (check `room-cli thread spawn --help`).
-3. Else → plain Claude Code: ignore this file.
+- `ROOM_THREAD_ID` set → Cloudroom thread: Cloud if `CLOUDROOM_WORKLOAD` is also set, else Local.
+- Unset → plain Claude Code: ignore this file.
+
+The CLI is `room-cli` in both; use the legacy `cloudroom` name only if `room-cli` is missing.
 
 ## Model ids (the one place they are mapped)
 
@@ -15,49 +16,43 @@ Cloudroom forbids native sub-agents (Agent tool, SendMessage) and AskUserQuestio
 | haiku | `claude-haiku-5-5` |
 | sonnet | `claude-sonnet-5-5` |
 | opus | `claude-opus-5-5` |
-| fable | `claude-fable-5-1`, opt-in only (orchestrate model routing) |
+| fable | `claude-fable-5-1`, opt-in only (orchestrate's model routing) |
 
 ## Primitive mapping
 
 | Claude Code | Cloudroom |
 |---|---|
-| Agent dispatch | Write the filled dispatch template to `.workflow/dispatch/<task-name>.md`, then spawn (commands below). Keep the returned thread `id` in STATE.md. |
+| Agent dispatch | Write the filled dispatch template to `.workflow/dispatch/<task-name>.md`, spawn it (below), keep the returned thread `id` in STATE.md. |
 | `model` | `--model <id>` from the table above, always passed. |
 | Task description | `--title "<Verb object>"`. |
-| `subagent_type` | None. Explore/read-only → CONSTRAINTS says `read-only`; general-purpose → CONSTRAINTS names where it may write. |
-| `run_in_background: true` | Spawn and keep orchestrating; act on each completion message as it arrives. |
-| Foreground batch (`run_in_background: false`) | Spawn every thread of the batch, then end your turn (or do orchestrator-only work) until a completion message has arrived for each one. Never poll. |
-| SendMessage / resume | `cloudroom thread tell <id> "<text>"` (`room-cli thread tell <id> "<text>"`). Same rule: only to answer a question or apply review findings. |
-| Agent result | Arrives automatically as `[Cloudroom] Child thread … completed: <final reply>`. Full text: `cloudroom thread output <id>`. |
-| 529/5xx re-dispatch (rule 8) | A child that errors or completes without its output file: `cloudroom thread stop <id>`, spawn a fresh one once; a second failure drops a model. |
-| AskUserQuestion | Plain chat: ≤4 numbered questions, each with lettered options, recommended first and marked "(Recommended)". Then end the turn and wait for the reply. |
-| Worktrees | Unchanged; children share the filesystem. Give the absolute worktree path in ROLE. |
+| `subagent_type` | None: CONSTRAINTS says `read-only` or names where it may write. |
+| Background | Spawn and keep orchestrating; act on each completion message as it arrives. |
+| Foreground batch | Spawn every thread of the batch, then end your turn (or do orchestrator-only work) until each has reported. Never poll (`room-cli thread wait` exists; don't use it). |
+| SendMessage / resume | `room-cli thread tell <id> "<text>"` (Cloud queues it); only to answer a question or hand over review findings. |
+| Agent result | Arrives as a message with the child's final reply. Full text: `room-cli thread output <id>`. |
+| Overload fallback | A child that errors or finishes without its output (own-sandbox Cloud child: no pushed branch or results in its reply): `room-cli thread stop <id>`, spawn a fresh one once; a second failure switches model. |
+| AskUserQuestion | Use it as usual; Cloudroom shows a question card. If the tool is missing: plain chat, ≤4 numbered questions with lettered options, recommended first and marked "(Recommended)", then end the turn and wait. |
+| Worktrees | Unchanged when the child shares your folder; give the absolute worktree path in ROLE. |
 | TodoWrite / TaskCreate | Unchanged for the orchestrator's own list; STATE.md stays the source of truth. |
 
-## Spawn commands
+## Spawn command
 
-Cloud thread:
-
-```bash
-cloudroom thread spawn --provider claude-code --model claude-opus-5-5 \
-  --title "Verify auth findings" --prompt-file .workflow/dispatch/verify-auth-findings.md
-```
-
-Prints JSON with `id`. Other commands: `cloudroom thread list | output <id> | tell <id> TEXT | stop <id>`.
-
-Local thread (room-cli has no `--prompt-file`):
+Same for Local and Cloud (there is no `--prompt-file`):
 
 ```bash
 room-cli thread spawn --parent-self --project "$ROOM_PROJECT_ID" --provider claude-code \
-  --model claude-opus-5-5 --title "Verify auth findings" --json \
+  --model claude-sonnet-5-5 --title "Verify auth findings" --json \
   --prompt "$(cat .workflow/dispatch/verify-auth-findings.md)"
 ```
 
-If the child must share your folder and lands in another environment, add `--environment <your workspace path or environment id>`.
+Prints JSON with `id`. Also: `room-cli thread output <id> | tell <id> TEXT | stop <id> | list --parent-thread <id>`.
+
+- Local: add `--environment "$ROOM_ENVIRONMENT_ID"` so the child works in your folder.
+- Cloud: a child gets its own sandbox with a copy of your code (commits and uncommitted changes) on its own branch. Add `--shared-sandbox` when it writes shared `.workflow/` files or code in place (the usual case). Without it the child cannot write your files, so its OUTPUT CONTRACT says commit and push, or return the results in its reply.
 
 ## The sub-agent line
 
-Children inherit `~/.claude/CLAUDE.md`, which tells them to orchestrate. Every Cloudroom dispatch therefore starts with this line, above ROLE (also in `dispatch-template.md`):
+Children inherit `~/.claude/CLAUDE.md`, which tells them to orchestrate, so every Cloudroom dispatch starts with this line above ROLE:
 
 > SUB-AGENT: You are a sub-agent thread spawned by an orchestrator. Do the work yourself: do not spawn threads, do not use my-skill-orchestrate, do not ask questions.
 

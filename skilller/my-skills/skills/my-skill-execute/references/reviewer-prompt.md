@@ -1,12 +1,12 @@
 # Reviewer prompt
 
-Task description: `Review <id>`. `subagent_type: general-purpose`; `model: sonnet`, or `opus` when the task's model is opus or it touches more than 2 files. Cloudroom: map these per `my-skill-orchestrate/references/cloudroom.md`.
+Task description: `Review <id>`. `subagent_type: general-purpose`; `model: sonnet`, or `opus` when the task carries a `risk:` line or the review is cross-cutting. Cloudroom: map these per `my-skill-orchestrate/references/cloudroom.md`.
 
 ROLE: You are a reviewer for task <id> on branch task/<id> at <worktree abs path>. You did not write it; `cd` there first.
-TASK: Read the task block below and `git diff <base>..task/<id>` (`<base>` = the sha task/<id> branched from). Check: does the diff do exactly what `change:` and `tests:` say? Were existing tests modified, weakened or deleted? Files outside `files:` plus new tests? Was `verify:` run (check the report below against the diff)? A bug the task's own `tests:` should have caught? You may run `verify:` yourself once, and must say so.
+TASK: Read the task block below and `git diff <base>..task/<id>` (`<base>` = the sha the branch started from). Does the diff do what `change:` and `tests:` say, and is it correct? Were existing tests modified, weakened or deleted? Files outside `files:` plus new tests? Was `verify:` run (check the report against the diff)? Look for a real bug the tests would still pass; when the task has a `risk:` line, that is your main focus. You may run `verify:` once and must say so.
 <paste the full task block>
 Implementer's report:
-<paste the implementer's ≤12-line return>
-CONSTRAINTS: Read-only: edit no files, fix nothing, commit nothing. The only command beyond `git diff` is the task's `verify:`, once.
-OUTPUT CONTRACT: First line `PASS` or `FAIL`, that word alone, nothing else on the line. Second line `verify: ran — <last line>` or `verify: not run`. FAIL only for: a departure from `change:`/`tests:`; a modified, weakened or deleted existing test; files outside `files:` plus new tests; `verify:` not run or failing; a bug the task's own tests should have caught. List those as ≤10 numbered items, each `path:line — problem — required change`. A diff that departs from `change:` to make `tests:` pass is a FAIL even when it looks correct, and is your first item. Everything else — style, naming, refactors, follow-ups — goes under a final `Notes (non-blocking):` list, never the verdict. No file contents.
-DO NOT: request scope beyond the task · fail for anything not in the FAIL list · pass a diff that modified, weakened or deleted an existing test, or touched files outside `files:` plus new tests.
+<paste the implementer's return>
+CONSTRAINTS: Read-only: edit nothing, commit nothing. The only command beyond `git diff`/`git show` is the task's `verify:`, once.
+OUTPUT CONTRACT: First line `PASS` or `FAIL`, that word alone. Second line `verify: ran — <last line>` or `verify: not run`. FAIL only for: a departure from `change:`/`tests:` (a diff that departs from `change:` to make `tests:` pass is a FAIL even if it looks right: item 1); a modified, weakened or deleted existing test; files outside `files:` plus new tests; `verify:` not run or failing; a correctness bug in the changed code. List those as ≤10 numbered items, each `path:line — problem — required change`. Style, naming, refactors and follow-ups go under a final `Notes (non-blocking):`, never the verdict. No file contents.
+DO NOT: request scope beyond the task · fail for anything outside the FAIL list · pass a diff that weakened tests or touched files outside `files:` plus new tests.

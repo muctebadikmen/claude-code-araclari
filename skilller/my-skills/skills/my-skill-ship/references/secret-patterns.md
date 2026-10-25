@@ -1,18 +1,18 @@
 # Secret patterns
 
-Used by the two scan agents dispatched in ship step 2. Exclusions for both: `node_modules/`, `vendor/`, lockfiles, `.workflow/` scratch (`research/`, `dispatch/`, `audit/`, `runs/`), `.worktrees/`, `.git/`, `**/secret-patterns.md`, build output, binaries, and logs (`*.log`, `*.jsonl`).
+Used by the two scan agents in ship step 2. Exclude in both: `node_modules/`, `vendor/`, lockfiles, `.workflow/` scratch (`research/`, `dispatch/`, `audit/`, `runs/`), `.worktrees/`, `.git/`, `**/secret-patterns.md`, build output, binaries, logs (`*.log`, `*.jsonl`).
 
-## Sensitive files (glob) — `Find sensitive files` (haiku)
+## Sensitive files (glob): `Find sensitive files` (haiku)
 
-`**/.env`, `**/.env.*` (except `.env.example`, `.env.sample`), `**/*.pem`, `**/*.key`, `**/*.cert`, `**/*.crt`, `**/*.p12`, `**/*.pfx`, `**/*credentials*`, `**/*secret*`, `**/id_rsa*`, `**/id_ed25519*`, `**/.htpasswd`, `**/*.keystore`, `**/*.jks`, `**/serviceAccount*.json`
+`**/.env`, `**/.env.*` (not `.env.example`/`.env.sample`), `**/*.pem`, `**/*.key`, `**/*.cert`, `**/*.crt`, `**/*.p12`, `**/*.pfx`, `**/*.keystore`, `**/*.jks`, `**/*credentials*`, `**/*secret*`, `**/id_rsa*`, `**/id_ed25519*`, `**/.htpasswd`, `**/serviceAccount*.json`
 
-Report each match as `path — sensitive file (<glob>)` plus `tracked` only when `git ls-files --error-unmatch <path>` exits 0, else `untracked`. Do not open the file.
+Report `path — sensitive file (<glob>)` plus `tracked` if `git ls-files --error-unmatch <path>` exits 0, else `untracked`. Don't open the file.
 
-## In-code patterns (extended regex, case-insensitive where sensible) — `Grep for hardcoded secrets` (sonnet)
+## In-code patterns (extended regex): `Grep for hardcoded secrets` (sonnet)
 
 | name | regex |
 |---|---|
-| openai-style key | `sk-[A-Za-z0-9_-]{8,}` |
+| openai-style key | `(^|[^A-Za-z0-9_])sk-[A-Za-z0-9_-]{20,}` |
 | stripe key | `[sp]k_(live|test)_[A-Za-z0-9]{8,}` |
 | aws access key | `AKIA[0-9A-Z]{16}` |
 | aws secret | `aws_secret_access_key` |
@@ -27,8 +27,10 @@ Report each match as `path — sensitive file (<glob>)` plus `tracked` only when
 | github token | `gh[pousr]_[A-Za-z0-9]{36,}` |
 | slack token | `xox[baprs]-[A-Za-z0-9-]{10,}` |
 
-Run the grep with `-l` or `-n` piped through a filter that keeps only the path and line number (for example `grep -rnE -e <regex> . | cut -d: -f1,2`; the `-e` keeps a regex that starts with `-` from being read as an option). Never print matching lines to your own output.
+Run with output cut to path and line, e.g. `grep -rnE -e <regex> . | cut -d: -f1,2` (`-e` keeps a regex starting with `-` from being read as an option); never print matching lines. The `sk-` pattern needs the leading non-word guard: without it ordinary words such as `task-notification` match.
 
-## Report format (both agents)
+A hit that is plainly not a secret (an identifier, prose, an obvious placeholder such as `sk-xxxx`, a test fixture) is reported as `path:line — <name> (false positive: <reason>)`, reason in a few words, no value. Doubt means a finding.
 
-One line per finding: `path:line — <name>` using the name column above (a line matching several patterns lists the first). Never include the matched text: no quote, no prefix such as `sk-live-…`, no suffix, no last-4, no character count, no paraphrase of what the value looks like. If nothing matches, return the single word `clean`.
+## Report format
+
+One line per finding: `path:line — <name>` (first matching name if several). Never the matched text: no quote, prefix, suffix, last-4, length or description of the value. Nothing found: `clean`.

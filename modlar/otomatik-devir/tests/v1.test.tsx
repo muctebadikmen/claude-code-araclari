@@ -9,6 +9,8 @@ import {
   HANDED_PREFIX,
   handoffFile,
   inTurnHandoff,
+  LONG_CHAT_SECTION_ID,
+  longChatNote,
   MAX_HANDOFF_BLOCKS,
   nextMessageNote,
   READY_BAND,
@@ -669,5 +671,73 @@ describe('otomatik-devir v1', () => {
     await turnBegin($)
     expect((await startSession($)).deny).toBeUndefined()
     expect(callsOf(world, START)).toHaveLength(1)
+  })
+})
+
+describe('long-chat note', () => {
+  // The engine's own sections beneath the mod: a shared one, then a session one.
+  const base = (on: any) =>
+    on('prompt.compose', () => ({
+      sections: [
+        { id: 'intro', text: 'giriş', scope: 'shared' },
+        { id: 'env', text: 'ortam', scope: 'session' },
+      ],
+    }))
+  const sections = async ($: any) => (
+      await $.prompt.compose({
+        model: 'claude-test',
+        promptModel: 'claude-test',
+        surfaces: ['terminal'],
+        tools: [],
+        outputStyle: null,
+        traits: [],
+      })
+    ).sections as { id: string; text: string; scope: string }[]
+
+  test('(a) mod açık + idle: son bölüm otomatik-devir, %60 ve /devir simdi içerir', async ($, on) => {
+    setup(on, { esik: 60 })
+    base(on)
+    await start($)
+    const got = await sections($)
+    expect(got.map(s => s.id)).toEqual(['intro', 'env', 'otomatik-devir'])
+    const last = got.at(-1)!
+    expect(last.id).toBe(LONG_CHAT_SECTION_ID)
+    expect(last.scope).toBe('session')
+    expect(last.text).toBe(longChatNote(60))
+    expect(last.text).toContain('%60')
+    expect(last.text).toContain('/devir simdi')
+  })
+
+  test('(b) acik:false: bölüm eklenmez', async ($, on) => {
+    setup(on, { esik: 60, acik: false })
+    base(on)
+    await start($)
+    expect((await sections($)).map(s => s.id)).toEqual(['intro', 'env'])
+  })
+
+  test('(c) aşama done: bölüm eklenmez', async ($, on) => {
+    const { world, clock } = setup(on, { esik: 60 })
+    base(on)
+    await start($)
+    expect((await sections($)).at(-1)?.id).toBe(LONG_CHAT_SECTION_ID)
+    world.percent = 30
+    await typed($, 'iş')
+    await turnBegin($)
+    world.percent = 70
+    await bash($)
+    writeFile(world, clock)
+    expect((await startSession($)).deny).toBeUndefined()
+    expect(await phase($)).toContain('aşama: done')
+    expect((await sections($)).map(s => s.id)).toEqual(['intro', 'env'])
+  })
+
+  test('(d) dene 15: metin %15 içerir', async ($, on) => {
+    setup(on, { esik: 60 })
+    base(on)
+    await start($)
+    await devir($, 'dene 15')
+    const text = (await sections($)).at(-1)!.text
+    expect(text).toContain('%15')
+    expect(text).not.toContain('%60')
   })
 })

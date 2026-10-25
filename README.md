@@ -7,7 +7,7 @@ Kendi işimde her gün kullandığım Claude Code modları. Kod yazmadan, Claude
 
 | Mod | Ne yapar |
 |---|---|
-| **otomatik-devir** | Sohbetin bağlamı dolmaya yaklaşınca Claude'a çalışan işleri bitirtir, yeni iş başlattırmaz, devam notu yazdırır ve işi yeni bir sohbette kaldığı yerden sürdürür. |
+| **otomatik-devir** | Orkestra modu: `/otomatik-devir:devir-otonom <görev>` yazdığınız sohbet ana sohbet olur; iş, bağlamı dolunca devam notu yazan iç içe alt sohbetlere tıklamasız ve sırayla bölünür, zincir bitince ana sohbet bir özet yazar. Normal sohbetler devredilmez. |
 | **ilerleme-cubugu** | Süren işin ilerlemesini yazı kutusunun üstünde çubuk olarak gösterir: kaç adımın bittiği, yüzde kaç olduğu ve şu an hangi adımda olunduğu. |
 
 > "Mod", Claude Code'un içine takılan küçük bir eklentidir. Claude Code'un görünüşünü ve davranışını değiştirir.

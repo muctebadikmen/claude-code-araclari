@@ -233,6 +233,9 @@ const turnEnd = ($: any, isAborted = false) =>
 const bash = ($: any) => $.tool.call({ tool: 'Bash', command: 'ls' })
 const stop = ($: any, tasks: Task[] | undefined = []) =>
   $.classic.Stop({ stop_hook_active: false, background_tasks: tasks })
+/** A Stop after the model's reply `said`. */
+const stopSaid = ($: any, said: string) =>
+  $.classic.Stop({ stop_hook_active: false, background_tasks: [], last_assistant_message: said })
 const callsOf = (world: World, tool: string) => world.calls.filter((c: any) => c.tool === tool)
 const startSession = ($: any, extra: Record<string, unknown> = {}) =>
   $.tool.call({
@@ -765,8 +768,8 @@ describe('orkestra ana', () => {
     const end = orkestraEndText('kapatildi', 1, undefined, undefined, childId(k))
     expect((await bash($)).context).toEqual([end])
     expect((await bash($)).context ?? []).toEqual([])
-    // The tool result of this turn already carried the end: the Stop does not repeat it.
-    expect((await stop($, [])).block).toBeUndefined()
+    // The tool result of this turn already carried the end and a summary followed: the Stop does not repeat it.
+    expect((await stopSaid($, 'Özet: zincir kapatıldı.')).block).toBeUndefined()
     expect(rec(world, 'local_main')).toMatchObject({ ended: 'kapatildi' })
     expect((await stop($, [])).block).toBeUndefined()
     expect((await startSession($)).deny).toBe(ORKESTRA_END_DENY)
@@ -824,7 +827,7 @@ describe('orkestra ana', () => {
     const { world, clock } = setup(on)
     const once = async (localId: string, kind: string, end: string) => {
       expect((await bash($)).context).toEqual([end])
-      expect((await stop($, [])).block).toBeUndefined()
+      expect((await stopSaid($, 'Özet: zincir bitti.')).block).toBeUndefined()
       expect(rec(world, localId)).toMatchObject({ ended: kind })
       expect((await stop($, [])).block).toBeUndefined()
       expect((await bash($)).context ?? []).toEqual([])
@@ -865,8 +868,35 @@ describe('orkestra ana', () => {
     const end7 = orkestraEndText('kapatildi', 1, undefined, undefined, childId(k7))
     expect((await bash($)).context).toEqual([end7])
     await turnBegin($)
-    expect((await stop($, [])).block).toBe(end7)
+    expect((await stopSaid($, 'Özet: zincir bitti.')).block).toBe(end7)
     expect(rec(world, 'local_m7')).toMatchObject({ ended: 'kapatildi' })
+
+    // The tool result carried the end but the turn ends on an empty reply: the Stop gives it once.
+    const k8 = await chainUp($, world, 'm8')
+    seedChild(world, clock, k8, 'local_m8', 1, 'cancelled')
+    const end8 = orkestraEndText('kapatildi', 1, undefined, undefined, childId(k8))
+    expect((await bash($)).context).toEqual([end8])
+    expect((await stopSaid($, '  ')).block).toBe(end8)
+    expect(rec(world, 'local_m8')).toMatchObject({ ended: 'kapatildi' })
+    expect((await stopSaid($, 'Özet: zincir kapatıldı.')).block).toBeUndefined()
+
+    // Closed while paused: a machine turn's tool result does not carry the end; the typed message gets it once.
+    const k9 = await chainUp($, world, 'm9')
+    seedChild(world, clock, k9, 'local_m9', 1, 'working')
+    await turnEnd($, true)
+    seedAyar(world, clock, 'local_m9', { isClosed: true, at: clock.now() })
+    await machine($, 'görev bildirimi')
+    await turnBegin($)
+    expect((await bash($)).context ?? []).toEqual([])
+    expect((await stopSaid($, 'Bildirim okundu.')).block).toBeUndefined()
+    expect(rec(world, 'local_m9')).toMatchObject({ ended: 'kapatildi' })
+    await turnEnd($)
+    const end9 = orkestraEndText('kapatildi', 1, undefined, undefined, childId(k9))
+    await typed($, 'devam')
+    expect(world.typed.at(-1)?.context.filter(c => c === end9)).toHaveLength(1)
+    await turnBegin($)
+    expect((await bash($)).context ?? []).not.toContain(end9)
+    expect((await stopSaid($, 'Özet: zincir kapatıldı.')).block).toBeUndefined()
   })
 
   test('(A19) ana sohbet %80 ve üstü: aktarım noktasında dolu sonu; %79 aktarım; çocuk çalışırken bekleme; kısa metinler', async ($, on) => {

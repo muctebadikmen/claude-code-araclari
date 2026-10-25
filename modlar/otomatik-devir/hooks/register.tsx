@@ -1910,6 +1910,8 @@ const orkestraNote = async ($: EngineInterface): Promise<string | undefined> => 
     if (got === undefined) return undefined
     const { decision } = got
     if (decision.kind !== 'start' && decision.kind !== 'relay' && decision.kind !== 'end') return undefined
+    // A paused chain hears its end only through the next typed message (O7).
+    if (decision.kind === 'end' && !got.main.isHeld) return undefined
     const key = `${decision.n}:${decision.kind}`
     if (orkestraNoted === key) return undefined
     orkestraNoted = key
@@ -2420,8 +2422,11 @@ export const register: Register = on => {
           await patchMain($, main.localId, { ended: decision.end })
           later($, () => refreshStatus($))
           // A paused main chat (O21): no block; its next typed message gets the end text (O7).
-          // A tool result of this turn already carried it (O6): no second announcement.
-          if (!main.isHeld || orkestraEndTold === `${runningTurnId}:${decision.n}`) return next(e)
+          // A tool result of this turn already carried it (O6) and a reply followed: no second announcement.
+          if (!main.isHeld) return next(e)
+          if (orkestraEndTold === `${runningTurnId}:${decision.n}` && (e.last_assistant_message?.trim() ?? '') !== '') {
+            return next(e)
+          }
 
           return { block: decision.text }
         case 'stalled':

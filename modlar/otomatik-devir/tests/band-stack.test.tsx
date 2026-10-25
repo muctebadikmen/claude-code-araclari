@@ -1,5 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+import { READY_BAND } from '../hooks/register'
+
 // Cross-mod check of the shared AbovePrompt band: the REAL otomatik-devir (the
 // plugin under test) in one chain with the two other mods of the pack.
 //
@@ -14,7 +16,6 @@ import { expect, mock, test } from 'claude-code/testing'
 // next(e): whatever stands beneath it is not drawn.
 
 const SKILL = 'my-skill-handoff'
-const ANSWER = 'Devam notu yazıldı.\n\n```\nDevam et: adım 3\n```\n'
 const BAND = {
   hasSurvey: false,
   isWorking: false,
@@ -66,16 +67,33 @@ const walk = (node: any, out: any[] = []): any[] => {
   return out
 }
 
+/** The text a drawn node holds, joined from its string children. */
+const textOf = (node: any): string | undefined => {
+  const parts = [node?.props?.children, ...(node?.children ?? [])].filter(part => typeof part === 'string')
+
+  return parts.length === 0 ? undefined : parts.join('')
+}
+
 const setup = (on: any) => {
-  const world = { sid: 's1', percent: 50, sent: [] as string[], ran: [] as string[], tools: [] as string[] }
+  const world = {
+    sid: 's1',
+    percent: 50,
+    sent: [] as string[],
+    ran: [] as string[],
+    tools: [] as string[],
+    files: {} as Record<string, { text: string; mtimeMs: number }>,
+  }
   const clock = mock.clock(on, { now: 1_000_000 })
-  mock.store(on, { esik: 40, mod: 'sor' })
+  mock.store(on, { esik: 1 })
   mock.env(on, { HOME: '/home/test' })
   // Stands in for core beneath every plugin.
   on('ui.render', { component: 'AbovePrompt' }, ($: any, e: any) => $.ui.resolve(e).Box({ key: 'below' }))
   on('session.start', ($: any, e: any) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: world.sid }))
   on('session.root', () => ({ value: '/proj' }))
+  on('session.cwd', () => ({ value: '/proj' }))
+  // Stands in for core beneath the Stop hooks: no block, the turn may end.
+  on('classic.Stop', () => ({}))
   on('session.usage', () => ({
     value: { startedAt: 0, context: { window: 100, percent: world.percent }, rateLimits: [] },
   }))
@@ -103,13 +121,22 @@ const setup = (on: any) => {
     return { result: [], text: '{}' }
   })
   on('fs.exists', () => ({ value: false }))
+  on('fs.stat', ($: any, e: any) => {
+    const file = world.files[e.path]
+    if (file === undefined) throw new Error('ENOENT')
+    return { value: { kind: 'file', size: file.text.length, mtimeMs: file.mtimeMs, isLink: false } }
+  })
+  on('fs.read', ($: any, e: any) => {
+    const file = world.files[e.path]
+    if (file === undefined) throw new Error('ENOENT')
+    return { value: file.text }
+  })
   on('prompt.submit', ($: any, e: any) => {
     world.sent.push(e.text)
     return { text: e.text }
   })
   on('ui.status', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
-  on('ui.copy', () => ({ value: { isCopied: true } }))
   on('ui.toast', () => ({ value: undefined }))
 
   return { world, clock }
@@ -123,11 +150,17 @@ const devir = ($: any, args: string) =>
     presentation: { isFullscreen: false, columns: 100 },
   })
 
-/** /devir simdi, then the handoff turn: ends at awaiting_choice (mode sor). */
-const toAwaitingChoice = async ($: any, clock: any) => {
-  await devir($, 'simdi')
+/**
+ * Trips a handoff in a machine turn (esik 1, a model tool call), writes the
+ * handoff file as the model would, then lets the main turn end: the Stop hook
+ * sees the closed gate and a fresh file and moves the phase to `ready`.
+ */
+const toReady = async ($: any, world: any, clock: any) => {
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
   await clock.advance(100)
-  await $.turn.complete({ answer: ANSWER, durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  world.files['/proj/.workflow/handoff/s1.md'] = { text: 'Devam notu\n\nAdım 3', mtimeMs: clock.now() }
+  await clock.advance(100)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
 }
 
 const OPTIONS = { plugins: [ilerlemeStandIn, blastStandIn] }
@@ -146,69 +179,56 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(idleAll.filter(n => n.props?.autoFocus === true)).toHaveLength(0)
     await idle.unmount()
 
-    // The handover question: all three rows, the drawing beneath exactly once, last.
-    await toAwaitingChoice($, clock)
+    // Ready: the one READY_BAND row first, the two others and the drawing beneath intact.
+    await toReady($, world, clock)
     const ui = await mount()
     const all = walk(await ui.drawn())
+    const rows = all.filter(n => textOf(n) === READY_BAND)
+    expect(rows).toHaveLength(1)
+    const rowAt = all.indexOf(rows[0])
+    expect(all.slice(0, rowAt).filter(n => n.type === 'Button')).toHaveLength(0)
+    expect(all.slice(0, rowAt).filter(n => n.props?.key === 'below')).toHaveLength(0)
     const buttons = all.filter(n => n.type === 'Button')
-    expect(buttons.map(n => [n.press.plugin, n.props.key])).toContainEqual(['otomatik-devir', 'gec'])
-    expect(buttons.map(n => [n.press.plugin, n.props.key])).toContainEqual(['otomatik-devir', 'bekle'])
-    expect(buttons.map(n => [n.press.plugin, n.props.key])).toContainEqual(['ilerleme-cubugu', 'toggle'])
-    expect(buttons).toHaveLength(3)
+    expect(buttons.map(n => [n.press.plugin, n.props.key])).toEqual([['ilerleme-cubugu', 'toggle']])
     const belowAt = all.findIndex(n => n.props?.key === 'below')
     expect(all.filter(n => n.props?.key === 'below')).toHaveLength(1)
     expect(belowAt).toBe(all.length - 1)
 
-    // Focus: one autoFocus in the whole band, on otomatik-devir's [Geç].
-    const focused = all.filter(n => n.props?.autoFocus === true)
-    expect(focused.map(n => [n.press.plugin, n.props.key])).toEqual([['otomatik-devir', 'gec']])
+    // No button of its own: no autoFocus and no hotkey anywhere in the band.
+    expect(all.filter(n => n.props?.autoFocus === true)).toHaveLength(0)
+    expect(buttons.filter(n => n.props.hotkey !== undefined)).toHaveLength(0)
 
-    // Hotkeys: no two Buttons share one; letters are otomatik-devir's.
-    const hotkeys = buttons.filter(n => n.props.hotkey !== undefined).map(n => n.props.hotkey)
-    expect(new Set(hotkeys).size).toBe(hotkeys.length)
-    for (const n of buttons) {
-      if (n.press.plugin === 'otomatik-devir') expect(n.props.hotkey).toMatch(/^[a-z]$/)
-      if (n.press.plugin === 'ilerleme-cubugu') expect(n.props.hotkey).toBeUndefined()
-    }
-
-    // Mid-turn a blast-radius hold takes the band: the question steps aside,
-    // so exactly one autoFocus (blast-radius' Cancel) and no 'gec', in any order.
+    // Mid-turn a blast-radius hold takes the band: the row steps aside, so
+    // exactly one autoFocus (blast-radius' Cancel) and no READY_BAND row.
     await ui.redraw({ ...BAND, isWorking: true })
     const busy = walk(await ui.drawn())
-    expect(busy.filter(n => n.props?.key === 'gec')).toHaveLength(0)
+    expect(busy.filter(n => textOf(n) === READY_BAND)).toHaveLength(0)
     expect(busy.filter(n => n.props?.autoFocus === true).map(n => [n.press.plugin, n.props.key])).toEqual([
       ['blast-radius', 'cancel'],
     ])
     await ui.redraw(BAND)
 
-    // Presses reach the plugin that drew the Button, nested or not. The
-    // handoff went out as the one message; nothing more is sent on the press.
-    expect(world.ran).toEqual([])
-    expect(world.sent).toHaveLength(1)
-    await ui.press({ key: 'gec' })
-    await clock.advance(100)
-    expect(world.ran).toEqual([])
-    expect(world.tools).toContain('mcp__ccd_session__start_session')
-    expect(world.sent).toHaveLength(1)
-
-    // After the switch the question is gone; the others and the drawing beneath stay.
-    const after = walk(await ui.drawn())
-    expect(after.filter(n => n.type === 'Button').map(n => n.props.key)).not.toContain('gec')
-    expect(after.filter(n => n.props?.key === 'below')).toHaveLength(1)
+    // Back at rest the row is drawn again, with the others and the drawing beneath.
+    const again = walk(await ui.drawn())
+    expect(again.filter(n => textOf(n) === READY_BAND)).toHaveLength(1)
+    expect(again.filter(n => n.type === 'Button').map(n => n.props.key)).toEqual(['toggle'])
+    expect(again.filter(n => n.props?.key === 'below')).toHaveLength(1)
     await ui.unmount()
   })
 }
 
 test('bant: anket varken üçü de yalnızca alttaki çizimi döndürür', OPTIONS, async ($, on) => {
-  const { clock } = setup(on)
+  const { world, clock } = setup(on)
   await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
-  await toAwaitingChoice($, clock)
+  await toReady($, world, clock)
   const ui = await $.ui.mount({
     plugin: 'otomatik-devir',
     surface: 'terminal',
     component: 'AbovePrompt',
     props: { ...BAND, hasSurvey: true },
   })
+  const drawn = walk(await ui.drawn())
+  expect(drawn.filter(n => textOf(n) === READY_BAND)).toHaveLength(0)
   expect(await ui.drawn()).toMatchObject({ type: 'Box', props: { key: 'below' } })
   await ui.unmount()
 })

@@ -522,55 +522,182 @@ type ToolNext = (input: ToolCallArgs) => Promise<{
   text?: string
   context?: readonly string[]
 }>
+
+// ---------------------------------------------------------------------------
+// The drain (S4): while a handoff drains, no new subagent, Workflow or agent
+// message starts, whoever asks (a subagent, another plugin, the model).
+// ---------------------------------------------------------------------------
+
+const DRAIN_TOOLS: ReadonlySet<string> = new Set(['Agent', 'Task', 'Workflow', 'SendMessage'])
+
+/** A call the drain refuses: SendMessage to another session (`local_...`) is not agent work. */
+const isDrainCall = (call: { tool: string; to?: unknown }): boolean =>
+  DRAIN_TOOLS.has(call.tool) &&
+  !(call.tool === 'SendMessage' && typeof call.to === 'string' && call.to.startsWith('local_'))
+
+const isDrainingNow = async ($: EngineInterface): Promise<boolean> =>
+  isDrainPhase((await currentConv($)).phase)
+
+/**
+ * S6: the model's own start_session during the handoff. A session that
+ * handed off never starts a second child; outside a handoff the call passes
+ * untouched. Only a typed turn (`user_asked`) may start it, only once the
+ * file is written, and the prompt is the file (plus the person's message).
+ * The child stays nested under this chat (Decision 9).
+ */
 const watchModelStart = async (
   $: EngineInterface,
   call: { tool: string } & Record<string, unknown>,
   next: ToolNext,
 ) => {
-  const record = await read($, conv)
   const sid = await $.session.id()
-  if (
-    record !== null &&
-    record.sid === sid &&
-    record.phase === 'done' &&
-    record.startedId !== undefined &&
-    startedInTurn !== undefined &&
-    startedInTurn === runningTurnId &&
-    call.proposal_id === undefined
-  ) {
-    return { deny: `otomatik-devir: devam sohbeti bu turda zaten açıldı (${record.startedId}); ikinci kez açma.` }
+  const handed = await handedOf($, sid)
+  if (handed !== undefined) {
+    return { deny: `otomatik-devir: bu sohbet zaten devredildi (${handed.startedId}); ikinci kez açma.` }
   }
-  const isStart = call.initiation !== 'own_initiative'
-  if (isStart) {
-    const isClaimed = await claim(
-      $,
-      sid,
-      h => h.phase === 'handoff_running' && h.starting === undefined,
-      { starting: runningTurnId ?? 'start' },
-    )
-    if (!isClaimed) {
-      return { deny: 'otomatik-devir: devam sohbeti şu an açılıyor ya da açıldı; ikinci kez açma.' }
-    }
+  const held = await currentConv($)
+  if (!isDrainPhase(held.phase)) return next(call as unknown as ToolCallArgs)
+  if (call.initiation === 'own_initiative' || call.proposal_id !== undefined) return { deny: CARD_DENY }
+  if (!isPersonTurn) {
+    await patchConv($, sid, { isGateClosed: true })
+
+    return { deny: MACHINE_TURN_DENY }
   }
-  const input: { tool: string } & Record<string, unknown> = { ...call }
-  if (input.proposal_id === undefined) {
-    input.context = 'fresh'
-    if (input.title === undefined && held.title !== undefined) input.title = held.title
-    if (typeof input.background !== 'string' || input.background.length < 80) {
-      input.background = CONTINUE_BACKGROUND
-    }
+  const file = held.file ?? handoffFile(await $.session.cwd(), sid)
+  const text = await readFresh($, file, held.handoffAt)
+  if (text === undefined) return { deny: `otomatik-devir: önce devir dosyasını yaz: ${file}` }
+  const isClaimed = await claim($, sid, h => isDrainPhase(h.phase) && h.starting === undefined, {
+    starting: runningTurnId ?? 'start',
+  })
+  if (!isClaimed) return { deny: 'otomatik-devir: devam sohbeti şu an açılıyor; ikinci kez açma.' }
+  const title = held.title ?? nonEmpty(call.title) ?? continueTitle(undefined)
+  const message = held.pendingMessage
+  const input: { tool: string } & Record<string, unknown> = {
+    ...call,
+    initiation: 'user_asked',
+    context: 'fresh',
+    title,
+    background:
+      typeof call.background === 'string' && call.background.length >= 80 ? call.background : CONTINUE_BACKGROUND,
+    prompt:
+      text +
+      (message !== undefined && message.trim() !== ''
+        ? `\n\n## Kullanıcının son mesajı (yeni sohbetin ilk işi)\n${message}`
+        : ''),
   }
   let result: Awaited<ReturnType<ToolNext>>
   try {
     result = await next(input as unknown as ToolCallArgs)
   } catch (error) {
-    if (isStart) await patchConv($, sid, { starting: undefined })
+    await patchConv($, sid, { starting: undefined })
     throw error
   }
-  const prompt = typeof input.prompt === 'string' ? input.prompt : undefined
-  const title = typeof input.title === 'string' ? input.title : (held.title ?? 'Devam')
-  const isRefused = result.deny !== undefined || result.isError === true
-  if (isStart && !isRefused) {
-    const id = startedId(result)
-    startedInTurn = runningTurnId
-    await patchConv($, sid, { phase: 'done', startedId: id ?? title, starting: undefined })
+  if (result.deny !== undefined || result.isError === true) {
+    await patchConv($, sid, { starting: undefined, isGateClosed: true })
+
+    return result
+  }
+  const id = startedId(result) ?? title
+  const handedNow: HandedRecord = {
+    handoffId: held.handoffId ?? '',
+    startedId: id,
+    file,
+    at: await $.clock.now(),
+  }
+  await $.store.set(`${HANDED_PREFIX}${sid}`, handedNow)
+  // `done` deletes `devir:<sid>` (syncStore).
+  await patchConv($, sid, { phase: 'done', startedId: id, starting: undefined, isForced: false })
+  later($, async () => {
+    $.ui.toast(`Devam yeni sohbette: ${title}`, { timeoutMs: 15000 })
+    await refreshStatus($).catch(() => undefined)
+  })
+
+  return result
+}
+
+/**
+ * S5: after a main-loop tool result. Idle and due: claim, and the instruction
+ * rides on this result's `context` (in-turn when the person typed the turn,
+ * else the closed-turn text). A closed-gate handoff in a machine turn gets its
+ * closed-turn text once per turn.
+ */
+const tripMidTurn = async ($: EngineInterface): Promise<string | undefined> => {
+  const held = await currentConv($)
+  if (held.phase === 'idle') {
+    const due = await isDue($, held)
+    if (due === undefined) return undefined
+    const claimed = await claimHandoff(
+      $,
+      held.sid,
+      h => h.phase === 'idle',
+      isPersonTurn ? {} : { notedTurn: runningTurnId },
+    )
+    if (claimed?.file === undefined) return undefined
+    const hasSkill = await hasHandoffSkill($)
+    $.ui.toast(
+      isPersonTurn
+        ? 'Devir başlıyor: bu turun içinde yapılacak.'
+        : 'Devir başlıyor: yeni sohbet bir sonraki mesajınla açılacak.',
+    )
+
+    return isPersonTurn
+      ? inTurnHandoff(due.threshold, claimed.file, hasSkill)
+      : closedTurnHandoff(due.threshold, claimed.file, hasSkill)
+  }
+  if (
+    held.phase === 'handoff_running' &&
+    held.isGateClosed === true &&
+    !isPersonTurn &&
+    runningTurnId !== undefined &&
+    held.notedTurn !== runningTurnId
+  ) {
+    const turn = runningTurnId
+    const isClaimed = await claim($, held.sid, h => h.phase === 'handoff_running' && h.notedTurn !== turn, {
+      notedTurn: turn,
+    })
+    if (!isClaimed || held.file === undefined) return undefined
+    const settings = await readSettings($)
+
+    return closedTurnHandoff(thresholdOf(settings, held), held.file, await hasHandoffSkill($))
+  }
+
+  return undefined
+}
+
+export const register: Register = on => {
+  // (a) The mid-turn channel: a tool result's `context` is read by the model
+  // right after that result, inside the running turn.
+  on('tool.call', async ($, e, next) => {
+    const call = e as unknown as { tool: string; agentId?: string; to?: unknown } & Record<string, unknown>
+    type Out = Awaited<ReturnType<typeof next>>
+    // S4 first, before the origin and subagent returns: the drain holds for
+    // every caller.
+    if (isDrainCall(call) && (await isDrainingNow($))) return { deny: DRAIN_DENY } as Out
+    // Only the model's own calls (the engine's call site): another plugin's
+    // $.tool.call drops `context`, and its start_session is not the handoff.
+    if (next.origin.plugin !== 'engine') return next(e)
+    if (call.agentId !== undefined) return next(e)
+    if (call.tool === HAND_OFF) {
+      // A fork through hand_off_to_session is not the handoff's path.
+      if (await isDrainingNow($)) return { deny: HAND_OFF_DENY } as Out
+
+      return next(e)
+    }
+    if (call.tool === START_SESSION) {
+      return watchModelStart($, call, next as unknown as ToolNext) as ReturnType<typeof next>
+    }
+    const result = await next(e)
+    if (result.deny !== undefined) return result
+    const note = await tripMidTurn($)
+    if (note === undefined) return result
+
+    return { ...result, context: [...(result.context ?? []), note] } as typeof result
+  }).catch(($, e, next) =>
+    next.called ? next(e) : isDraining && DRAIN_TOOLS.has(e.tool) ? { deny: DRAIN_DENY } : next(e),
+  )
+
+  // S4 at the spawn itself: also a workflow's `agent()` calls and resumes.
+  on('agent.spawn', async ($, e, next) => ((await isDrainingNow($)) ? { deny: DRAIN_DENY } : next(e))).catch(
+    ($, e, next) => (next.called ? next(e) : isDraining ? { deny: DRAIN_DENY } : next(e)),
+  )
+}

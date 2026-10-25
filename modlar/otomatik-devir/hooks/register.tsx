@@ -1269,6 +1269,115 @@ const isUnaskedSkillHandoff = async ($: EngineInterface, call: Record<string, un
   }
 }
 
+/** A start in flight that is not stale (O4): an older one is a crash mid-start. */
+const isLiveStarting = (main: OrkestraAna, now: number): boolean =>
+  main.starting === true && now - (main.startingAt ?? 0) < STARTING_STALE_MS
+
+/**
+ * O4: the main chat's start_session. Every refusal of the chain comes first;
+ * then one start at a time (a claim on conv), the prompt filled by the mod (the
+ * task for child 1, the previous child's file after), and the child recorded.
+ * Undefined when this chat has no main record (the v1 flow then runs).
+ */
+const orkestraStart = async (
+  $: EngineInterface,
+  call: { tool: string } & Record<string, unknown>,
+  next: ToolNext,
+): Promise<Awaited<ReturnType<ToolNext>> | undefined> => {
+  const sid = await $.session.id()
+  const localId = await selfLocal($)
+  const main = localId === undefined ? undefined : await readMain($, localId)
+  if (localId === undefined || main === undefined) return undefined
+  const limit = await orkestraLimit($, localId)
+  if (main.ended !== undefined) return { deny: main.ended === 'sinir' ? orkestraCapDeny(limit) : ORKESTRA_END_DENY }
+  if (!main.isHeld) return { deny: ORKESTRA_PAUSED_DENY }
+  const now = await $.clock.now()
+  if (isLiveStarting(main, now)) return { deny: orkestraBusyDeny(main.n + 1) }
+  const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+  let file: string | undefined
+  if (main.n >= 1) {
+    if (child?.status !== 'ready') return { deny: orkestraBusyDeny(main.n) }
+    file = child.file
+    const text = await readFresh($, file, undefined)
+    if ((text !== undefined && NONE_LEFT_RE.test(text)) || main.isStopRequested === true) {
+      return { deny: ORKESTRA_END_DENY }
+    }
+  }
+  if (main.n >= limit) return { deny: orkestraCapDeny(limit) }
+  const isClaimed = await claim($, sid, h => h.starting === undefined, { starting: 'orkestra' })
+  if (!isClaimed) return { deny: orkestraBusyDeny(main.n + 1) }
+  try {
+    const n = main.n + 1
+    let body: string
+    if (n === 1) {
+      const own = nonEmpty(call.prompt)
+      body =
+        own === undefined
+          ? main.task
+          : own.includes(main.task)
+            ? own
+            : `${own}\n\n## Kullanıcının asıl isteği\n${main.task}`
+    } else {
+      const text = await readFresh($, file, undefined)
+      if (text === undefined) {
+        return { deny: `otomatik-devir orkestra: alt sohbet ${main.n} devir dosyası okunamadı: ${file ?? ''}` }
+      }
+      body = text
+    }
+    const message = main.pendingMessage
+    const prompt =
+      body +
+      (message !== undefined && message.trim() !== '' ? `\n\n## Kullanıcının notu\n${message}` : '') +
+      managedChildNote(n, limit)
+    await patchMain($, localId, { starting: true, startingAt: now })
+    const title = childTitle(main.task, n)
+    const input: { tool: string } & Record<string, unknown> = {
+      ...call,
+      initiation: 'user_asked',
+      context: 'fresh',
+      title,
+      background:
+        typeof call.background === 'string' && call.background.length >= 80 ? call.background : ORKESTRA_BACKGROUND,
+      prompt,
+    }
+    delete input.proposal_id
+    const pause = async () => {
+      await patchMain($, localId, { starting: undefined, startingAt: undefined, isHeld: false })
+      await patchConv($, sid, { isPaused: true })
+    }
+    let result: Awaited<ReturnType<ToolNext>>
+    try {
+      result = await next(input as unknown as ToolCallArgs)
+    } catch (error) {
+      await pause()
+      throw error
+    }
+    if (result.deny !== undefined || result.isError === true) {
+      await pause()
+
+      return result
+    }
+    await patchMain($, localId, {
+      n,
+      childId: startedId(result) ?? UNKNOWN_CHILD,
+      starting: undefined,
+      startingAt: undefined,
+      stallCount: undefined,
+      stallAt: undefined,
+      pendingMessage: undefined,
+    })
+    await patchConv($, sid, { childN: n })
+    later($, async () => {
+      $.ui.toast(`Orkestra: alt sohbet ${n} açıldı`)
+      await refreshStatus($).catch(() => undefined)
+    })
+
+    return result
+  } finally {
+    await patchConv($, sid, { starting: undefined })
+  }
+}
+
 /**
  * S6: the model's own start_session during the handoff. A session that
  * handed off never starts a second child; outside a handoff the call passes
@@ -1281,6 +1390,11 @@ const watchModelStart = async (
   call: { tool: string } & Record<string, unknown>,
   next: ToolNext,
 ) => {
+  // O4: the main chat's starts, before the v1 handed-off check.
+  if ((await roleOf($)) === 'ana') {
+    const started = await orkestraStart($, call, next)
+    if (started !== undefined) return started
+  }
   const sid = await $.session.id()
   const handed = await handedOf($, sid)
   if (handed !== undefined) {
@@ -1725,6 +1839,10 @@ export const register: Register = on => {
     if (isDrainCall(call) && (await isDrainingNow($))) return { deny: DRAIN_DENY } as Out
     // Decision 16: the mod owns the handoff; the model's own skill call is refused.
     if (await isUnaskedSkillHandoff($, call)) return { deny: SKILL_HANDOFF_DENY } as Out
+    // O13: a managed sub-chat starts no session and forks none, whoever asks.
+    if ((call.tool === START_SESSION || call.tool === HAND_OFF) && (await roleOf($)) === 'alt') {
+      return { deny: MANAGED_START_DENY } as Out
+    }
     // Only the model's own calls (the engine's call site): another plugin's
     // $.tool.call drops `context`, and its start_session is not the handoff.
     if (next.origin.plugin !== 'engine') return next(e)

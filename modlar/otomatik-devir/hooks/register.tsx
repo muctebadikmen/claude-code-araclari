@@ -697,7 +697,103 @@ const runningWork = async ($: EngineInterface, tasks: readonly BackgroundTask[] 
   return (await activeAgents($)).map(agent => ({ id: agent.id, description: agent.description }))
 }
 
+
+// ---------------------------------------------------------------------------
+// One-time cleanup of v0.4/v0.5 leftovers (S11)
+// ---------------------------------------------------------------------------
+
+const OLD_KEY = /^(mod|depoGoruldu|aktarici|kendiKurulum)$/
+const OLD_PREFIX = /^(hazirlik|zincir|gorevModu|gonderildi|ipucu|istek|kurulumUyari):/
+const LOCK_STALE_MS = 5 * 60 * 1000
+const OWN_TASK_IN_TEXT = /otomatik-devir-[0-9a-f]{8}-(?:[1-9]\d*)?[ab](?![\w-])/g
+
+/** The mod's own task ids in a task list: its JSON (`taskId ?? id`), else ids named in its text. */
+const ownTaskIds = (text: string | undefined): string[] => {
+  try {
+    const got: unknown = JSON.parse(text ?? '')
+    const list = Array.isArray(got) ? got : record(got)?.tasks
+    if (Array.isArray(list)) {
+      const ids: string[] = []
+      for (const item of list) {
+        const task = record(item)
+        const id = nonEmpty(task?.taskId) ?? nonEmpty(task?.id)
+        if (isOwnTask(id) && !ids.includes(id)) ids.push(id)
+      }
+
+      return ids
+    }
+  } catch {
+    // not JSON: read the ids from the text
+  }
+
+  return [...new Set((text ?? '').match(OWN_TASK_IN_TEXT) ?? [])].filter(isOwnTask)
+}
+
+const toolNames = async ($: EngineInterface): Promise<ReadonlySet<string>> =>
+  new Set((await $.tool.list().catch(() => [])).map(tool => tool.name))
+
+/**
+ * Once per store (session.start, through `later`): old store keys go, then the
+ * mod's own scheduled tasks, each only when `$.tool.check` allows the delete
+ * with no dialog. The flag is set only when nothing of them is left, so a later
+ * session retries. A lock keeps two sessions starting together from both running.
+ */
+const cleanupOnce = async ($: EngineInterface): Promise<void> => {
+  if ((await $.store.get(CLEANUP_FLAG)) !== undefined) return
+  const sid = await $.session.id()
+  const now = await $.clock.now()
+  const isOurs = (lock: Record<string, unknown> | undefined): boolean =>
+    lock === undefined ||
+    lock.sid === sid ||
+    typeof lock.at !== 'number' ||
+    now - lock.at > LOCK_STALE_MS
+  if (!isOurs(record(await $.store.get(CLEANUP_LOCK)))) return
+  await $.store.set(CLEANUP_LOCK, { sid, at: now })
+  await $.clock.sleep(100)
+  const back = record(await $.store.get(CLEANUP_LOCK))
+  if (back !== undefined && back.sid !== sid && !isOurs(back)) return
+
+  for (const key of await $.store.keys().catch(() => [] as string[])) {
+    if (OLD_KEY.test(key) || OLD_PREFIX.test(key)) await $.store.delete(key).catch(() => undefined)
+  }
+
+  let deleted = 0
+  const tools = await toolNames($)
+  if (tools.has(LIST_TASKS) && tools.has(DELETE_TASK)) {
+    const listed = await callTool($, { tool: LIST_TASKS })
+    if (listed.deny !== undefined || listed.isError === true) return
+    for (const taskId of ownTaskIds(listed.text)) {
+      const check = await $.tool.check({ tool: DELETE_TASK, input: { taskId } })
+      if (check.decision !== 'allow') return
+      const gone = await callTool($, { tool: DELETE_TASK, taskId })
+      if (gone.deny !== undefined || gone.isError === true) return
+      deleted += 1
+    }
+  }
+  await $.store.set(CLEANUP_FLAG, { at: await $.clock.now(), deleted })
+  await $.store.delete(CLEANUP_LOCK).catch(() => undefined)
+}
+
 export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'devir',
+      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac',
+      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac]',
+    })
+    isPersonTurn = false
+    isNextTurnPerson = false
+    runningTurnId = undefined
+    handoffBlocks = 0
+    missingBlocks = 0
+    await currentConv($)
+    await refreshStatus($)
+    // Also on a reload of a changed module, so the one-time cleanup runs there too.
+    later($, () => cleanupOnce($))
+
+    return next(e)
+  })
+
   // A /clear (or any end) drops this conversation's $.state record; the
   // store keys stay (S2), so a reload restores the handoff.
   on('session.end', async ($, e, next) => {
@@ -923,5 +1019,103 @@ export const register: Register = on => {
     missingBlocks += 1
 
     return { block: fileMissingText(file, false) }
+  })
+
+  on('command.run', { command: 'devir' }, async ($, e) => {
+    const [verb = '', value] = e.args.trim().split(/\s+/)
+    const settings = await readSettings($)
+    const held = await currentConv($)
+
+    switch (verb.toLowerCase()) {
+      case '': {
+        const percent = await contextPercent($)
+        const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
+
+        return { text: `${statusText(settings, percent, held, running)} · aşama: ${held.phase}` }
+      }
+      case 'esik': {
+        const n = Number(value)
+        if (!isThreshold(n)) return { text: 'Kullanım: /devir esik <1-99>' }
+        await $.store.set('esik', n)
+        await refreshStatus($)
+
+        return { text: `Devir eşiği %${n} olarak ayarlandı.` }
+      }
+      case 'dene': {
+        // Decision 13: a threshold for THIS chat only ($.state), for live tests.
+        if (value === undefined) {
+          await patchConv($, held.sid, { testThreshold: undefined })
+          await refreshStatus($)
+
+          return { text: `Bu sohbetin deneme eşiği kaldırıldı; eşik %${settings.threshold}.` }
+        }
+        const n = Number(value)
+        if (!isThreshold(n)) return { text: 'Kullanım: /devir dene <1-99> (boş: kaldır)' }
+        await patchConv($, held.sid, { testThreshold: n })
+        await refreshStatus($)
+
+        return { text: `Bu sohbetin deneme eşiği %${n} (yalnızca bu sohbet).` }
+      }
+      case 'simdi': {
+        const handed = await handedOf($, held.sid)
+        if (handed !== undefined || held.phase === 'done') {
+          return {
+            text: `Bu sohbet zaten devredildi${handed?.startedId ? ` (${handed.startedId})` : ''}.`,
+          }
+        }
+        if (isDrainPhase(held.phase)) return { text: 'Devir zaten çalışıyor.' }
+        if (!settings.isEnabled) return { text: 'Otomatik devir kapalı. Açmak için: /devir ac' }
+        await patchConv($, held.sid, { isForced: true })
+
+        return { text: 'Devir istendi: çalışan turda ya da bir sonraki mesajınla başlayacak.' }
+      }
+      case 'kapat':
+        await $.store.set('acik', false)
+        await refreshStatus($)
+
+        return { text: 'Otomatik devir kapatıldı.' }
+      case 'ac':
+        await $.store.set('acik', true)
+        await refreshStatus($)
+
+        return { text: 'Otomatik devir açıldı.' }
+      case 'sor':
+      case 'otomatik':
+      case 'gec':
+      case 'hazirla':
+        return { text: REMOVED_VERB }
+      default:
+        return { text: USAGE }
+    }
+  })
+
+  // S10, the ready band: one row, no buttons, only in `ready`.
+  //
+  // The context indicator lives in the status line ($.ui.status: one line per
+  // plugin, no contention); only this row uses the AbovePrompt band, which
+  // every mod shares (ilerleme-cubugu draws there too, blast-radius / Silme
+  // Kalkanı falls back to it in a narrow terminal).
+  //
+  // Coexistence contract: nothing to show -> return next(e) untouched;
+  // otherwise this row FIRST, then the drawing of the plugins below (next(e)),
+  // in a column Box, never swallowed. While a turn runs (isWorking) the row
+  // stays hidden: a blast-radius hold is mid-turn and owns the keys then. The
+  // row has no hotkeys, so every key stays free for others.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey || e.props.isWorking) return next(e)
+    const held = await read($, conv)
+    if (held === null || held.phase !== 'ready' || held.sid !== (await $.session.id())) return next(e)
+
+    const below = await next(e)
+    const { Box, Text } = $.ui.resolve(e)
+
+    return (
+      <Box flexDirection="column">
+        <Box key="devir">
+          <Text>{READY_BAND}</Text>
+        </Box>
+        {below ?? null}
+      </Box>
+    )
   })
 }

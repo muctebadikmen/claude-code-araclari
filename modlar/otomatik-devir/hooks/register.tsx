@@ -653,6 +653,8 @@ const claim = async (
 const isDue = async ($: EngineInterface, held: OtomatikDevirConv): Promise<{ threshold: number } | undefined> => {
   const settings = await readSettings($)
   if (!settings.isEnabled) return undefined
+  // O3: the main chat never hands off by threshold.
+  if ((await roleOf($)) === 'ana') return undefined
   if ((await handedOf($, held.sid)) !== undefined) return undefined
   const threshold = thresholdOf(settings, held)
   if (held.isForced === true) return { threshold }
@@ -677,12 +679,14 @@ const claimHandoff = async (
 ): Promise<OtomatikDevirConv | undefined> => {
   const now = await $.clock.now()
   const file = handoffFile(await $.session.cwd(), sid)
+  // O12: a managed sub-chat only writes its file; the main chat starts the next one.
+  const isManaged = (await roleOf($)) === 'alt'
   const isClaimed = await claim($, sid, may, {
     phase: 'handoff_running',
     handoffId: newHandoffId(sid, now),
     handoffAt: now,
     file,
-    isGateClosed: !isPersonTurn,
+    isGateClosed: isManaged || !isPersonTurn,
     isForced: false,
     starting: undefined,
     notedTurn: undefined,
@@ -694,6 +698,17 @@ const claimHandoff = async (
 
   return held !== null && held.sid === sid ? held : undefined
 }
+
+/**
+ * The handoff instruction for this chat (O12): a managed sub-chat writes its
+ * file only; else in-turn when the person typed the turn, the closed-turn text otherwise.
+ */
+const handoffTextFor = (held: OtomatikDevirConv, threshold: number, file: string, hasSkill: boolean): string =>
+  held.role === 'alt'
+    ? managedHandoff(threshold, file, hasSkill)
+    : isPersonTurn
+      ? inTurnHandoff(threshold, file, hasSkill)
+      : closedTurnHandoff(threshold, file, hasSkill)
 
 /** The handoff file's text, when it was written for this handoff (not before `since`). */
 const readFresh = async ($: EngineInterface, file: string | undefined, since: number | undefined) => {
@@ -1357,9 +1372,7 @@ const tripMidTurn = async ($: EngineInterface): Promise<string | undefined> => {
         : 'Devir başlıyor: yeni sohbet bir sonraki mesajınla açılacak.',
     )
 
-    return isPersonTurn
-      ? inTurnHandoff(due.threshold, claimed.file, hasSkill)
-      : closedTurnHandoff(due.threshold, claimed.file, hasSkill)
+    return handoffTextFor(claimed, due.threshold, claimed.file, hasSkill)
   }
   if (
     held.phase === 'handoff_running' &&
@@ -1375,7 +1388,7 @@ const tripMidTurn = async ($: EngineInterface): Promise<string | undefined> => {
     if (!isClaimed || held.file === undefined) return undefined
     const settings = await readSettings($)
 
-    return closedTurnHandoff(thresholdOf(settings, held), held.file, await hasHandoffSkill($))
+    return handoffTextFor(held, thresholdOf(settings, held), held.file, await hasHandoffSkill($))
   }
 
   return undefined
@@ -1761,11 +1774,7 @@ export const register: Register = on => {
         if (claimed?.file !== undefined) {
           const hasSkill = await hasHandoffSkill($)
 
-          return {
-            block: isPersonTurn
-              ? inTurnHandoff(due.threshold, claimed.file, hasSkill)
-              : closedTurnHandoff(due.threshold, claimed.file, hasSkill),
-          }
+          return { block: handoffTextFor(claimed, due.threshold, claimed.file, hasSkill) }
         }
         held = await currentConv($)
       }
@@ -1859,6 +1868,8 @@ export const register: Register = on => {
         return { text: `Bu sohbetin deneme eşiği %${n} (yalnızca bu sohbet).` }
       }
       case 'simdi': {
+        // O3: the main chat never hands off.
+        if ((await roleOf($)) === 'ana') return { text: 'Ana sohbet devredilmez (orkestra modu).' }
         const handed = await handedOf($, held.sid)
         if (handed !== undefined || held.phase === 'done') {
           return {

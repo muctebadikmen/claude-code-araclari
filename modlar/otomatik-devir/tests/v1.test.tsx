@@ -245,11 +245,11 @@ const typedTrip = async ($: any, world: any, clock: any) => {
 }
 
 describe('otomatik-devir v1', () => {
-  test('(V1) çalışan alt ajan ya da Workflow turu tutar; yalnızca shell/monitor tutmaz', async ($, on) => {
-    const { world } = setup(on)
+  test('(V1) devir sürerken çalışan alt ajan ya da Workflow turu tutar; yalnızca shell/monitor tutmaz', async ($, on) => {
+    const { world, clock } = setup(on)
     await start($)
-    await typed($, 'iş')
-    await turnBegin($)
+    // v1.0.1: the Stop guard holds only during a handoff (see hotfix (B)).
+    await typedTrip($, world, clock)
     const held = await stop($, [SUBAGENT, WORKFLOW, SHELL])
     expect(held.block).toBe(
       waitText([
@@ -260,17 +260,20 @@ describe('otomatik-devir v1', () => {
     expect(held.block).toContain("perl -e 'select(undef,undef,undef,120)'")
     expect(held.block).toContain('5 dakika')
     expect(held.block).not.toContain('b1')
-    expect((await stop($, [SHELL, MONITOR])).block).toBeUndefined()
+    // Nothing waited on: the Stop goes on to the handoff's own block (file missing), no wait text.
+    expect((await stop($, [SHELL, MONITOR])).block).toBe(fileMissingText(FILE, true))
     // A finished or waiting subagent is not waited on (Decision 15).
-    expect((await stop($, [{ ...SUBAGENT, status: 'completed' }, { ...SUBAGENT, id: 'a2', status: 'waiting' }])).block).toBeUndefined()
+    expect((await stop($, [{ ...SUBAGENT, status: 'completed' }, { ...SUBAGENT, id: 'a2', status: 'waiting' }])).block).toBe(
+      fileMissingText(FILE, true),
+    )
     // No background_tasks in the hook: $.agent.list() decides.
     world.agents = [{ id: 'a7', description: 'yaz', type: 'general-purpose', status: 'running' }]
     expect((await $.classic.Stop({ stop_hook_active: false } as any)).block).toBe(
       waitText([{ id: 'a7', description: 'yaz' }]),
     )
     world.agents = [{ id: 'a7', description: 'yaz', type: 'general-purpose', status: 'waiting' }]
-    expect((await $.classic.Stop({ stop_hook_active: false } as any)).block).toBeUndefined()
-    expect(await phase($)).toContain('aşama: idle')
+    expect((await $.classic.Stop({ stop_hook_active: false } as any)).block).toBe(fileMissingText(FILE, true))
+    expect(await phase($)).toContain('aşama: handoff_running')
   })
 
   test('(V2) bir alt ajanın Stop olayı (agent_id) hiç tutulmaz', async ($, on) => {
@@ -970,5 +973,218 @@ describe('skill handoff deny', () => {
     expect((await skill($, undefined, 'my-skill-audit')).deny).toBeUndefined()
     expect((await skill($, undefined, 'my-skill-handoff-notes')).deny).toBeUndefined()
     expect(callsOf(world, 'Skill')).toHaveLength(2)
+  })
+})
+
+// v1.0.1 hotfix: (A) /devir kapat cancels the handoff, (B) the Stop guard holds
+// only during a handoff, (C) the child reads only the per-session handoff file.
+describe('v1.0.1 hotfix', () => {
+  const spawn = ($: any, description: string) =>
+    $.agent.spawn({
+      tool_use_id: `tu-${description}`,
+      prompt: 'x',
+      description,
+      subagentType: 'general-purpose',
+      provider: { plugin: 'engine', tier: 'core' },
+      parentModel: 'claude-opus-5-5',
+      background: true,
+      fork: false,
+    } as any)
+  const mountBand = ($: any) =>
+    $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'AbovePrompt', props: BAND } as any)
+  /** A machine-turn trip, the file written, the Stop: phase `ready`. */
+  const toReady = async ($: any, world: any, clock: any) => {
+    await machine($, 'görev bildirimi')
+    await turnBegin($)
+    world.percent = 50
+    await bash($)
+    await clock.advance(100)
+    writeFile(world, clock)
+    await stop($, [])
+    await turnEnd($)
+    expect(await phase($)).toContain('aşama: ready')
+  }
+
+  test('(A1) devir sürerken /devir kapat: devir iptal, devir:<sid> silinir, Agent/Workflow/spawn/Stop serbest', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await typedTrip($, world, clock)
+    writeFile(world, clock)
+    expect(world.store[`${RUN_PREFIX}s1`]).toMatchObject({ phase: 'handoff_running' })
+    expect((await $.tool.call({ tool: 'Agent', prompt: 'x', description: 'y' } as any)).deny).toBe(DRAIN_DENY)
+
+    const reply = (await devir($, 'kapat')).text as string
+    expect(reply).toContain('kapatıldı')
+    expect(reply).toContain('süren devri iptal edildi')
+    expect(world.store.acik).toBe(false)
+    expect(world.store[`${RUN_PREFIX}s1`]).toBeUndefined()
+    expect(world.store[`${HANDED_PREFIX}s1`]).toBeUndefined()
+    expect(await phase($)).toContain('aşama: idle')
+    expect(world.statuses.at(-1)).toBe('Devir: kapalı')
+    // The file already written stays.
+    expect(world.files[FILE]).toBeDefined()
+
+    expect((await $.tool.call({ tool: 'Agent', prompt: 'x', description: 'y' } as any)).deny).toBeUndefined()
+    expect((await $.tool.call({ tool: 'Workflow', script: 'x' } as any)).deny).toBeUndefined()
+    expect(callsOf(world, 'Agent')).toHaveLength(1)
+    expect(callsOf(world, 'Workflow')).toHaveLength(1)
+    expect(((await spawn($, 'sonra')) as any).deny).toBeUndefined()
+    expect((await stop($, [SUBAGENT])).block).toBeUndefined()
+    expect((await stop($, [])).block).toBeUndefined()
+    // start_session passes untouched (no handoff): the model's own prompt, no handed-off flag.
+    expect((await startSession($)).deny).toBeUndefined()
+    expect(callsOf(world, START).at(-1)?.prompt).toBe('modelin promptu')
+    expect(world.store[`${HANDED_PREFIX}s1`]).toBeUndefined()
+    // No handoff starts above the threshold while off.
+    expect((await bash($)).context ?? []).toEqual([])
+    expect(await phase($)).toContain('aşama: idle')
+  })
+
+  test('(A2) ready iken /devir kapat: hazır devir iptal, bant çizilmez, drain kalkar', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await toReady($, world, clock)
+    const reply = (await devir($, 'kapat')).text as string
+    expect(reply).toContain('hazır devri iptal edildi')
+    expect(world.store[`${RUN_PREFIX}s1`]).toBeUndefined()
+    await clock.advance(100)
+    const ui = await mountBand($)
+    expect(JSON.stringify(await ui.drawn())).not.toContain(READY_BAND)
+    await ui.unmount()
+    expect((await $.tool.call({ tool: 'Workflow', script: 'x' } as any)).deny).toBeUndefined()
+    // The next typed message is not a handoff message.
+    await typed($, 'şunu yap')
+    expect(world.typed.at(-1)?.context).toEqual([])
+  })
+
+  test('(A3) mod başka sohbette kapatılınca bu sohbet devrini bir sonraki olayında bırakır', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await toReady($, world, clock)
+    const shown = await mountBand($)
+    expect(JSON.stringify(await shown.drawn())).toContain(READY_BAND)
+    await shown.unmount()
+    // Another chat runs /devir kapat: only the shared store changes.
+    world.store.acik = false
+    // The band is gone even before this chat's next hook drops the handoff.
+    const ui = await mountBand($)
+    expect(JSON.stringify(await ui.drawn())).not.toContain(READY_BAND)
+    await ui.unmount()
+    expect(world.store[`${RUN_PREFIX}s1`]).toMatchObject({ phase: 'ready' })
+    // The next hook event (here an Agent call) drops it.
+    expect((await $.tool.call({ tool: 'Agent', prompt: 'x', description: 'y' } as any)).deny).toBeUndefined()
+    expect(world.store[`${RUN_PREFIX}s1`]).toBeUndefined()
+    await clock.advance(100)
+    expect(world.toasts).toContain('Otomatik devir kapalı: bu sohbetin devri iptal edildi.')
+    expect(await phase($)).toContain('aşama: idle')
+  })
+
+  test('(A4) yeniden yüklemede mod kapalıysa depodaki devir:<sid> geri gelmez; devredildi kalır', async ($, on) => {
+    const { world } = setup(on, {
+      esik: 40,
+      acik: false,
+      [`${RUN_PREFIX}s1`]: { handoffId: 's1-x', file: FILE, handoffAt: NOW - 10, phase: 'handoff_running' },
+      [`${HANDED_PREFIX}s2`]: { handoffId: 's2-x', startedId: 'local_old', file: 'f', at: 1 },
+    })
+    await start($)
+    expect(await phase($)).toContain('aşama: idle')
+    expect(world.store[`${RUN_PREFIX}s1`]).toBeUndefined()
+    expect(((await spawn($, 'sonra')) as any).deny).toBeUndefined()
+    // A finished handoff is not undone, by the mod off nor by /devir kapat.
+    world.sid = 's2'
+    expect(await phase($)).toContain('aşama: done')
+    expect((await devir($, 'kapat')).text).toBe('Otomatik devir kapatıldı.')
+    expect(world.store[`${HANDED_PREFIX}s2`]).toBeDefined()
+    expect(await phase($)).toContain('aşama: done')
+  })
+
+  test('(B1) devir yokken çalışan alt ajan/Workflow Stop\'u tutmaz', async ($, on) => {
+    const { world } = setup(on)
+    await start($)
+    await typed($, 'iş')
+    await turnBegin($)
+    expect((await stop($, [SUBAGENT, WORKFLOW])).block).toBeUndefined()
+    world.agents = [{ id: 'a7', description: 'yaz', type: 'general-purpose', status: 'running' }]
+    expect((await $.classic.Stop({ stop_hook_active: false } as any)).block).toBeUndefined()
+    expect(await phase($)).toContain('aşama: idle')
+  })
+
+  test('(B2) devir sürerken (handoff_running) çalışan iş Stop\'u yine tutar; ready tutmaz', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await toReady($, world, clock)
+    const running = [{ id: 'a1', description: 'araştır' }]
+    // `ready`: the file is written and the child waits for the next typed message.
+    expect((await stop($, [SUBAGENT])).block).toBeUndefined()
+    world.agents = [{ id: 'a7', description: 'yaz', type: 'general-purpose', status: 'running' }]
+    expect((await $.classic.Stop({ stop_hook_active: false } as any)).block).toBeUndefined()
+    world.agents = []
+    expect(await phase($)).toContain('aşama: ready')
+    // The typed message makes it `handoff_running` again: the wait holds there.
+    await typed($, 'devam')
+    await turnBegin($)
+    expect(await phase($)).toContain('aşama: handoff_running')
+    expect((await stop($, [SUBAGENT])).block).toBe(waitText(running))
+  })
+
+  test('(B3) 30 dk zaman aşımından sonra ready olan devir, sonraki makine turlarını beklemede tutmaz', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await machine($, 'görev bildirimi')
+    await turnBegin($)
+    world.percent = 50
+    await bash($)
+    await clock.advance(100)
+    writeFile(world, clock)
+    const running = [{ id: 'a1', description: 'araştır' }]
+    expect((await stop($, [SUBAGENT])).block).toBe(waitText(running))
+    await clock.advance(DRAIN_TIMEOUT_MS)
+    expect((await stop($, [SUBAGENT])).block).toBe(timeoutText(running))
+    expect((await stop($, [SUBAGENT])).block).toBe(timeoutText(running))
+    // Third: the work no longer holds the turn; the written file makes it `ready`.
+    expect((await stop($, [SUBAGENT])).block).toBeUndefined()
+    await turnEnd($)
+    expect(await phase($)).toContain('aşama: ready')
+    // The agent was never stopped: a later machine turn ends instead of waiting with no end.
+    await machine($, 'görev bildirimi 2')
+    await turnBegin($)
+    expect((await stop($, [SUBAGENT])).block).toBeUndefined()
+    expect((await stop($, [SUBAGENT])).block).toBeUndefined()
+    expect(await phase($)).toContain('aşama: ready')
+  })
+
+  test('(C1) devir talimatları ve yeni sohbetin promptu HANDOFF.md/STATE.md anmaz; yalnızca devir dosyası', async ($, on) => {
+    const texts = [
+      inTurnHandoff(40, FILE),
+      inTurnHandoff(40, FILE, false),
+      closedTurnHandoff(40, FILE),
+      closedTurnHandoff(40, FILE, false),
+      nextMessageNote(FILE, false),
+      nextMessageNote(FILE, false, false),
+      nextMessageNote(FILE, true),
+      fileMissingText(FILE, true),
+      fileMissingText(FILE, false),
+      START_NOW,
+    ]
+    for (const text of texts) {
+      expect(text).not.toContain('HANDOFF.md')
+      expect(text).not.toContain('STATE.md')
+    }
+    // Both writers (the skill's auto mode and the fallback) say the child reads only this file.
+    for (const text of [inTurnHandoff(40, FILE), inTurnHandoff(40, FILE, false), fileMissingText(FILE, true)]) {
+      expect(text).toContain(`yalnızca ${FILE} dosyasını okumasını`)
+    }
+    // The child's first prompt: the file (plus the message), the mod's own background.
+    const { world, clock } = setup(on)
+    await start($)
+    await typedTrip($, world, clock)
+    writeFile(world, clock)
+    expect((await startSession($)).deny).toBeUndefined()
+    const [sent] = callsOf(world, START)
+    expect(sent.prompt).toBe(HANDOFF_TEXT)
+    for (const text of [sent.prompt, sent.background]) {
+      expect(text).not.toContain('HANDOFF.md')
+      expect(text).not.toContain('STATE.md')
+    }
   })
 })

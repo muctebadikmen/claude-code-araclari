@@ -69,11 +69,19 @@ export const handoffFile = (cwd: string, sid: string): string =>
 // Texts the model reads (Contract)
 // ---------------------------------------------------------------------------
 
+/**
+ * v1.0.1: the child reads only this handoff's own file, never an older
+ * project-wide handoff or state file (a real child once resumed from a
+ * 13-hour-stale one).
+ */
+const RESUME_ONLY = (file: string): string =>
+  `devam prompt'u yeni sohbete yalnızca ${file} dosyasını okumasını söylesin; başka bir devir ya da durum dosyasına yönlendirmesin`
+
 /** How the handoff file gets written: the skill's inline auto mode, or the built-in steps. */
 const writeStep = (file: string, hasSkill: boolean): string =>
   hasSkill
-    ? `Skill aracıyla /${SKILL} becerisini \`auto ${file}\` argümanıyla çalıştır (alt ajan yok, soru yok); devir dosyasını o yazar.`
-    : `Devir notunu ${file} dosyasına yaz (klasör yoksa oluştur): hedef, yapılanlar, kalanlar, alınan kararlar ve dikkat edilecekler; durdurulan işler varsa "Yeniden çalıştır:" altında. En sona \`## Devam prompt'u\` başlığını koy ve altına yeni sohbetin ilk mesajı olacak devam prompt'unu düz metin olarak yaz.`
+    ? `Skill aracıyla /${SKILL} becerisini \`auto ${file}\` argümanıyla çalıştır (alt ajan yok, soru yok); devir dosyasını o yazar. Dosyadaki ${RESUME_ONLY(file)}.`
+    : `Devir notunu ${file} dosyasına yaz (klasör yoksa oluştur): hedef, yapılanlar, kalanlar, alınan kararlar ve dikkat edilecekler; durdurulan işler varsa "Yeniden çalıştır:" altında. En sona \`## Devam prompt'u\` başlığını koy ve altına yeni sohbetin ilk mesajı olacak devam prompt'unu düz metin olarak yaz; bu ${RESUME_ONLY(file)}.`
 
 const NO_NEW_WORK =
   "Yeni alt ajan, Workflow, alt ajana mesaj ya da yeni bir iş BAŞLATMA (mod bunları reddeder); çalışan alt ajanların ve Workflow'ların sonuçlarını geldikçe işle."
@@ -117,7 +125,7 @@ export const LONG_CHAT_SECTION_ID = 'otomatik-devir'
 export const longChatNote = (threshold: number): string =>
   `otomatik-devir bu oturumda açık: devri mod yönetir. Bağlam büyüdü diye kendiliğinden devir yapma, my-skill-handoff çağırma, yeni sohbet ya da devam prompt'u önerme; işe devam et. Bağlam %${threshold}'e ulaşınca mod talimat verir, o talimata uy. Kullanıcı açıkça devir isterse: /devir simdi.`
 
-/** Stop block while subagents or Workflows run: wait inside the turn (Decision 3). */
+/** Stop block while subagents or Workflows run during a handoff (`handoff_running`): wait inside the turn (v1.0.1: only then). */
 export const waitText = (running: Running): string =>
   `otomatik-devir: turu henüz bitirme; çalışan işler var: ${runningList(running)}. Sonuçlarını bu turun içinde bekle: Bash aracıyla \`perl -e 'select(undef,undef,undef,120)'\` çalıştır (120 saniye; tek bir bekleme en çok 5 dakika olsun), gelen sonuçları işle ve hiçbiri çalışmıyorsa turu yeniden bitirmeyi dene. Yeni alt ajan ya da Workflow başlatma.`
 
@@ -127,7 +135,7 @@ export const timeoutText = (running: Running): string =>
 
 /** Stop block when the handoff file is missing, empty or older than this handoff. */
 export const fileMissingText = (file: string, isOpenTurn: boolean): string =>
-  `otomatik-devir: devir dosyası yok ya da bu devirden eski: ${file}. Turu bitirmeden önce dosyayı yaz (/${SKILL} \`auto ${file}\`, ya da hedef/yapılanlar/kalanlar/kararlar/dikkat ve en sonda \`## Devam prompt'u\`). ` +
+  `otomatik-devir: devir dosyası yok ya da bu devirden eski: ${file}. Turu bitirmeden önce dosyayı yaz (/${SKILL} \`auto ${file}\`, ya da hedef/yapılanlar/kalanlar/kararlar/dikkat ve en sonda \`## Devam prompt'u\`; ${RESUME_ONLY(file)}). ` +
   (isOpenTurn
     ? `Sonra turu bitirmeden ${START_SESSION} aracını initiation "user_asked" ve context "fresh" ile bir kez çağır.`
     : `${START_SESSION} çağırma: yeni sohbet kullanıcının bir sonraki mesajıyla açılır. Dosyayı yazınca turu bitir.`)
@@ -294,20 +302,61 @@ const restoreConv = async ($: EngineInterface, sid: string): Promise<OtomatikDev
   return { sid, phase: 'idle' }
 }
 
-/** The record of the conversation now running; a new session id restores it from the store. */
+/**
+ * Cancels this chat's handoff whose child has not started (v1.0.1): back to
+ * `idle` (this chat's `/devir dene` and last typed message kept), `devir:<sid>`
+ * deleted, the drain lifted, the band and status redrawn. `/devir kapat` runs
+ * it, and so does any chat that sees the mod off (`isNoticed`: a toast says
+ * so). A finished handoff (`done`, `devredildi:<sid>`) is never undone; a
+ * handoff file already written stays on disk.
+ */
+const cancelHandoff = async ($: EngineInterface, sid: string, isNoticed: boolean): Promise<OtomatikDevirConv> => {
+  let now: OtomatikDevirConv = { sid, phase: 'idle' }
+  await update($, conv, (held): OtomatikDevirConv | null => {
+    if (held !== null && held.sid !== sid) return held
+    if (held?.phase === 'done') {
+      now = held
+      return held
+    }
+    now = { sid, phase: 'idle', testThreshold: held?.testThreshold, lastTyped: held?.lastTyped }
+    return now
+  })
+  if (now.phase === 'done') return now
+  isDraining = false
+  await $.store.delete(`${RUN_PREFIX}${sid}`).catch(() => undefined)
+  later($, async () => {
+    try {
+      $.ui.invalidate('ui.render')
+    } catch {
+      // the band redraws on the next prop change anyway
+    }
+    if (isNoticed) $.ui.toast('Otomatik devir kapalı: bu sohbetin devri iptal edildi.')
+    await refreshStatus($).catch(() => undefined)
+  })
+
+  return now
+}
+
+/**
+ * The record of the conversation now running; a new session id restores it
+ * from the store. A handoff not yet handed off is dropped once the mod is
+ * off, in whichever chat turned it off (v1.0.1).
+ */
 const currentConv = async ($: EngineInterface): Promise<OtomatikDevirConv> => {
   const sid = await $.session.id()
   const held = await read($, conv)
+  let now: OtomatikDevirConv
   if (held !== null && held.sid === sid) {
-    isDraining = isDrainPhase(held.phase)
-
-    return held
+    now = held
+  } else {
+    now = await restoreConv($, sid)
+    const restored = now
+    await update($, conv, () => restored)
   }
-  const restored = await restoreConv($, sid)
-  await update($, conv, () => restored)
-  isDraining = isDrainPhase(restored.phase)
+  isDraining = isDrainPhase(now.phase)
+  if (isDraining && !(await readSettings($)).isEnabled) return cancelHandoff($, sid, true)
 
-  return restored
+  return now
 }
 
 const patchConv = async (
@@ -957,7 +1006,7 @@ export const register: Register = on => {
   })
 
   // S9: a main turn that ends with the handoff still running closes the gate
-  // (an Esc, `isAborted`, too: the handoff stays, it is never cancelled). The
+  // (an Esc, `isAborted`, too: the handoff stays; only the mod off cancels it). The
   // file written and nothing running: the handoff is `ready`.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
@@ -1025,9 +1074,9 @@ export const register: Register = on => {
     ($, e, next) => (next.called ? next(e) : isDraining ? { deny: DRAIN_DENY } : next(e)),
   )
 
-  // S7: the main loop's turn end. Idle and due: trip here. Running work: wait
-  // in the turn. A typed turn's handoff: start the child before it ends. A
-  // closed gate: once the file is written the handoff is `ready`.
+  // S7: the main loop's turn end. Idle and due: trip here. Running work during
+  // the handoff: wait in the turn. A typed turn's handoff: start the child
+  // before it ends. A closed gate: once the file is written the handoff is `ready`.
   on('classic.Stop', async ($, e, next) => {
     if (e.agent_id !== undefined) return next(e)
     const settings = await readSettings($)
@@ -1055,8 +1104,12 @@ export const register: Register = on => {
         held = await currentConv($)
       }
     }
-    // (b)
-    const running = await runningWork($, e.background_tasks)
+    // (b) Only while this chat's handoff runs (v1.0.1): outside a handoff,
+    // running subagents and Workflows never hold the turn end. Not in `ready`
+    // either: the file is written and the child waits for the next typed
+    // message, which makes it `handoff_running` again; the 30-minute timeout
+    // counts only in `handoff_running`, so a wait there could never end.
+    const running = held.phase === 'handoff_running' ? await runningWork($, e.background_tasks) : []
     if (running.length > 0) {
       const now = await $.clock.now()
       const isTimedOut =
@@ -1152,11 +1205,20 @@ export const register: Register = on => {
 
         return { text: 'Devir istendi: çalışan turda ya da bir sonraki mesajınla başlayacak.' }
       }
-      case 'kapat':
+      case 'kapat': {
         await $.store.set('acik', false)
+        // v1.0.1: this chat's running or ready handoff is cancelled (a pending
+        // `/devir simdi` too); a finished one stays.
+        const wasHandoff = isDrainPhase(held.phase)
+        if (held.phase !== 'done') await cancelHandoff($, held.sid, false)
         await refreshStatus($)
 
-        return { text: 'Otomatik devir kapatıldı.' }
+        return {
+          text: wasHandoff
+            ? `Otomatik devir kapatıldı; bu sohbetin ${held.phase === 'ready' ? 'hazır' : 'süren'} devri iptal edildi. Alt ajan ve Workflow yeniden başlatılabilir; yazılmış devir dosyası yerinde kalır.`
+            : 'Otomatik devir kapatıldı.',
+        }
+      }
       case 'ac':
         await $.store.set('acik', true)
         await refreshStatus($)
@@ -1188,6 +1250,8 @@ export const register: Register = on => {
     if (e.props.hasSurvey || e.props.isWorking) return next(e)
     const held = await read($, conv)
     if (held === null || held.phase !== 'ready' || held.sid !== (await $.session.id())) return next(e)
+    // The mod off: no band, even before this chat's next hook drops the handoff.
+    if (!(await readSettings($)).isEnabled) return next(e)
 
     const below = await next(e)
     const { Box, Text } = $.ui.resolve(e)

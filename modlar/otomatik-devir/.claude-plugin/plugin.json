@@ -1,6 +1,6 @@
 {
   "name": "otomatik-devir",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Bağlam doluluğunu gösterir; eşikte çalışan alt ajanları bitirtir, yeni iş başlattırmaz, devir dosyası yazdırır ve devamı tıklamasız, iç içe yeni bir sohbette sürdürür (/devir).",
   "author": {
     "name": "Mustafa Dikmen",

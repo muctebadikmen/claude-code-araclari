@@ -1501,6 +1501,9 @@ const orkestraStart = async (
     if ((text !== undefined && NONE_LEFT_RE.test(text)) || main.isStopRequested === true) {
       return { deny: ORKESTRA_END_DENY }
     }
+    // O22: a full main chat starts no next child (O5/O6 write the end).
+    const percent = await contextPercent($)
+    if (percent !== undefined && percent >= MAIN_FULL_PERCENT) return { deny: ORKESTRA_END_DENY }
   }
   if (main.n >= limit) return { deny: orkestraCapDeny(limit) }
   const isClaimed = await claim($, sid, h => h.starting === undefined, { starting: 'orkestra' })
@@ -1724,6 +1727,11 @@ let timeoutFor: { id: string; n: number } | undefined
 
 type BackgroundTask = { id: string; type: string; status: string; description: string }
 
+// Decision 21a: the background tasks of this turn's last main-loop Stop, so
+// turn.complete's `ready` check sees Workflows ($.agent.list() does not).
+// Reset at session.start (O18).
+let lastStopTasks: { turnId: string | undefined; tasks: readonly BackgroundTask[] | undefined } | undefined
+
 /**
  * The work the turn waits on (Decision 15): subagents and Workflows running or
  * pending in `background_tasks`; `$.agent.list()` only when the hook got none.
@@ -1813,6 +1821,9 @@ const orkestraDecision = async (
     if (text !== undefined && NONE_LEFT_RE.test(text)) return end('bitti')
     if (main.isStopRequested === true) return end('durduruldu')
     if (n >= limit) return end('sinir')
+    // O22: the main chat's own context is full: the chain ends here (never mid-child).
+    const percent = await contextPercent($)
+    if (percent !== undefined && percent >= MAIN_FULL_PERCENT) return end('dolu')
 
     return done({ kind: 'relay', n, text: orkestraRelayText(n + 1, childTitle(main.task, n + 1)) })
   }
@@ -2024,6 +2035,7 @@ export const register: Register = on => {
     missingBlocks = 0
     // O18: no module state leaks from another session (or an older load).
     timeoutFor = undefined
+    lastStopTasks = undefined
     orkestraStartBlocks = undefined
     orkestraNoted = undefined
     lastAyar = {}
@@ -2248,10 +2260,12 @@ export const register: Register = on => {
     if (held.phase === 'handoff_running') {
       if (e.isAborted) $.ui.log('otomatik-devir: tur durduruldu; devir sürüyor', { to: 'debug' })
       await claim($, held.sid, h => h.phase === 'handoff_running', { isGateClosed: true })
+      // Decision 21a: this turn's last Stop saw its Workflows too.
+      const tasks = lastStopTasks?.turnId === e.turnId ? lastStopTasks.tasks : undefined
       if (
         held.starting === undefined &&
         (await isFresh($, held.file, held.handoffAt)) &&
-        (await runningWork($, undefined)).length === 0
+        (await runningWork($, tasks)).length === 0
       ) {
         const isReady = await claim(
           $,
@@ -2318,6 +2332,7 @@ export const register: Register = on => {
   // before it ends. A closed gate: once the file is written the handoff is `ready`.
   on('classic.Stop', async ($, e, next) => {
     if (e.agent_id !== undefined) return next(e)
+    lastStopTasks = { turnId: runningTurnId, tasks: e.background_tasks }
     // O5: the main chat's only Stop hold, before the mod-off return and (a).
     const orkestra = await orkestraDecision($, { isCycle: true })
     if (orkestra !== undefined) {

@@ -108,12 +108,16 @@ type Running = { id: string; description: string }[]
 const runningList = (running: Running): string =>
   running.map(work => `${work.id} (${work.description})`).join(', ')
 
-/** Stop block while subagents or Workflows run: wait inside the turn (Decision 3). */
-/** Decision 16: the system-prompt section that tells the model the mod owns the long-chat handoff. */
+/**
+ * Decision 16: the system-prompt section that tells the model the mod owns the
+ * long-chat handoff. The bare id is accepted at runtime (the engine's section
+ * check wants only a non-empty, unique id).
+ */
 export const LONG_CHAT_SECTION_ID = 'otomatik-devir'
 export const longChatNote = (threshold: number): string =>
   `otomatik-devir bu oturumda açık: devri mod yönetir. Bağlam büyüdü diye kendiliğinden devir yapma, my-skill-handoff çağırma, yeni sohbet ya da devam prompt'u önerme; işe devam et. Bağlam %${threshold}'e ulaşınca mod talimat verir, o talimata uy. Kullanıcı açıkça devir isterse: /devir simdi.`
 
+/** Stop block while subagents or Workflows run: wait inside the turn (Decision 3). */
 export const waitText = (running: Running): string =>
   `otomatik-devir: turu henüz bitirme; çalışan işler var: ${runningList(running)}. Sonuçlarını bu turun içinde bekle: Bash aracıyla \`perl -e 'select(undef,undef,undef,120)'\` çalıştır (120 saniye; tek bir bekleme en çok 5 dakika olsun), gelen sonuçları işle ve hiçbiri çalışmıyorsa turu yeniden bitirmeyi dene. Yeni alt ajan ya da Workflow başlatma.`
 
@@ -594,7 +598,8 @@ const watchModelStart = async (
   try {
     result = await next(input as unknown as ToolCallArgs)
   } catch (error) {
-    await patchConv($, sid, { starting: undefined })
+    // A start that threw is refused too (S6): the gate closes, the Stop makes it `ready`.
+    await patchConv($, sid, { starting: undefined, isGateClosed: true })
     throw error
   }
   if (result.deny !== undefined || result.isError === true) {
@@ -710,6 +715,9 @@ const runningWork = async ($: EngineInterface, tasks: readonly BackgroundTask[] 
 const OLD_KEY = /^(mod|depoGoruldu|aktarici|kendiKurulum)$/
 const OLD_PREFIX = /^(hazirlik|zincir|gorevModu|gonderildi|ipucu|istek|kurulumUyari):/
 const LOCK_STALE_MS = 5 * 60 * 1000
+// The scheduled-task tools may connect after session.start: retry in this session.
+const CLEANUP_RETRY_MS = 60 * 1000
+const CLEANUP_TRIES = 3
 const OWN_TASK_IN_TEXT = /otomatik-devir-[0-9a-f]{8}-(?:[1-9]\d*)?[ab](?![\w-])/g
 
 /** The mod's own task ids in a task list: its JSON (`taskId ?? id`), else ids named in its text. */
@@ -741,9 +749,11 @@ const toolNames = async ($: EngineInterface): Promise<ReadonlySet<string>> =>
  * Once per store (session.start, through `later`): old store keys go, then the
  * mod's own scheduled tasks, each only when `$.tool.check` allows the delete
  * with no dialog. The flag is set only when nothing of them is left, so a later
- * session retries. A lock keeps two sessions starting together from both running.
+ * session retries; without the task tools nothing could be checked, so no flag
+ * either, and this session tries again a minute later (at most 3 tries). A lock
+ * keeps two sessions starting together from both running.
  */
-const cleanupOnce = async ($: EngineInterface): Promise<void> => {
+const cleanupOnce = async ($: EngineInterface, attempt = 1): Promise<void> => {
   if ((await $.store.get(CLEANUP_FLAG)) !== undefined) return
   const sid = await $.session.id()
   const now = await $.clock.now()
@@ -764,16 +774,24 @@ const cleanupOnce = async ($: EngineInterface): Promise<void> => {
 
   let deleted = 0
   const tools = await toolNames($)
-  if (tools.has(LIST_TASKS) && tools.has(DELETE_TASK)) {
-    const listed = await callTool($, { tool: LIST_TASKS })
-    if (listed.deny !== undefined || listed.isError === true) return
-    for (const taskId of ownTaskIds(listed.text)) {
-      const check = await $.tool.check({ tool: DELETE_TASK, input: { taskId } })
-      if (check.decision !== 'allow') return
-      const gone = await callTool($, { tool: DELETE_TASK, taskId })
-      if (gone.deny !== undefined || gone.isError === true) return
-      deleted += 1
+  if (!tools.has(LIST_TASKS) || !tools.has(DELETE_TASK)) {
+    await $.store.delete(CLEANUP_LOCK).catch(() => undefined)
+    if (attempt < CLEANUP_TRIES) {
+      $.clock.after(CLEANUP_RETRY_MS, () => {
+        cleanupOnce($, attempt + 1).catch(error => $.ui.log(`otomatik-devir: ${String(error)}`, { to: 'debug' }))
+      })
     }
+
+    return
+  }
+  const listed = await callTool($, { tool: LIST_TASKS })
+  if (listed.deny !== undefined || listed.isError === true) return
+  for (const taskId of ownTaskIds(listed.text)) {
+    const check = await $.tool.check({ tool: DELETE_TASK, input: { taskId } })
+    if (check.decision !== 'allow') return
+    const gone = await callTool($, { tool: DELETE_TASK, taskId })
+    if (gone.deny !== undefined || gone.isError === true) return
+    deleted += 1
   }
   await $.store.set(CLEANUP_FLAG, { at: await $.clock.now(), deleted })
   await $.store.delete(CLEANUP_LOCK).catch(() => undefined)

@@ -15,6 +15,7 @@ import {
   nextMessageNote,
   READY_BAND,
   RUN_PREFIX,
+  START_NOW,
   timeoutText,
   waitText,
 } from '../hooks/register.tsx'
@@ -72,6 +73,11 @@ const setup = (
     checkDecision: 'allow' as string,
     checks: [] as any[],
     spawns: [] as any[],
+    // How start_session answers ('ok', 'error' = isError, 'throw'), a drop of the next
+    // submitted prompt, and a session.id that throws (a failing guard).
+    startMode: 'ok' as 'ok' | 'error' | 'throw',
+    dropNext: undefined as string | undefined,
+    failSid: false,
   }
   const clock = mock.clock(on, { now: NOW })
   const clone = (value: unknown) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)))
@@ -90,7 +96,10 @@ const setup = (
   // The plugins below this one in the shared band (other mods, or the engine).
   on('ui.render', { component: 'AbovePrompt' }, ($: any, e: any) => $.ui.resolve(e).Box({ key: 'below' }))
   on('session.start', ($: any, e: any) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: world.sid }))
+  on('session.id', () => {
+    if (world.failSid) throw new Error('session.id failed')
+    return { value: world.sid }
+  })
   on('session.root', () => ({ value: '/proj' }))
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.usage', () => ({
@@ -123,6 +132,8 @@ const setup = (
       return { result: [], text: JSON.stringify({ sessionId: 'local_self', title: 'Eski iş' }) }
     }
     if (e.tool === START) {
+      if (world.startMode === 'throw') throw new Error('start_session failed')
+      if (world.startMode === 'error') return { result: [], isError: true, text: 'refused by the app' }
       return { result: [], text: `Started session "${e.title}" (session_id: ${NEW_ID}, name: eski-is)` }
     }
     if (e.tool === TASKS) return { result: [], text: JSON.stringify(world.tasks) }
@@ -145,6 +156,11 @@ const setup = (
   })
   on('prompt.submit', ($: any, e: any) => {
     world.typed.push({ text: e.text, context: e.context ?? [] })
+    if (world.dropNext !== undefined) {
+      const drop = world.dropNext
+      world.dropNext = undefined
+      return { drop }
+    }
     return { text: e.text, context: e.context }
   })
   on('classic.Stop', () => ({}))
@@ -416,7 +432,7 @@ describe('otomatik-devir v1', () => {
     world.files[FILE] = { text: HANDOFF_TEXT, mtimeMs: NOW - 1 }
     expect((await startSession($)).deny).toBe(`otomatik-devir: önce devir dosyasını yaz: ${FILE}`)
     writeFile(world, clock)
-    const got = await startSession($)
+    const got = await startSession($, { initiation: 'offer', context: 'inherit' })
     expect(got.deny).toBeUndefined()
     const [sent] = callsOf(world, START)
     expect(callsOf(world, START)).toHaveLength(1)
@@ -739,5 +755,168 @@ describe('long-chat note', () => {
     const text = (await sections($)).at(-1)!.text
     expect(text).toContain('%15')
     expect(text).not.toContain('%60')
+  })
+})
+
+// T8 review: Spec items the V-tests left unchecked, and the fixes of review-1.md.
+describe('T8 review', () => {
+  /** A machine-turn trip, the file written, the Stop: phase `ready`. */
+  const toReady = async ($: any, world: any, clock: any) => {
+    await machine($, 'görev bildirimi')
+    await turnBegin($)
+    world.percent = 50
+    await bash($)
+    await clock.advance(100)
+    writeFile(world, clock)
+    await stop($, [])
+    await turnEnd($)
+    expect(await phase($)).toContain('aşama: ready')
+  }
+  const mountBand = ($: any, props: Record<string, unknown> = {}) =>
+    $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, ...props } } as any)
+  const bandText = async (ui: any) => JSON.stringify(await ui.drawn())
+
+  test('(R1, S11 fix) görev araçları yokken bayrak konmaz; araçlar bağlanınca aynı oturum yeniden dener', async ($, on) => {
+    const tools = [START, GET]
+    const { world, clock } = setup(on, { esik: 40, mod: 'sor', 'zincir:s0': { x: 1 } }, { tools })
+    world.tasks = [{ taskId: 'otomatik-devir-1a2b3c4d-a' }, { taskId: 'baska-gorev' }]
+    await start($)
+    await clock.advance(500)
+    // Store keys go at once; nothing could be listed, so no flag and no lock left.
+    expect(world.store.mod).toBeUndefined()
+    expect(world.store['zincir:s0']).toBeUndefined()
+    expect(world.store[CLEANUP_FLAG]).toBeUndefined()
+    expect(world.store['temizlik-kilit']).toBeUndefined()
+    expect(callsOf(world, TASKS)).toHaveLength(0)
+    // The MCP connects later: the retry a minute on deletes the task and sets the flag.
+    tools.push(TASKS, DELETE)
+    await clock.advance(60_000)
+    expect(callsOf(world, DELETE).map((c: any) => c.taskId)).toEqual(['otomatik-devir-1a2b3c4d-a'])
+    expect(world.store[CLEANUP_FLAG]).toMatchObject({ deleted: 1 })
+    expect(world.store.esik).toBe(40)
+  })
+
+  test('(R2, S6) reddedilen start_session (isError) kapıyı kapatır; Stop ready yapar, START_NOW yok', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await typedTrip($, world, clock)
+    writeFile(world, clock)
+    world.startMode = 'error'
+    expect((await startSession($)).isError).toBe(true)
+    expect(world.store[`${HANDED_PREFIX}s1`]).toBeUndefined()
+    const after = await stop($, [])
+    expect(after.block).toBeUndefined()
+    expect(await phase($)).toContain('aşama: ready')
+  })
+
+  test('(R3, S6 fix) hata fırlatan start_session da reddedilmiş sayılır: starting temizlenir, kapı kapanır', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await typedTrip($, world, clock)
+    writeFile(world, clock)
+    world.startMode = 'throw'
+    const got: any = await startSession($).catch((error: unknown) => ({ thrown: error }))
+    expect(got.deny).toBeUndefined()
+    expect(world.store[`${HANDED_PREFIX}s1`]).toBeUndefined()
+    // Gate closed: the Stop makes it ready instead of asking for another start (START_NOW).
+    expect((await stop($, [])).block).toBeUndefined()
+    expect(await phase($)).toContain('aşama: ready')
+    // `starting` was cleared: the next typed message can start the child.
+    world.startMode = 'ok'
+    await typed($, 'devam')
+    await turnBegin($)
+    expect((await startSession($)).deny).toBeUndefined()
+    expect(await phase($)).toContain('aşama: done')
+  })
+
+  test('(R4, S7c) yazılan turda dosya hazırsa Stop START_NOW ile tutar', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await typedTrip($, world, clock)
+    writeFile(world, clock)
+    const got = await stop($, [])
+    expect(got.block).toBe(START_NOW)
+    expect(got.block).toContain(START)
+  })
+
+  test('(R5, S8) düşürülen mesaj (drop) önceki aşamayı geri getirir', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await toReady($, world, clock)
+    world.dropNext = 'başka mod düşürdü'
+    await typed($, 'şunu yap')
+    expect(await phase($)).toContain('aşama: ready')
+    expect(world.store[`${RUN_PREFIX}s1`]).toMatchObject({ phase: 'ready' })
+    // Not instructed: the next turn's start_session is still the typed message's job, not this one's.
+    await typed($, 'şunu yap')
+    expect(world.typed.at(-1)?.context).toEqual([nextMessageNote(FILE, true)])
+    expect(await phase($)).toContain('aşama: handoff_running')
+  })
+
+  test('(R6, S2) depodaki devir:<sid> kapı kapalı geri yüklenir', async ($, on) => {
+    const { world } = setup(on, {
+      esik: 40,
+      [`${RUN_PREFIX}s1`]: { handoffId: 's1-x', file: FILE, handoffAt: NOW - 10, phase: 'handoff_running' },
+    })
+    await start($)
+    expect(await phase($)).toContain('aşama: handoff_running')
+    // Closed gate: a machine turn gets the closed-turn text, a typed message the next-message note.
+    await machine($, 'görev bildirimi')
+    await turnBegin($)
+    expect((await bash($)).context).toEqual([closedTurnHandoff(40, FILE)])
+    await turnEnd($)
+    await typed($, 'devam')
+    expect(world.typed.at(-1)?.context).toEqual([nextMessageNote(FILE, false)])
+  })
+
+  test('(R7, S1) devirde durum satırı: N alt ajan bitiyor; ready iken Devir hazır', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    world.agents = [{ id: 'a1', description: 'araştır', type: 'general-purpose', status: 'running' }]
+    await typedTrip($, world, clock)
+    expect(await phase($)).toContain('Devir: 1 alt ajan bitiyor')
+    world.agents = []
+    expect(await phase($)).toContain('Devir: %50 / eşik %40')
+  })
+
+  test('(R8, S4/S10) ready iken drain sürer; bant boştayken ve çalışırken çizilmez', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    const idle = await mountBand($)
+    expect(await bandText(idle)).not.toContain(READY_BAND)
+    await idle.unmount()
+    await toReady($, world, clock)
+    expect((await $.tool.call({ tool: 'Agent', prompt: 'x', description: 'y' } as any)).deny).toBe(DRAIN_DENY)
+    expect((await $.tool.call({ tool: 'Workflow', script: 'x' } as any)).deny).toBe(DRAIN_DENY)
+    const working = await mountBand($, { isWorking: true })
+    expect(await bandText(working)).not.toContain(READY_BAND)
+    expect(await bandText(working)).toContain('"below"')
+    await working.unmount()
+    const shown = await mountBand($)
+    expect(await bandText(shown)).toContain(READY_BAND)
+    await shown.unmount()
+  })
+
+  test('(R9, S4) koruma kancası hata verirse .catch drain sırasında yine reddeder', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await typedTrip($, world, clock)
+    world.failSid = true
+    expect((await $.tool.call({ tool: 'Agent', prompt: 'x', description: 'y' } as any)).deny).toBe(DRAIN_DENY)
+    const spawned: any = await $.agent.spawn({
+      tool_use_id: 'tu-x',
+      prompt: 'x',
+      description: 'x',
+      subagentType: 'general-purpose',
+      provider: { plugin: 'engine', tier: 'core' },
+      parentModel: 'claude-opus-5-5',
+      background: true,
+      fork: false,
+    } as any)
+    expect(spawned.deny).toBe(DRAIN_DENY)
+    expect(callsOf(world, 'Agent')).toHaveLength(0)
+    expect(world.spawns).toHaveLength(0)
+    // A tool outside the drain set still runs.
+    expect((await bash($)).deny).toBeUndefined()
   })
 })

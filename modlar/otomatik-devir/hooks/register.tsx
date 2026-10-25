@@ -1543,6 +1543,110 @@ const runningWork = async ($: EngineInterface, tasks: readonly BackgroundTask[] 
 
 
 // ---------------------------------------------------------------------------
+// The main chat's next step (O5, O6, O19): start, wait, relay or end.
+// ---------------------------------------------------------------------------
+
+type OrkestraDecision =
+  | { kind: 'pass' }
+  | { kind: 'start' | 'relay' | 'wait' | 'stalled'; n: number; text: string }
+  | { kind: 'end'; n: number; end: EndKind; text: string }
+
+/** The child's `isRunning` from `get_session` (O19); undefined when it cannot tell. */
+const childRunning = async ($: EngineInterface, childId: string): Promise<boolean | undefined> => {
+  try {
+    const got = await callTool($, { tool: GET_SESSION, session_id: childId })
+    if (got.deny !== undefined || got.isError === true || got.text === undefined) return undefined
+    const isRunning = record(JSON.parse(got.text))?.isRunning
+
+    return typeof isRunning === 'boolean' ? isRunning : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * What the main chat does next, from its record and its child's; undefined
+ * outside a live main chat. Decides only: its one write is O19's stall count,
+ * under `isCycle` (the Stop's wait cycle).
+ */
+const orkestraDecision = async (
+  $: EngineInterface,
+  opts: { isCycle?: boolean } = {},
+): Promise<{ decision: OrkestraDecision; main: OrkestraAna } | undefined> => {
+  if ((await roleOf($)) !== 'ana') return undefined
+  const localId = await selfLocal($)
+  const main = localId === undefined ? undefined : await readMain($, localId)
+  if (localId === undefined || main === undefined || main.ended !== undefined) return undefined
+  const done = (decision: OrkestraDecision) => ({ decision, main })
+  // Until T2b the global switch: off, the main chat is not held.
+  if (!(await readSettings($)).isEnabled || !main.isHeld) return done({ kind: 'pass' })
+  const now = await $.clock.now()
+  const n = main.n
+  const isStarting = isLiveStarting(main, now)
+  if (n === 0) {
+    return done(
+      isStarting
+        ? { kind: 'wait', n: 1, text: orkestraWaitText(1) }
+        : { kind: 'start', n, text: orkestraStartNote(childTitle(main.task, 1)) },
+    )
+  }
+  if (isStarting) return done({ kind: 'wait', n, text: orkestraWaitText(n) })
+  const child = await readChild($, main.childId)
+  const limit = await orkestraLimit($, localId)
+  const end = (kind: EndKind) =>
+    done({ kind: 'end', n, end: kind, text: orkestraEndText(kind, n, child?.report, child?.file, main.childId, limit) })
+  if (child?.status === 'finished') return end('bitti')
+  if (child?.status === 'ready') {
+    const text = await readFresh($, child.file, undefined)
+    if (text !== undefined && NONE_LEFT_RE.test(text)) return end('bitti')
+    if (main.isStopRequested === true) return end('durduruldu')
+    if (n >= limit) return end('sinir')
+
+    return done({ kind: 'relay', n, text: orkestraRelayText(n + 1, childTitle(main.task, n + 1)) })
+  }
+  // O19: the child not running, in STALL_CYCLES checks at least STALL_GAP_MS apart.
+  if (opts.isCycle === true && main.childId !== undefined && main.childId !== UNKNOWN_CHILD) {
+    let stallCount = main.stallCount
+    if (now - (main.stallAt ?? 0) >= STALL_GAP_MS) {
+      const isRunning = await childRunning($, main.childId)
+      if (isRunning === false) {
+        stallCount = (stallCount ?? 0) + 1
+        await patchMain($, localId, { stallCount, stallAt: now })
+      } else if (isRunning === true) {
+        stallCount = undefined
+        await patchMain($, localId, { stallCount: undefined, stallAt: now })
+      }
+    }
+    if ((stallCount ?? 0) >= STALL_CYCLES) {
+      return done({ kind: 'stalled', n, text: orkestraEndText('durdu', n, undefined, child?.file, main.childId) })
+    }
+  }
+
+  return done({ kind: 'wait', n, text: orkestraWaitText(n) })
+}
+
+/** O6: the main chat's start, relay or end rides on a tool result once per (N, kind). */
+const orkestraNote = async ($: EngineInterface): Promise<string | undefined> => {
+  try {
+    const held = await read($, conv)
+    if (held === null || held.role !== 'ana') return undefined
+    const got = await orkestraDecision($)
+    if (got === undefined) return undefined
+    const { decision } = got
+    if (decision.kind !== 'start' && decision.kind !== 'relay' && decision.kind !== 'end') return undefined
+    const key = `${decision.n}:${decision.kind}`
+    if (orkestraNoted === key) return undefined
+    orkestraNoted = key
+
+    return decision.text
+  } catch (error) {
+    $.ui.log(`otomatik-devir: ${String(error)}`, { to: 'debug' })
+
+    return undefined
+  }
+}
+
+// ---------------------------------------------------------------------------
 // One-time cleanup of v0.4/v0.5 leftovers (S11)
 // ---------------------------------------------------------------------------
 
@@ -1858,6 +1962,9 @@ export const register: Register = on => {
     }
     const result = await next(e)
     if (result.deny !== undefined) return result
+    // O6: the main chat's next step rides on this result.
+    const step = await orkestraNote($)
+    if (step !== undefined) return { ...result, context: [...(result.context ?? []), step] } as typeof result
     const note = await tripMidTurn($)
     if (note === undefined) return result
 
@@ -1876,6 +1983,37 @@ export const register: Register = on => {
   // before it ends. A closed gate: once the file is written the handoff is `ready`.
   on('classic.Stop', async ($, e, next) => {
     if (e.agent_id !== undefined) return next(e)
+    // O5: the main chat's only Stop hold, before the mod-off return and (a).
+    const orkestra = await orkestraDecision($, { isCycle: true })
+    if (orkestra !== undefined) {
+      const { decision, main } = orkestra
+      switch (decision.kind) {
+        case 'pass':
+          return next(e)
+        case 'start':
+        case 'relay': {
+          // At most 3 blocks per N, then the turn ends (and the chain pauses).
+          const blocks = orkestraStartBlocks?.n === main.n ? orkestraStartBlocks : { n: main.n, count: 0 }
+          if (blocks.count >= 3) return next(e)
+          orkestraStartBlocks = { n: main.n, count: blocks.count + 1 }
+
+          return { block: decision.text }
+        }
+        case 'end':
+          await patchMain($, main.localId, { ended: decision.end })
+          later($, () => refreshStatus($))
+
+          return { block: decision.text }
+        case 'stalled':
+          await patchMain($, main.localId, { ended: 'durdu' })
+          await patchConv($, main.sid, { stalledN: decision.n })
+          later($, () => refreshStatus($))
+
+          return { block: decision.text }
+        case 'wait':
+          return { block: decision.text }
+      }
+    }
     const settings = await readSettings($)
     if (!settings.isEnabled) return next(e)
     let held = await currentConv($)

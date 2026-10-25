@@ -138,6 +138,13 @@ export const START_NOW = `otomatik-devir: devir dosyası hazır. Turu bitirme: �
 export const DRAIN_DENY =
   'otomatik-devir: devir sürüyor; yeni alt ajan, Workflow ya da alt ajana mesaj başlatılamaz. Çalışan işlerin sonuçlarını işle ve devri tamamla.'
 
+/** Decision 16: the model's own my-skill-handoff call is refused while the mod is on. */
+export const SKILL_HANDOFF_DENY =
+  'otomatik-devir açık: devri mod yönetir, eşikte kendisi başlatır. Kendiliğinden devir yapma, işe devam et. Kullanıcı devir isterse: /devir simdi.'
+
+/** A typed message that asks for a handoff itself. */
+const HANDOFF_ASK = /handoff|devir|yeni (sohbet|chat)|new chat|continue in a new/i
+
 export const READY_BAND = 'Devir hazır: bir sonraki mesajınla yeni sohbet açılacak.'
 
 const MACHINE_TURN_DENY = `otomatik-devir: bu tur kullanıcının yazdığı bir tur değil; yeni sohbet bu turda açılamaz. Yeniden deneme, kart açma: kullanıcının bir sonraki mesajı yeni sohbeti açacak. Devir dosyasını yazdıysan turu bitir.`
@@ -548,6 +555,25 @@ const isDrainingNow = async ($: EngineInterface): Promise<boolean> =>
   isDrainPhase((await currentConv($)).phase)
 
 /**
+ * Decision 16: a Skill call of my-skill-handoff the model makes on its own
+ * (mod on, idle, not the mod's own `auto <file>` call, and the person's latest
+ * typed message does not ask for a handoff). Any error here is "no": a skill
+ * is never blocked by a failing check.
+ */
+const isUnaskedSkillHandoff = async ($: EngineInterface, call: Record<string, unknown>): Promise<boolean> => {
+  try {
+    if (call.tool !== 'Skill' || typeof call.skill !== 'string' || !call.skill.endsWith(SKILL)) return false
+    if (typeof call.args === 'string' && call.args.trimStart().startsWith('auto ')) return false
+    if (!(await readSettings($)).isEnabled) return false
+    const held = await currentConv($)
+
+    return held.phase === 'idle' && !HANDOFF_ASK.test(held.lastTyped ?? '')
+  } catch {
+    return false
+  }
+}
+
+/**
  * S6: the model's own start_session during the handoff. A session that
  * handed off never starts a second child; outside a handoff the call passes
  * untouched. Only a typed turn (`user_asked`) may start it, only once the
@@ -863,6 +889,14 @@ export const register: Register = on => {
   // left alone (it runs as typed).
   on('prompt.submit', async ($, e, next) => {
     const isPerson = isPersonSubmit(e)
+    // Decision 16: what the person last typed, to tell their handoff ask from the model's own.
+    if (isPerson) {
+      try {
+        await patchConv($, (await currentConv($)).sid, { lastTyped: e.text })
+      } catch (error) {
+        $.ui.log(`otomatik-devir: son istem kaydedilemedi: ${String(error)}`, { to: 'debug' })
+      }
+    }
     if (e.turnId !== undefined) {
       // Typed over a running turn: the app counts that turn as the person's
       // from then on; if the message waits, it opens the next turn too.
@@ -961,6 +995,8 @@ export const register: Register = on => {
     // S4 first, before the origin and subagent returns: the drain holds for
     // every caller.
     if (isDrainCall(call) && (await isDrainingNow($))) return { deny: DRAIN_DENY } as Out
+    // Decision 16: the mod owns the handoff; the model's own skill call is refused.
+    if (await isUnaskedSkillHandoff($, call)) return { deny: SKILL_HANDOFF_DENY } as Out
     // Only the model's own calls (the engine's call site): another plugin's
     // $.tool.call drops `context`, and its start_session is not the handoff.
     if (next.origin.plugin !== 'engine') return next(e)

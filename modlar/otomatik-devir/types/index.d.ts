@@ -42,6 +42,8 @@ export type OtomatikDevirConv = {
   notedTurn?: string
   /** `/devir dene <n>`: this chat's own threshold, over the store's `esik`. */
   testThreshold?: number
+  /** The person's latest typed message (composer/bridge/sdk), read to tell a user-asked handoff from the model's own. */
+  lastTyped?: string
 }
 
 declare module 'claude-code' {

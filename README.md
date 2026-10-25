@@ -80,11 +80,11 @@ Sonra Claude Code'u yeniden başlatın.
 
 ### otomatik-devir
 
-Sürüm 1.0.0. Alt satırdaki durum çubuğunda `Devir: %X / eşik %60` görürsünüz (ilk yanıttan önce %0 görünür). Devir tek modludur ve tıklamasızdır: tek bir kurulum yolu, ayar yok.
+Sürüm 1.0.0. Alt satırdaki durum çubuğunda `Devir: %X / eşik %60` görürsünüz (ilk yanıttan önce %0 görünür). Devir tek modludur ve tıklamasızdır: tek bir kurulum yolu, seçilecek bir mod yok.
 
 **Alt ajanları bekleyen tur sonu koruması.** Mod açıkken Claude, alt ajanlar ve Workflow'lar çalışırken turu bitirmez; her seferinde en fazla 5 dakikalık beklemelerle bekler ve sonra turu bitirmeyi yeniden dener. Arka plan Bash, Monitor ve geliştirme sunucuları beklenmez. Esc bu beklemeyi her zaman durdurur.
 
-Mod açıkken my-skill-orchestrate/execute kendi başına "uzun sohbet" devri yapmaz; devri eşikte mod yapar.
+Mod açıkken ve devir başlamamışken sistem prompt'una bir bölüm ekler: Claude bağlam büyüdü diye kendi başına devir yapmaz (my-skill-orchestrate/execute'un "uzun sohbet" devri dahil); devri eşikte mod yapar.
 
 **Eşiğe gelince:**
 1. Mod Claude'a turun içinde tek bir talimat verir: elindeki adımı bitir, yeni iş başlatma, devir dosyasını yazdır (`my-skill-handoff auto`; beceri yoksa modun kendi devir talimatı) ve yeni sohbeti aç.
@@ -153,7 +153,7 @@ claude plugin validate modlar/otomatik-devir
 claude plugin validate modlar/ilerleme-cubugu
 ```
 
-Çıktı, modun hangi işlemleri yaptığını listeler. İki modun listesinde de ağ çağrısı yoktur. ilerleme-cubugu yalnızca proje klasöründeki plan dosyalarını okur, hiçbir dosyaya yazmaz. otomatik-devir devam notunu Claude'a yazdırır (`.workflow/handoff/<oturum-kimliği>.md`); kendisi yalnızca eşikte Claude'un süren turuna talimat ekler, alt ajan başlatmayı eşikten sonra reddeder ve alt ajanlar çalışırken turun bitmesini engeller. Yeni sohbeti masaüstü uygulamasının oturum aracıyla (`start_session`) Claude'a açtırır; ilk yüklemede eski sürümün `otomatik-devir-*` zamanlanmış görevlerini siler.
+Çıktı, modun hangi işlemleri yaptığını listeler. İki modun listesinde de ağ çağrısı yoktur. ilerleme-cubugu yalnızca proje klasöründeki plan dosyalarını okur, hiçbir dosyaya yazmaz. otomatik-devir devam notunu Claude'a yazdırır (`.workflow/handoff/<oturum-kimliği>.md`); kendisi mod açıkken sistem prompt'una devri kendisinin yönettiğini söyleyen bir bölüm ekler, eşikte Claude'un süren turuna talimat ekler, alt ajan ve Workflow başlatmayı eşikten sonra reddeder ve alt ajanlar ya da Workflow'lar çalışırken turun bitmesini engeller. Yeni sohbeti masaüstü uygulamasının oturum aracıyla (`start_session`) Claude'a açtırır; ilk yüklemede eski sürümün `otomatik-devir-*` zamanlanmış görevlerini siler.
 
 ## Bilinen sınırlar
 

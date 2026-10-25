@@ -15,6 +15,7 @@ import {
   longChatNote,
   MANAGED_START_DENY,
   managedHandoff,
+  MAX_MISSING_BLOCKS,
   nextMessageNote,
   NORMAL_INFO,
   normalDeneText,
@@ -204,11 +205,14 @@ const setup = (
     world.calls.push(e)
     if (e.tool === GET) {
       if (role === 'yok') return { result: [], text: JSON.stringify({ sessionId: 'local_self', title: 'Eski iş' }) }
-      // s1 is the chain's child; any other session is a normal chat (no parent).
+      // s1 is the chain's child, s2 its second child once seeded (kimlik:s2, seedSecondChild);
+      // any other session is a normal chat (no parent).
       const self =
         world.sid === 's1'
           ? { sessionId: CHILD, parentSessionId: MAIN, title: 'Eski iş' }
-          : { sessionId: `local_${world.sid}`, title: 'Eski iş' }
+          : world.sid === 's2' && world.store[`${KIMLIK_PREFIX}s2`] === CHILD2
+            ? { sessionId: CHILD2, parentSessionId: MAIN, title: 'Eski iş' }
+            : { sessionId: `local_${world.sid}`, title: 'Eski iş' }
       return { result: [], text: JSON.stringify(self) }
     }
     if (e.tool === START) {
@@ -782,7 +786,8 @@ describe('otomatik-devir v1', () => {
     await start($)
     await typedTrip($, world, clock)
     // M2: no Stop (c) in a managed sub-chat; (d) asks for the file at most MAX_MISSING_BLOCKS (2) times.
-    for (let i = 0; i < 2; i += 1) {
+    expect(MAX_MISSING_BLOCKS).toBe(2)
+    for (let i = 0; i < MAX_MISSING_BLOCKS; i += 1) {
       expect((await stop($, [])).block).toBe(fileMissingText(FILE, false))
     }
     expect((await stop($, [])).block).toBeUndefined()

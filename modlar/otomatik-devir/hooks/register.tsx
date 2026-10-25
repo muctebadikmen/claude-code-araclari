@@ -74,7 +74,7 @@ export const DRAIN_TIMEOUT_MS = 30 * 60 * 1000
 export const MAX_HANDOFF_BLOCKS = 4
 // Blocks with timeoutText per handoff, and with fileMissingText per turn when the gate is closed.
 const MAX_TIMEOUT_BLOCKS = 2
-const MAX_MISSING_BLOCKS = 2
+export const MAX_MISSING_BLOCKS = 2
 
 /** The per-session handoff file: `<cwd>/.workflow/handoff/<sid>.md`. */
 export const handoffFile = (cwd: string, sid: string): string =>
@@ -607,21 +607,7 @@ const syncStore = async ($: EngineInterface, sid: string): Promise<void> => {
  */
 const syncChild = async ($: EngineInterface, held: OtomatikDevirConv): Promise<void> => {
   if (held.localId === undefined || held.phase === 'done') return
-  const own = await readRecord($, held.localId)
-  const base: OrkestraAlt | undefined =
-    own?.role === 'alt'
-      ? own
-      : held.parentId === undefined
-        ? undefined
-        : {
-            role: 'alt',
-            parent: held.parentId,
-            n: held.childN ?? 1,
-            sid: held.sid,
-            localId: held.localId,
-            status: 'working',
-            at: 0,
-          }
+  const base = await childBase($, held)
   if (base === undefined || base.status === 'finished' || base.status === 'cancelled') return
   const isReady = held.phase === 'ready'
   await writeRecord($, held.localId, {
@@ -633,6 +619,27 @@ const syncChild = async ($: EngineInterface, held: OtomatikDevirConv): Promise<v
 }
 
 /**
+ * A managed sub-chat's own record, else (its first write failed) one rebuilt
+ * from conv as `working`; undefined without a local id or parent.
+ */
+const childBase = async ($: EngineInterface, held: OtomatikDevirConv): Promise<OrkestraAlt | undefined> => {
+  if (held.localId === undefined) return undefined
+  const own = await readRecord($, held.localId)
+  if (own?.role === 'alt') return own
+  if (held.parentId === undefined) return undefined
+
+  return {
+    role: 'alt',
+    parent: held.parentId,
+    n: held.childN ?? 1,
+    sid: held.sid,
+    localId: held.localId,
+    status: 'working',
+    at: 0,
+  }
+}
+
+/**
  * O15: a `ready` sub-chat whose parent moved on (a later child, or the chain
  * ended) is consumed: `done`, so its drain lifts.
  */
@@ -640,6 +647,9 @@ const consumeChild = async ($: EngineInterface, held: OtomatikDevirConv): Promis
   if (held.parentId === undefined) return held
   const parent = await readRecord($, held.parentId).catch(() => undefined)
   if (parent?.role !== 'ana' || !(parent.n > (held.childN ?? 0) || parent.ended !== undefined)) return held
+  // O21 over O15 also when the chain settings were not readable now: a main
+  // chat that ended `kapatildi` was closed, so its ready child is cancelled.
+  if (parent.ended === 'kapatildi') return cancelHandoff($, held.sid, true)
   await setPhase($, held.sid, 'done')
   const now = await read($, conv)
 
@@ -729,8 +739,8 @@ const cancelHandoff = async ($: EngineInterface, sid: string, isNoticed: boolean
   await $.store.delete(`${RUN_PREFIX}${sid}`).catch(() => undefined)
   // O14, O21: the cancelled drain of a managed sub-chat; its main chat ends `kapatildi`.
   if (wasDrain && now.role === 'alt' && now.localId !== undefined) {
-    const own = await readRecord($, now.localId).catch(() => undefined)
-    if (own?.role === 'alt' && own.status !== 'finished' && own.status !== 'cancelled') {
+    const own = await childBase($, now).catch(() => undefined)
+    if (own !== undefined && own.status !== 'finished' && own.status !== 'cancelled') {
       await writeRecord($, own.localId, { ...own, status: 'cancelled', file: undefined, at: await $.clock.now() })
     }
   }
@@ -1078,8 +1088,9 @@ const readMain = async ($: EngineInterface, localId: string): Promise<OrkestraAn
 }
 
 const writeMain = async ($: EngineInterface, rec: OrkestraAna): Promise<void> => {
-  ownMain = rec
   await writeRecord($, rec.localId, rec)
+  // Cached once written: a failed write leaves the copy true to the file.
+  ownMain = rec
 }
 
 /** Read, merge, write this main chat's record; undefined when it has none. */
@@ -1219,12 +1230,14 @@ const resolveRole = async ($: EngineInterface, sid: string): Promise<OrkestraRol
     status: 'working',
     at: await $.clock.now(),
   }
-  await writeRecord($, localId, mine)
   const held = await read($, conv)
   // O11: a child with no own `/devir dene` inherits the chain's test threshold.
   const inherited =
     held?.testThreshold === undefined && parent.testThreshold !== undefined ? { testThreshold: parent.testThreshold } : {}
+  // The role is cached before the record write: a failed write still leaves
+  // this chat managed (O13 fails closed; syncChild writes the record later).
   await patchConv($, sid, { role: 'alt', parentId: parent.localId, childN: n, ...inherited })
+  await writeRecord($, localId, mine)
 
   return 'alt'
 }
@@ -1399,6 +1412,7 @@ const orkestraSubmit = async (
   if (localId === undefined) return isCommand ? { drop: NO_ID_DROP } : next(withContext(e, NO_ID_CONTEXT))
   const now = await $.clock.now()
   const first = childTitle(task, 1)
+  let isMainWritten = false
   try {
     await writeChainSettings($, localId, { at: now }) // D22: new chain settings
     const held = await read($, conv)
@@ -1414,11 +1428,18 @@ const orkestraSubmit = async (
       startedAt: now,
       at: now,
     })
+    isMainWritten = true
     await patchConv($, sid, { role: 'ana', childN: 0, isPaused: undefined, stalledN: undefined, starting: undefined })
   } catch (error) {
     // Fail closed: no main record, so no body may start child 1.
     $.ui.log(`otomatik-devir: zincir kaydı yazılamadı: ${String(error)}`, { to: 'debug' })
     ownMain = undefined
+    // A main record written before the failure goes too (a tombstone), so no
+    // later event resolves this chat as a main chat the person was told never started.
+    if (isMainWritten) {
+      await writeRecord($, localId, { gone: true, at: now }).catch(() => undefined)
+      await patchConv($, sid, { role: undefined, childN: undefined }).catch(() => undefined)
+    }
 
     return isCommand ? { drop: NO_ID_DROP } : next(withContext(e, NO_ID_CONTEXT))
   }
@@ -1481,6 +1502,17 @@ const isUnaskedSkillHandoff = async ($: EngineInterface, call: Record<string, un
 }
 
 /** A start in flight that is not stale (O4): an older one is a crash mid-start. */
+/** The main chat's start_session when the mod's own check failed (O4 fails closed). */
+const ORKESTRA_START_FAILED =
+  'otomatik-devir orkestra: alt sohbet şu an açılamadı (mod hatası); yeniden deneme. Kullanıcıya söyle ve turu bitir.'
+
+/** This chat's role as cached in conv (no resolution), for the tool.call `.catch` (O13). */
+const cachedRole = async ($: EngineInterface): Promise<OrkestraRole | undefined> => {
+  const held = await read($, conv)
+
+  return held !== null && held.sid === (await $.session.id()) ? held.role : undefined
+}
+
 const isLiveStarting = (main: OrkestraAna, now: number): boolean =>
   main.starting === true && now - (main.startingAt ?? 0) < STARTING_STALE_MS
 
@@ -2077,8 +2109,9 @@ export const register: Register = on => {
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
     try {
-      const settings = await readSettings($)
+      // currentConv first: after a sid change it restores the cached role readSettings reads.
       const held = await currentConv($)
+      const settings = await readSettings($)
       // O2: the main chat's own section (cached role only, never a GET); it never trips, so no long-chat note.
       if (held.role === 'ana') {
         const main = held.localId === undefined ? undefined : await readMain($, held.localId)
@@ -2257,9 +2290,9 @@ export const register: Register = on => {
       }
     }
     // O14: a managed sub-chat whose turn ends idle with nothing running is finished.
-    const childId = held.phase === 'idle' && (await roleOf($)) === 'alt' ? (await read($, conv))?.localId : undefined
-    if (childId !== undefined) {
-      const own = await readRecord($, childId)
+    const child = held.phase === 'idle' && (await roleOf($)) === 'alt' ? await read($, conv) : null
+    if (child !== null && child.sid === held.sid) {
+      const own = await childBase($, child)
       // Decision 21a: this turn's last Stop saw its Workflows too.
       const idleTasks = lastStopTasks?.turnId === e.turnId ? lastStopTasks.tasks : undefined
       if (
@@ -2338,9 +2371,18 @@ export const register: Register = on => {
     if (note === undefined) return result
 
     return { ...result, context: [...(result.context ?? []), note] } as typeof result
-  }).catch(($, e, next) =>
-    next.called ? next(e) : isDraining && DRAIN_TOOLS.has(e.tool) ? { deny: DRAIN_DENY } : next(e),
-  )
+  }).catch(async ($, e, next) => {
+    if (next.called) return next(e)
+    // O13, O4 fail closed: a hook that threw before `next` never lets a
+    // managed sub-chat's start or fork through, nor an unmanaged start of a main chat.
+    if (e.tool === START_SESSION || e.tool === HAND_OFF) {
+      const role = await cachedRole($).catch(() => undefined)
+      if (role === 'alt') return { deny: MANAGED_START_DENY }
+      if (role === 'ana' && e.tool === START_SESSION) return { deny: ORKESTRA_START_FAILED }
+    }
+
+    return isDraining && DRAIN_TOOLS.has(e.tool) ? { deny: DRAIN_DENY } : next(e)
+  })
 
   // S4 at the spawn itself: also a workflow's `agent()` calls and resumes.
   on('agent.spawn', async ($, e, next) => ((await isDrainingNow($)) ? { deny: DRAIN_DENY } : next(e))).catch(

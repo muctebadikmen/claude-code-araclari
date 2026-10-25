@@ -319,7 +319,7 @@ export const orkestraResumeNote = (n: number, state: string): string =>
 
 /** Appended to every child's prompt (O4). */
 export const managedChildNote = (n: number, limit: number): string =>
-  `\n\n## otomatik-devir\nBu sohbet otonom bir zincirin yönetilen alt sohbeti (${n}/${limit}). Kullanıcıya soru sorma, onay bekleme: kararları kendin ver ve gerekçesini yaz. Yeni sohbet açma, kendiliğinden devir yapma: bağlam eşiğe ulaşınca mod talimat verir. İş bitince sonucu kısaca raporla.`
+  `\n\n## otomatik-devir\nBu sohbet otonom bir zincirin yönetilen alt sohbeti (${n}/${limit}). Kullanıcıya soru sorma, onay bekleme: kararları kendin ver ve gerekçesini yaz. Yeni sohbet açma, kendiliğinden devir yapma: bağlam eşiğe ulaşınca mod talimat verir. Çok adımlı işi my-skill-orchestrate becerisiyle alt ajanlara dağıt; model seçimi o becerideki yönlendirmeye göre (varsayılan sonnet). İş bitince sonucu kısaca raporla.`
 
 /** A managed sub-chat's handoff (O12): the file only, the main chat starts the next one. */
 export const managedHandoff = (threshold: number, file: string, hasSkill = true): string =>

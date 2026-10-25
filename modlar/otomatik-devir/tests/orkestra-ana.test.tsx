@@ -431,6 +431,7 @@ describe('orkestra ana', () => {
     expect(sent.prompt.startsWith('Adım listesini uygula')).toBe(true)
     expect(sent.prompt).toContain(`## Kullanıcının asıl isteği\n${TASK}`)
     expect(sent.prompt).toContain(managedChildNote(1, 100))
+    expect(managedChildNote(1, 100)).toContain('my-skill-orchestrate')
     expect(rec(world, 'local_main')).toMatchObject({ n: 1, childId: childId(1) })
     await clock.advance(100)
     expect(Object.keys(world.store).filter(key => key.startsWith(HANDED_PREFIX))).toEqual([])

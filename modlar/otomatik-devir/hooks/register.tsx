@@ -275,7 +275,7 @@ export const orkestraRelayText = (n: number, title: string): string =>
   `otomatik-devir orkestra: alt sohbet ${n - 1} devir dosyasını yazdı. Turu bitirmeden sıradaki alt sohbeti (${n}) aç: ${START_SESSION} aracını bir kez çağır, initiation "user_asked", context "fresh", title "${title}"; prompt tek satır olsun, gerisini mod doldurur (devir dosyası).`
 
 /** Why a chain ended (types/index.d.ts `OrkestraEnd`). */
-type EndKind = NonNullable<OrkestraAna['ended']> | 'kapatildi' | 'dolu'
+type EndKind = NonNullable<OrkestraAna['ended']>
 
 /** The chain is over (O5/O6 `end`, O19 `durdu`): the main chat summarises and opens nothing. */
 export const orkestraEndText = (

@@ -1,7 +1,7 @@
 {
   "name": "otomatik-devir",
-  "version": "0.5.2",
-  "description": "Bağlam doluluğunu durum satırında gösterir; eşik aşılınca tek mesajla çalışan işleri bitirtir, yeni iş başlattırmaz, devam notu yazdırır ve yeni bir kardeş sohbette devam eder (otomatik modda tıklamasız; zamanlanmış görev sohbetleri de açık bir sohbetteki aktarıcı üzerinden aynı ayarlarla devretmeyi sürdürür); eski sohbet açık kalır (/devir).",
+  "version": "1.0.0",
+  "description": "Bağlam doluluğunu gösterir; eşikte çalışan alt ajanları bitirtir, yeni iş başlattırmaz, devir dosyası yazdırır ve devamı tıklamasız, iç içe yeni bir sohbette sürdürür (/devir).",
   "author": {
     "name": "Mustafa Dikmen",
     "url": "https://github.com/muctebadikmen"

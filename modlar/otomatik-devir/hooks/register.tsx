@@ -605,7 +605,7 @@ const syncChild = async ($: EngineInterface, held: OtomatikDevirConv): Promise<v
             status: 'working',
             at: 0,
           }
-  if (base === undefined || base.status === 'finished') return
+  if (base === undefined || base.status === 'finished' || base.status === 'cancelled') return
   const isReady = held.phase === 'ready'
   await writeRecord($, held.localId, {
     ...base,
@@ -672,26 +672,51 @@ const restoreHandoff = async ($: EngineInterface, sid: string): Promise<Otomatik
 
 /**
  * Cancels this chat's handoff whose child has not started (v1.0.1): back to
- * `idle` (this chat's `/devir dene` and last typed message kept), `devir:<sid>`
+ * `idle`, only the handoff fields cleared (O21: the role, ids, chain fields,
+ * `/devir dene`, last typed message and noted settings kept), `devir:<sid>`
  * deleted, the drain lifted, the band and status redrawn. `/devir kapat` runs
- * it, and so does any chat that sees the mod off (`isNoticed`: a toast says
- * so). A finished handoff (`done`, `devredildi:<sid>`) is never undone; a
- * handoff file already written stays on disk.
+ * it, and so does any chat that sees its chain closed (`isNoticed`: a toast
+ * says so). A finished handoff (`done`, `devredildi:<sid>`) is never undone; a
+ * handoff file already written stays on disk. A managed sub-chat whose drain
+ * it cancelled records itself `cancelled` (never relayed).
  */
 const cancelHandoff = async ($: EngineInterface, sid: string, isNoticed: boolean): Promise<OtomatikDevirConv> => {
   let now: OtomatikDevirConv = { sid, phase: 'idle' }
+  let wasDrain = false
   await update($, conv, (held): OtomatikDevirConv | null => {
     if (held !== null && held.sid !== sid) return held
     if (held?.phase === 'done') {
       now = held
       return held
     }
-    now = { sid, phase: 'idle', testThreshold: held?.testThreshold, lastTyped: held?.lastTyped }
+    wasDrain = held !== null && isDrainPhase(held.phase)
+    now = {
+      ...held,
+      sid,
+      phase: 'idle',
+      handoffId: undefined,
+      handoffAt: undefined,
+      file: undefined,
+      isGateClosed: undefined,
+      isForced: undefined,
+      starting: undefined,
+      pendingMessage: undefined,
+      instructNext: undefined,
+      instructedTurn: undefined,
+      notedTurn: undefined,
+    }
     return now
   })
   if (now.phase === 'done') return now
   isDraining = false
   await $.store.delete(`${RUN_PREFIX}${sid}`).catch(() => undefined)
+  // O14, O21: the cancelled drain of a managed sub-chat; its main chat ends `kapatildi`.
+  if (wasDrain && now.role === 'alt' && now.localId !== undefined) {
+    const own = await readRecord($, now.localId).catch(() => undefined)
+    if (own?.role === 'alt' && own.status !== 'finished' && own.status !== 'cancelled') {
+      await writeRecord($, own.localId, { ...own, status: 'cancelled', file: undefined, at: await $.clock.now() })
+    }
+  }
   later($, async () => {
     try {
       $.ui.invalidate('ui.render')
@@ -1272,7 +1297,28 @@ const orkestraTyped = async (
   const held = await read($, conv)
   if (held === null || held.sid !== sid || held.role !== 'ana' || held.localId === undefined) return undefined
   const main = await readMain($, held.localId)
-  if (main === undefined || main.ended !== undefined) return undefined
+  if (main === undefined) return undefined
+  if (main.ended !== undefined) {
+    // O7: a chain that ended while paused gives the next typed message its end text, once.
+    if (held.isPaused !== true) return undefined
+    await patchConv($, sid, { isPaused: undefined })
+    const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+    const limit = await orkestraLimit($, main.localId)
+    noteTyper(e, isPerson)
+    later($, () => refreshStatus($))
+
+    return next(withContext(e, orkestraEndText(main.ended, main.n, child?.report, child?.file, main.childId, limit)))
+  }
+  // O21: this chain closed: it ends here, nothing resumes.
+  if ((await readChainSettings($, main.localId).catch(() => undefined))?.isClosed === true) {
+    const child = main.n >= 1 ? await readChild($, main.childId) : undefined
+    await patchMain($, main.localId, { ended: 'kapatildi' })
+    await patchConv($, sid, { isPaused: undefined })
+    noteTyper(e, isPerson)
+    later($, () => refreshStatus($))
+
+    return next(withContext(e, orkestraEndText('kapatildi', main.n, child?.report, child?.file, main.childId)))
+  }
   const isNote = !CONTINUE_ONLY.test(e.text) && e.text.trim() !== ''
   const pending = isNote
     ? main.pendingMessage === undefined
@@ -1435,6 +1481,10 @@ const orkestraStart = async (
   const localId = await selfLocal($)
   const main = localId === undefined ? undefined : await readMain($, localId)
   if (localId === undefined || main === undefined) return undefined
+  // O21: no new sub-chat once this chain is closed (`ended` is written by O5/O6/O7).
+  if (main.ended === undefined && (await readChainSettings($, localId).catch(() => undefined))?.isClosed === true) {
+    return { deny: ORKESTRA_END_DENY }
+  }
   const limit = await orkestraLimit($, localId)
   if (main.ended !== undefined) return { deny: main.ended === 'sinir' ? orkestraCapDeny(limit) : ORKESTRA_END_DENY }
   if (!main.isHeld) return { deny: ORKESTRA_PAUSED_DENY }
@@ -1443,6 +1493,8 @@ const orkestraStart = async (
   const child = main.n >= 1 ? await readChild($, main.childId) : undefined
   let file: string | undefined
   if (main.n >= 1) {
+    // O21: a cancelled child is never relayed.
+    if (child?.status === 'cancelled') return { deny: ORKESTRA_END_DENY }
     if (child?.status !== 'ready') return { deny: orkestraBusyDeny(main.n) }
     file = child.file
     const text = await readFresh($, file, undefined)
@@ -1728,10 +1780,20 @@ const orkestraDecision = async (
   const main = localId === undefined ? undefined : await readMain($, localId)
   if (localId === undefined || main === undefined || main.ended !== undefined) return undefined
   const done = (decision: OrkestraDecision) => ({ decision, main })
-  // Until T2b the global switch: off, the main chat is not held.
-  if (!(await readSettings($)).isEnabled || !main.isHeld) return done({ kind: 'pass' })
-  const now = await $.clock.now()
   const n = main.n
+  // O21: this chain closed (`/devir kapat`) or its child cancelled: the chain ends first, paused too.
+  const isClosed = (await readChainSettings($, localId).catch(() => undefined))?.isClosed === true
+  const last = n >= 1 ? await readChild($, main.childId) : undefined
+  if (isClosed || last?.status === 'cancelled') {
+    return done({
+      kind: 'end',
+      n,
+      end: 'kapatildi',
+      text: orkestraEndText('kapatildi', n, last?.report, last?.file, main.childId),
+    })
+  }
+  if (!main.isHeld) return done({ kind: 'pass' })
+  const now = await $.clock.now()
   const isStarting = isLiveStarting(main, now)
   if (n === 0) {
     return done(
@@ -1741,7 +1803,7 @@ const orkestraDecision = async (
     )
   }
   if (isStarting) return done({ kind: 'wait', n, text: orkestraWaitText(n) })
-  const child = await readChild($, main.childId)
+  const child = last
   const limit = await orkestraLimit($, localId)
   const end = (kind: EndKind) =>
     done({ kind: 'end', n, end: kind, text: orkestraEndText(kind, n, child?.report, child?.file, main.childId, limit) })
@@ -2168,7 +2230,12 @@ export const register: Register = on => {
     const childId = held.phase === 'idle' && (await roleOf($)) === 'alt' ? (await read($, conv))?.localId : undefined
     if (childId !== undefined) {
       const own = await readRecord($, childId)
-      if (own?.role === 'alt' && own.status !== 'finished' && (await runningWork($, undefined)).length === 0) {
+      if (
+        own?.role === 'alt' &&
+        own.status !== 'finished' &&
+        own.status !== 'cancelled' &&
+        (await runningWork($, undefined)).length === 0
+      ) {
         await writeRecord($, own.localId, {
           ...own,
           status: 'finished',
@@ -2270,6 +2337,8 @@ export const register: Register = on => {
         case 'end':
           await patchMain($, main.localId, { ended: decision.end })
           later($, () => refreshStatus($))
+          // A paused main chat (O21): no block; its next typed message gets the end text (O7).
+          if (!main.isHeld) return next(e)
 
           return { block: decision.text }
         case 'stalled':
@@ -2427,7 +2496,10 @@ export const register: Register = on => {
       }
       case 'kapat': {
         if (isNormal) return { text: NORMAL_INFO }
-        await $.store.set('acik', false)
+        // O21: this chain's emergency stop; no other chain and no global key changes.
+        const chainId = await chainIdOf($)
+        if (chainId === undefined) return { text: NORMAL_INFO }
+        await patchChainSettings($, chainId, { isClosed: true })
         // v1.0.1: this chat's running or ready handoff is cancelled (a pending
         // `/devir simdi` too); a finished one stays.
         const wasHandoff = isDrainPhase(held.phase)
@@ -2435,9 +2507,11 @@ export const register: Register = on => {
         await refreshStatus($)
 
         return {
-          text: wasHandoff
-            ? `Otomatik devir kapatıldı; bu sohbetin ${held.phase === 'ready' ? 'hazır' : 'süren'} devri iptal edildi. Alt ajan ve Workflow yeniden başlatılabilir; yazılmış devir dosyası yerinde kalır.`
-            : 'Otomatik devir kapatıldı.',
+          text: `${
+            wasHandoff
+              ? `Otomatik devir kapatıldı; bu sohbetin ${held.phase === 'ready' ? 'hazır' : 'süren'} devri iptal edildi. Alt ajan ve Workflow yeniden başlatılabilir; yazılmış devir dosyası yerinde kalır.`
+              : 'Otomatik devir kapatıldı.'
+          } ${KAPAT_CHAIN}`,
         }
       }
       case 'ac':

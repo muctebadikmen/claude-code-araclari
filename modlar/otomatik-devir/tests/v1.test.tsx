@@ -15,6 +15,7 @@ import {
   nextMessageNote,
   READY_BAND,
   RUN_PREFIX,
+  SKILL_HANDOFF_DENY,
   START_NOW,
   timeoutText,
   waitText,
@@ -918,5 +919,56 @@ describe('T8 review', () => {
     expect(world.spawns).toHaveLength(0)
     // A tool outside the drain set still runs.
     expect((await bash($)).deny).toBeUndefined()
+  })
+})
+
+// T15 (Decision 16): the model's own my-skill-handoff call is refused while the mod is on.
+describe('skill handoff deny', () => {
+  const skill = ($: any, args?: string, name = SKILL) =>
+    $.tool.call({ tool: 'Skill', skill: name, ...(args === undefined ? {} : { args }) })
+
+  test('(a) açık + idle + yazılan istem "devam et": Skill my-skill-handoff reddedilir', async ($, on) => {
+    const { world } = setup(on)
+    await start($)
+    await typed($, 'devam et')
+    const got = await skill($)
+    expect(got.deny).toBe(SKILL_HANDOFF_DENY)
+    expect(callsOf(world, 'Skill')).toHaveLength(0)
+    // The plugin-qualified name is the same skill.
+    expect((await skill($, undefined, `my-skills:${SKILL}`)).deny).toBe(SKILL_HANDOFF_DENY)
+  })
+
+  test('(b) yazılan istem "handoff yap": geçer', async ($, on) => {
+    const { world } = setup(on)
+    await start($)
+    await typed($, 'devam et')
+    await typed($, 'handoff yap')
+    expect((await skill($)).deny).toBeUndefined()
+    expect(callsOf(world, 'Skill')).toHaveLength(1)
+  })
+
+  test('(c) args `auto /x.md`: geçer (modun kendi çağrısı)', async ($, on) => {
+    const { world } = setup(on)
+    await start($)
+    await typed($, 'devam et')
+    expect((await skill($, 'auto /x.md')).deny).toBeUndefined()
+    expect(callsOf(world, 'Skill')).toHaveLength(1)
+  })
+
+  test('(d) acik:false: geçer', async ($, on) => {
+    const { world } = setup(on, { esik: 40, acik: false })
+    await start($)
+    await typed($, 'devam et')
+    expect((await skill($)).deny).toBeUndefined()
+    expect(callsOf(world, 'Skill')).toHaveLength(1)
+  })
+
+  test('(e) başka beceriler geçer', async ($, on) => {
+    const { world } = setup(on)
+    await start($)
+    await typed($, 'devam et')
+    expect((await skill($, undefined, 'my-skill-audit')).deny).toBeUndefined()
+    expect((await skill($, undefined, 'my-skill-handoff-notes')).deny).toBeUndefined()
+    expect(callsOf(world, 'Skill')).toHaveLength(2)
   })
 })

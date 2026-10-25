@@ -84,7 +84,7 @@ Sürüm 1.0.0. Alt satırdaki durum çubuğunda `Devir: %X / eşik %60` görürs
 
 **Alt ajanları bekleyen tur sonu koruması.** Mod açıkken Claude, alt ajanlar ve Workflow'lar çalışırken turu bitirmez; her seferinde en fazla 5 dakikalık beklemelerle bekler ve sonra turu bitirmeyi yeniden dener. Arka plan Bash, Monitor ve geliştirme sunucuları beklenmez. Esc bu beklemeyi her zaman durdurur.
 
-Mod açıkken ve devir başlamamışken sistem prompt'una bir bölüm ekler: Claude bağlam büyüdü diye kendi başına devir yapmaz (my-skill-orchestrate/execute'un "uzun sohbet" devri dahil); devri eşikte mod yapar.
+Mod açıkken ve devir başlamamışken sistem prompt'una bir bölüm ekler: Claude bağlam büyüdü diye kendi başına devir yapmaz (my-skill-orchestrate/execute'un "uzun sohbet" devri dahil); devri eşikte mod yapar. Mod açıkken modelin kendi başına my-skill-handoff çağırması engellenir; devri eşikte mod yapar. Kapatmak için /devir kapat.
 
 **Eşiğe gelince:**
 1. Mod Claude'a turun içinde tek bir talimat verir: elindeki adımı bitir, yeni iş başlatma, devir dosyasını yazdır (`my-skill-handoff auto`; beceri yoksa modun kendi devir talimatı) ve yeni sohbeti aç.

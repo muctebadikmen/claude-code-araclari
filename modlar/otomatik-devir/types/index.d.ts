@@ -7,6 +7,79 @@ export type OtomatikDevirPhase =
   /** The child started; `devredildi:<sid>` keeps a second one from starting. */
   | 'done'
 
+/** This chat's part in an orchestration: the main chat, a child, or none. */
+export type OrkestraRole = 'ana' | 'alt' | 'yok'
+
+/** Why a chain ended: finished, hit the limit, stopped by the person, or stalled. */
+export type OrkestraEnd = 'bitti' | 'sinir' | 'durduruldu' | 'durdu'
+
+/** The main chat's orchestration record, keyed by its local id. */
+export type OrkestraAna = {
+  /** Marks the main chat's record. */
+  role: 'ana'
+  /** The main chat's conversation (transcript) id. */
+  sid: string
+  /** The main chat's local session id; the record's key. */
+  localId: string
+  /** The task the person gave the orchestration. */
+  task: string
+  /** The main chat's title; children are titled from it. */
+  title: string
+  /** How many children have been started so far. */
+  n: number
+  /** The latest child's local id. */
+  childId?: string
+  /** True while a start of the next child is in flight. */
+  starting?: true
+  /** Clock ms when the in-flight start began; an old one counts as stale. */
+  startingAt?: number
+  /** The main chat is held: its turns end without finishing until the chain ends. */
+  isHeld: boolean
+  /** The person asked the chain to stop. */
+  isStopRequested?: boolean
+  /** Set when the chain ended, with the reason. */
+  ended?: OrkestraEnd
+  /** Consecutive Stop cycles that found the child not running. */
+  stallCount?: number
+  /** Clock ms of the last stall check. */
+  stallAt?: number
+  /** The person's message waiting to be handed to the next child. */
+  pendingMessage?: string
+  /** This chain's own threshold, copied from the chat's `testThreshold`. */
+  testThreshold?: number
+  /** Clock ms when the orchestration started. */
+  startedAt: number
+  /** Clock ms of the last write to this record. */
+  at: number
+}
+
+/** A child chat's orchestration record, keyed by its local id. */
+export type OrkestraAlt = {
+  /** Marks a child's record. */
+  role: 'alt'
+  /** The parent's local id. */
+  parent: string
+  /** This child's number in the chain (1-based). */
+  n: number
+  /** The child's conversation (transcript) id. */
+  sid: string
+  /** The child's local session id; the record's key. */
+  localId: string
+  /** Where the child stands: working, handoff file ready, or the whole task finished. */
+  status: 'working' | 'ready' | 'finished'
+  /** The handoff file the child wrote, once ready. */
+  file?: string
+  /** The child's final report, once finished. */
+  report?: string
+  /** The child was aborted before it could hand off. */
+  isAborted?: boolean
+  /** Clock ms of the last write to this record. */
+  at: number
+}
+
+/** Either side of an orchestration record. */
+export type OrkestraRecord = OrkestraAna | OrkestraAlt
+
 export type OtomatikDevirConv = {
   /** The conversation (session id) this record belongs to; a /clear mints a new one. */
   sid: string
@@ -44,6 +117,18 @@ export type OtomatikDevirConv = {
   testThreshold?: number
   /** The person's latest typed message (composer/bridge/sdk), read to tell a user-asked handoff from the model's own. */
   lastTyped?: string
+  /** This chat's orchestration role; unset is the same as `yok`. */
+  role?: OrkestraRole
+  /** This chat's local session id (the key of its orchestration record). */
+  localId?: string
+  /** A child's parent, as a local id. */
+  parentId?: string
+  /** The main chat's count of children started. */
+  childN?: number
+  /** The main chat is paused: the chain does not start a new child until resumed. */
+  isPaused?: boolean
+  /** The main chat's running count of stalled-child Stop cycles. */
+  stalledN?: number
 }
 
 declare module 'claude-code' {

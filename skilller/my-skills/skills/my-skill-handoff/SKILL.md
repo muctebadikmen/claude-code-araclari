@@ -19,7 +19,7 @@ Used when the user asks for a new chat, or when a message gives a file path for 
 4. **Write `.workflow/HANDOFF.md`** (never the repo root) from the template. In a git repo make sure it is not ignored (init's `.gitignore` rule), commit it with STATE.md/PLAN.md/PROGRESS.md and nothing else, never push.
 5. **Print the resume prompt**, filled, in a code block, last in the reply. No table after it.
 
-**Target path given:** also write the filled resume prompt to exactly that path, paste-ready and self-contained (it may land right after a compaction): the plan/STATE/PROGRESS paths, the next step, agents and worktrees still in flight, and "continue non-stop". Ask nothing, then end the turn.
+**Target path given:** also write the filled resume prompt to exactly that path, paste-ready and self-contained (it may land right after a compaction): the plan/STATE/PROGRESS paths, the next step, agents and worktrees still in flight, and "continue non-stop". Ask nothing, then end the turn at once: the mod then compacts this chat and submits the prompt itself (no new chat).
 
 ## HANDOFF.md template
 

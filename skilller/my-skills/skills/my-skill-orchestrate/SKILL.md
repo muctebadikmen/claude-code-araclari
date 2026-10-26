@@ -19,7 +19,7 @@ The main chat decides, dispatches, relays and keeps state; sub-agents do the wor
 - **Honesty.** Report only what a sub-agent verified; "not run" is valid. Before telling the user to act outside the repo (portal, console), dispatch a diagnosis.
 - **Stop points (🛑).** Write STATE.md, report found / done / next in three lines, wait. Non-stop skills (execute) skip the wait.
 - **Questions policy.** Research and masterplan ask whatever they need: AskUserQuestion, ≤4 per call, more calls allowed, recommended option first, marked "(Recommended)". Execute, ship and handoff never ask.
-- **Long chats.** One chat runs the whole task. Keep STATE.md and the ledger current at every merge and phase so a handoff or compaction loses nothing. When a message says "Context handoff point reached", start nothing new, let running agents finish, update state, run `my-skill-handoff` and write the prompt to exactly the path the message gives, then end the turn. Otherwise invoke `my-skill-handoff` only when the user asks.
+- **Long chats.** One chat runs the whole task. Keep STATE.md and the ledger current at every merge and phase so a handoff or compaction loses nothing. When a message says "Context handoff point reached", start nothing new, let running agents finish, update state, run `my-skill-handoff` and write the prompt to exactly the path the message gives, then end the turn; the otomatik-devir mod compacts this same chat and submits that prompt itself, so never tell the user to open a new chat. Otherwise invoke `my-skill-handoff` only when the user asks.
 - **Overload fallback.** An agent dying with a 529/5xx is re-dispatched once; a second failure switches it to the other of sonnet/opus, noted in STATE.md.
 
 ## Model routing

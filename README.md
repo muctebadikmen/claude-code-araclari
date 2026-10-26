@@ -101,7 +101,7 @@ Sıkıştırmadan sonra ya da yeni sohbette devam prompt'u plan dosyalarından (
 
 ### otomatik-devir
 
-Uzun bir işi tek sohbette saatlerce sürdürmek için. Varsayılan olarak kapalıdır; yalnızca açtığınız sohbette çalışır. Bağlam eşiğe gelince Claude'a yeni iş başlatmamasını, süren alt ajanları bitirmesini ve devam prompt'unu `.workflow/devir/<sohbet-kimliği>.md` dosyasına yazmasını söyler. Dosya yazılıp alt ajanlar bitince sohbeti sıkıştırır ve işi o prompt'la aynı sohbette kendiliğinden sürdürür. Yeni sohbet açmaz.
+Uzun bir işi tek sohbette saatlerce sürdürmek için. Varsayılan olarak kapalıdır; yalnızca açtığınız sohbette çalışır. Bağlam eşiğe gelince Claude'a yeni iş başlatmamasını ve devam prompt'unu `.workflow/devir/<sohbet-kimliği>.md` dosyasına yazmasını söyler. Dosya yazılıp tur bitince sohbeti sıkıştırır ve işi o prompt'la aynı sohbette kendiliğinden sürdürür; arka planda süren alt ajanlar ve komutlar çalışmaya devam eder, sonuçları sıkıştırmadan sonra gelir. Claude dosyayı yazıp turu bitirmezse mod turu kendisi bitirir. Yeni sohbet açmaz.
 
 | Komut | Ne yapar |
 |---|---|
@@ -111,7 +111,7 @@ Uzun bir işi tek sohbette saatlerce sürdürmek için. Varsayılan olarak kapal
 | `/devir kapat` | Bu sohbette kapatır, süren devri iptal eder |
 | `/devir simdi` | Yüzdeye bakmadan devri hemen başlatır |
 
-Açık olduğu sohbette durum satırında `Devir açık · eşik %60 · şu an %34` yazar. Devam prompt'u iki denemede de yazılmazsa devir durur ve uyarı verir; `/devir simdi` ile yeniden deneyebilirsiniz.
+Açık olduğu sohbette durum satırında `Devir açık · eşik %60 · şu an %34` yazar. Devam prompt'u iki denemede de yazılmazsa devir bu seferlik bırakılır, uyarı verilir ve iş sürer; bağlam biraz daha dolunca devir yeniden dener.
 
 ## Kaldırma
 

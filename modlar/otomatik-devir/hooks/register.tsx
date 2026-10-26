@@ -4,33 +4,28 @@ import type { OtomatikDevirChat } from '../types'
 
 // otomatik-devir v2: a single-chat handoff. Off by default; `/devir ac` turns it
 // on for THIS chat. At the threshold the model is told to wind down and write a
-// continuation prompt to a file; once a main turn ends with that file written
-// and no sub-agent or background work running, the chat is compacted and the
-// file's text submitted. It never opens a new chat, never blocks or vetoes
-// anything, and on any error it logs to the debug log and does nothing.
+// continuation prompt to a file; once the file is written (after the latest
+// delivery) the main turn's end compacts the chat and submits the file's text.
+// Background agents and shells are not tracked: they live in the same process
+// and report after the compaction. It never opens a new chat, never blocks or
+// vetoes anything, and on any error it logs to the debug log and does nothing.
 
 const PLUGIN = 'otomatik-devir'
 export const DEFAULT_THRESHOLD = 60
 export const MIN_THRESHOLD = 20
 export const MAX_THRESHOLD = 90
-/** At or above this, Claude's own auto-compaction may come first: `/devir ac` warns. */
-export const WARN_THRESHOLD = 80
-/** After a handoff the next one needs the fill this many points over the lowest fill since. */
-export const MIN_GAP = 15
-/** A paused chat re-arms once the fill is this far under its threshold. */
-export const REARM_MARGIN = 10
-/** Re-sends of the wind-down message when a turn ends without the file. */
-export const MAX_RESENDS = 1
-/** Refused compactions per wind-down before it pauses. */
+export const WARN_THRESHOLD = 80 // at or above: Claude's own auto-compaction may come first
+export const MIN_GAP = 15 // after a handoff or give-up: the next needs floor + MIN_GAP too
+export const REDELIVER_STEP = 10 // mid-turn re-delivery when the fill moved this far since the last
+export const MAX_DELIVERIES = 3 // deliveries per wind-down inside running turns
+export const MAX_RESENDS = 1 // prompt re-sends when a turn ended without the file
+export const END_NOTE_TOOLS = 3 // after the "end your turn" note: this many main tool results...
+export const END_NOTE_MS = 10 * 60_000 // ...or this long, then the mod aborts the turn
 export const MAX_COMPACT_FAILS = 3
-/** The light re-check while the wind-down waits on work. */
-export const WAIT_TICK_MS = 45_000
-/** Waiting on sub-agents longer than this pauses the handoff. */
-export const MAX_WAIT_MS = 60 * 60_000
-/** Background shells are waited on this long after the wind-down began, then ignored. */
-export const SHELL_WAIT_MS = 10 * 60_000
-/** Used continuation files kept per folder. */
-export const KEEP_DONE = 3
+export const COMPACT_RETRY_MS = 30_000 // an idle compaction failure retries after this × failures
+export const ABORT_WAIT_MS = 5000 // after the mod's abort: re-check for its turn end this often...
+export const ABORT_CHECKS = 6 // ...this many times, then drive the handoff itself
+export const KEEP_DONE = 3 // used continuation files kept per folder
 
 const storeKey = (sid: string): string => `sohbet:${sid}`
 
@@ -40,25 +35,22 @@ export const handoffFile = (root: string, sid: string): string =>
 
 const dirOf = (file: string): string => file.slice(0, file.lastIndexOf('/'))
 
-// ---------------------------------------------------------------------------
-// Texts the model reads (English) and the person reads (Turkish)
-// ---------------------------------------------------------------------------
+// Texts the model reads (English) and the person reads (Turkish).
 
 export const windDownText = (file: string): string =>
-  'Context handoff point reached. Do not start new tasks or new sub-agents. Let running sub-agents/background work finish ' +
-  "and handle their results. Update the project's state/progress files. Then write a complete, paste-ready continuation " +
-  `prompt (use the my-skill-handoff skill if available) to the file ${file}. After writing it, end your turn.`
+  "Context handoff point reached. Do not start new tasks or new sub-agents. Update the project's state/progress files. " +
+  'Then write a complete, paste-ready continuation prompt (use the my-skill-handoff skill if available) to the file ' +
+  `${file}; list any sub-agents or background work still running in it (their results arrive after the handoff). ` +
+  'After writing it, end your turn. The conversation is then compacted in place and continues from that prompt.'
 
-export const RESEND_PREFIX = 'Reminder (otomatik-devir): the continuation prompt file is still missing or empty. '
+export const RESEND_PREFIX =
+  'Reminder (otomatik-devir): the continuation prompt file is missing, empty or older than this request. '
 
 export const RESUME_NOTE =
-  'otomatik-devir: the context handoff was cancelled or paused. Ignore the earlier handoff instruction (do not write the continuation prompt file) and continue the work normally; new tasks and sub-agents are allowed again.'
+  'otomatik-devir: the context handoff was cancelled. Ignore the earlier handoff instruction (do not write the continuation prompt file) and continue the work normally; new tasks and sub-agents are allowed again.'
 
 export const END_TURN_NOTE =
-  'otomatik-devir: the continuation prompt file is written. If no sub-agent or background work is still running, end your turn now so the handoff can run.'
-
-export const nudgeText = (file: string): string =>
-  `otomatik-devir: the sub-agents/background work have finished. Handle their results, make sure the continuation prompt file ${file} is up to date, then end your turn.`
+  'otomatik-devir: the continuation prompt file is written. End your turn now so the handoff can run; do not start further work.'
 
 export const COMPACT_INSTRUCTIONS =
   'Automatic context handoff (otomatik-devir). Write a short but useful summary: the current task and goal, the paths of the plan/state/progress files, ' +
@@ -71,55 +63,47 @@ export const continuationText = (text: string): string => `${CONTINUE_PREFIX}\n\
 
 export const USAGE = 'Kullanım: /devir [ac [eşik] | esik <20-90> | kapat | simdi]'
 export const TOAST_DONE = 'Bağlam temizlendi, iş devam ediyor'
-export const TOAST_MISSING = "Devir duraklatıldı: devam prompt'u dosyası yazılmadı. Yeniden denemek için /devir simdi."
-export const TOAST_WAIT = 'Devir duraklatıldı: alt ajanlar 60 dakikadır bitmedi. Yeniden denemek için /devir simdi.'
-export const TOAST_COMPACT = 'Devir duraklatıldı: sohbet sıkıştırılamadı. Yeniden denemek için /devir simdi.'
-export const TOAST_DROPPED = 'Devir duraklatıldı: devir mesajı gönderilemedi. Yeniden denemek için /devir simdi.'
+export const TOAST_GAVE_UP =
+  "Devir bu sefer olmadı (devam prompt'u yazılmadı ya da sohbet sıkıştırılamadı); iş sürüyor, eşik yeniden kuruldu."
 export const toastUndelivered = (file: string): string =>
-  `Sohbet sıkıştırıldı ama devam prompt'u gönderilemedi. Dosya: ${file}. Göndermek için /devir simdi (ya da prompt kutusundakini gönderin).`
+  `Sohbet sıkıştırıldı ama devam prompt'u gönderilemedi: prompt kutusuna kondu, göndermek için Enter. Dosya: ${file}`
 const WARN_HIGH = ` Uyarı: %${WARN_THRESHOLD} ve üstünde Claude'un kendi sıkıştırması önce gelebilir.`
 
-// ---------------------------------------------------------------------------
-// The chat record ($.store, keyed by session id: survives compaction, reloads, restarts)
-// ---------------------------------------------------------------------------
+// The chat record ($.store, keyed by session id: survives compaction, reloads, restarts).
 
 type Chat = OtomatikDevirChat
 
 const freshChat = (): Chat => ({ isOn: false, threshold: DEFAULT_THRESHOLD, phase: 'idle' })
 
-const WIND_DOWN_RESET: Partial<Chat> = {
-  startedAt: undefined,
-  file: undefined,
-  isDelivered: false,
-  resends: 0,
-  waitingSince: undefined,
-  workSeenAt: undefined,
-  isNudged: false,
-  isEndReminded: false,
-  compactFails: 0,
-}
+const WIND_DOWN_RESET: Partial<Chat> = { startedAt: undefined, file: undefined, deliveredAt: undefined, deliveredPercent: undefined }
+const COUNTS_RESET: Partial<Chat> = { deliveries: 0, resends: 0, endNoteAt: undefined, toolsSinceEndNote: 0, compactFails: 0 }
 
 export const isThreshold = (n: unknown): n is number =>
   typeof n === 'number' && Number.isInteger(n) && n >= MIN_THRESHOLD && n <= MAX_THRESHOLD
 
 const asChat = (value: unknown): Chat | undefined => {
-  if (typeof value !== 'object' || value === null) return undefined
-  const v = value as Partial<Chat>
-  if (typeof v.isOn !== 'boolean') return undefined
-  return {
-    ...freshChat(),
-    ...v,
-    threshold: isThreshold(v.threshold) ? v.threshold : DEFAULT_THRESHOLD,
-    phase: v.phase === 'winding' || v.phase === 'paused' ? v.phase : 'idle',
-  }
+  if (typeof value !== 'object' || value === null || typeof (value as Chat).isOn !== 'boolean') return undefined
+  const v = value as Chat
+  const chat: Chat = { ...freshChat(), ...v, threshold: isThreshold(v.threshold) ? v.threshold : DEFAULT_THRESHOLD }
+  // Older records: `paused` is idle now. A wind-down with no delivery on record (just
+  // begun, or left by an older version) starts over: no file written before the next delivery counts.
+  if (chat.phase !== 'winding') chat.phase = 'idle'
+  else if (chat.deliveredAt === undefined) Object.assign(chat, COUNTS_RESET)
+  return chat
 }
 
 const load = async ($: EngineInterface, sid: string): Promise<Chat | undefined> => asChat(await $.store.get(storeKey(sid)))
 
-const save = async ($: EngineInterface, sid: string, patch: Partial<Chat>): Promise<Chat> => {
-  const next: Chat = { ...((await load($, sid)) ?? freshChat()), ...patch }
-  await $.store.set(storeKey(sid), next)
-  return next
+/** Every write is a load + merge + set, one at a time: a parallel write never brings back an older record. */
+let saving: Promise<unknown> = Promise.resolve()
+const save = ($: EngineInterface, sid: string, patch: Partial<Chat>): Promise<Chat> => {
+  const run = saving.then(async () => {
+    const next: Chat = { ...((await load($, sid)) ?? freshChat()), ...patch }
+    await $.store.set(storeKey(sid), next)
+    return next
+  })
+  saving = run.catch(() => undefined)
+  return run
 }
 
 const parseThreshold = (raw: string | undefined): number | undefined => {
@@ -128,43 +112,38 @@ const parseThreshold = (raw: string | undefined): number | undefined => {
   return isThreshold(n) ? n : Number.NaN
 }
 
-// ---------------------------------------------------------------------------
-// Module state (a reload starts it over; the record above is the truth)
-// ---------------------------------------------------------------------------
+// Module state (a reload starts it over; the record above is the truth).
 
-type Work = { id: string; type: string; status: string }
-
+// The main loop's running turn: set only by its turn.start and turn.step, cleared by its own turn.complete.
 let isTurnRunning = false
-let lastTurnStartAt = 0
-/** Background work the main loop's last Stop listed. */
-let stopWork: readonly Work[] = []
-/** The wind-down (its startedAt) whose delivery is claimed: one per wind-down (and per compaction). */
-let deliveringFor: number | undefined
-/** The wind-down whose "end your turn" reminder is claimed. */
-let remindedFor: number | undefined
+let runningTurnId: string | undefined
+let endedTurnId: string | undefined // the latest main turn whose end was heard
+let abortedTurnId: string | undefined // the turn the mod aborted: its end is the handoff, not an Esc
+let claimed = new Set<string>() // claimed deliveries and end notes: parallel results deliver once
 let isBeginning = false
 let isFinishing = false
-/** Bumped by `/devir kapat`: a finish that began before it does nothing more. */
-let epoch = 0
+let epoch = 0 // bumped by `/devir kapat`: a finish begun before it does nothing more
 /** The continuation while the mod's own compaction runs: the first prompt to enter carries it. */
-let pending: { sid: string; text: string; isUsed: boolean } | undefined
-let waitTimer: { cancel: () => void } | undefined
-let emptyTicks = 0
+let pending: { sid: string; text: string; isUsed: boolean; isHandedOver?: boolean } | undefined
 let registeredSid: string | undefined
 
+const claim = (key: string): boolean => !claimed.has(key) && claimed.add(key).has(key)
+
 const debug = ($: EngineInterface, error: unknown): void => {
+  try { $.ui.log(`${PLUGIN}: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }) } catch { /* nothing else to do */ }
+}
+
+const safely = async ($: EngineInterface, work: () => Promise<unknown>): Promise<void> => {
   try {
-    $.ui.log(`${PLUGIN}: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
-  } catch {
-    // nothing else to do
+    await work()
+  } catch (error) {
+    debug($, error)
   }
 }
 
 /** Work that must not run inside the dispatch the turn waits on. */
-const later = ($: EngineInterface, work: () => Promise<void>): void => {
-  $.clock.after(50, () => {
-    work().catch(error => debug($, error))
-  })
+const later = ($: EngineInterface, work: () => Promise<unknown>, ms = 50): void => {
+  $.clock.after(ms, () => void safely($, work))
 }
 
 const contextPercent = async ($: EngineInterface): Promise<number | undefined> => {
@@ -178,25 +157,12 @@ const contextPercent = async ($: EngineInterface): Promise<number | undefined> =
 const fileOf = async ($: EngineInterface, sid: string, chat?: Chat): Promise<string> =>
   chat?.file ?? handoffFile(await $.session.root(), sid)
 
-const isLive = (status: string): boolean => status === 'running' || status === 'pending'
-
-/**
- * What the handoff waits on: sub-agents pending, running or waiting (a waiting
- * one still owes a result), workflows the last main Stop listed in flight, and
- * background shells for SHELL_WAIT_MS after the wind-down began.
- */
-export const runningWork = async ($: EngineInterface, chat: Chat): Promise<string[]> => {
-  const agents = (await $.agent.list()).filter(a => isLive(a.status) || a.status === 'waiting').map(a => a.id)
-  const isShellWaited = (await $.clock.now()) - (chat.startedAt ?? 0) < SHELL_WAIT_MS
-  const tasks = stopWork.filter(t => isLive(t.status) && (t.type === 'workflow' || (t.type === 'shell' && isShellWaited)))
-  return [...agents, ...tasks.map(t => t.id)]
-}
-
-/** The handoff file's text when it was written after the wind-down began; else undefined. */
+/** The handoff file's text when written after `since` (the latest delivery); else undefined. */
 const readFresh = async ($: EngineInterface, file: string, since: number | undefined): Promise<string | undefined> => {
+  if (since === undefined) return undefined
   try {
     const stat = await $.fs.stat(file)
-    if (stat.kind !== 'file' || (since !== undefined && stat.mtimeMs < since - 1000)) return undefined
+    if (stat.kind !== 'file' || stat.mtimeMs < since - 1000) return undefined
     const text = (await $.fs.read(file)).trim()
     return text === '' ? undefined : text
   } catch {
@@ -216,46 +182,39 @@ const ensureCommand = async ($: EngineInterface): Promise<void> => {
   })
 }
 
-// ---------------------------------------------------------------------------
-// Status line (Turkish), only where it is on
-// ---------------------------------------------------------------------------
-
-const statusText = (chat: Chat, percent: number | undefined): string => {
-  if (chat.phase === 'winding') return chat.waitingSince === undefined ? 'Devir: işler bitiriliyor…' : 'Devir: alt ajanlar bekleniyor…'
-  if (chat.undeliveredFile !== undefined) return "Devir: devam prompt'u gönderilemedi · /devir simdi"
-  if (chat.phase === 'paused') return 'Devir duraklatıldı · /devir simdi'
-  return `Devir açık · eşik %${chat.threshold} · şu an %${percent ?? 0}`
-}
-
+/** The status line (Turkish), only where it is on. */
 const refreshStatus = async ($: EngineInterface, percent?: number): Promise<void> => {
   const chat = await load($, await $.session.id())
   if (chat?.isOn !== true) return $.ui.status(undefined)
-  $.ui.status(statusText(chat, percent ?? (await contextPercent($))))
+  if (chat.phase === 'winding') return $.ui.status('Devir: işler bitiriliyor…')
+  $.ui.status(`Devir açık · eşik %${chat.threshold} · şu an %${percent ?? (await contextPercent($)) ?? 0}`)
 }
 
-// ---------------------------------------------------------------------------
-// Wind-down, delivery, finish
-// ---------------------------------------------------------------------------
+// Wind-down, delivery, finish.
 
-const stopWaitTimer = (): void => {
-  waitTimer?.cancel()
-  waitTimer = undefined
-  emptyTicks = 0
+/** Records one delivery of the wind-down message; false when a parallel caller took it. */
+const claimDelivery = async ($: EngineInterface, sid: string, chat: Chat, extra: Partial<Chat> = {}): Promise<boolean> => {
+  if (!claim(`${chat.startedAt}:${chat.deliveries ?? 0}`)) return false
+  const percent = await contextPercent($).catch(() => undefined)
+  await save($, sid, { deliveredAt: await $.clock.now(), deliveredPercent: percent, deliveries: (chat.deliveries ?? 0) + 1, ...extra })
+  return true
 }
 
-/** Tells the model, once, that the handoff no longer stands (as a prompt; a running turn hears it at a tool result). */
+/** Tells the model, once, that the handoff no longer stands (a running turn hears it at a tool result). */
 const submitResumeNote = async ($: EngineInterface, sid: string): Promise<void> => {
   if ((await load($, sid))?.isResumeNoteDue !== true) return
   await save($, sid, { isResumeNoteDue: false })
   await $.prompt.submit({ text: RESUME_NOTE })
 }
 
-const pause = async ($: EngineInterface, sid: string, toast: string, extra: Partial<Chat> = {}): Promise<void> => {
-  stopWaitTimer()
+/** The wind-down did not work out: back to idle, re-armed above the current fill; the model resumes. */
+const giveUp = async ($: EngineInterface, sid: string): Promise<void> => {
   const chat = await load($, sid)
-  const isNoteDue = chat?.phase === 'winding' && chat.isDelivered === true
-  await save($, sid, { phase: 'paused', ...WIND_DOWN_RESET, isResumeNoteDue: isNoteDue, ...extra })
-  $.ui.toast(toast, { timeoutMs: 10_000 })
+  if (chat?.isOn !== true || chat.phase !== 'winding') return
+  const percent = await contextPercent($).catch(() => undefined)
+  const isNoteDue = chat.deliveredAt !== undefined
+  await save($, sid, { phase: 'idle', ...WIND_DOWN_RESET, ...COUNTS_RESET, floor: percent ?? chat.threshold, isResumeNoteDue: isNoteDue })
+  $.ui.toast(TOAST_GAVE_UP, { timeoutMs: 10_000 })
   await refreshStatus($)
   if (isNoteDue && !isTurnRunning) later($, () => submitResumeNote($, sid))
 }
@@ -263,16 +222,13 @@ const pause = async ($: EngineInterface, sid: string, toast: string, extra: Part
 /** Submits the wind-down message as a prompt (it runs once the session is idle). */
 const submitWindDown = async ($: EngineInterface, sid: string, isResend: boolean): Promise<void> => {
   const chat = await load($, sid)
-  if (chat?.isOn !== true || chat.phase !== 'winding') return
-  // A turn started meanwhile and a tool result already carried it.
-  if (!isResend && (chat.isDelivered === true || deliveringFor === chat.startedAt)) return
-  deliveringFor = chat.startedAt
-  await save($, sid, { isDelivered: true, resends: (chat.resends ?? 0) + (isResend ? 1 : 0) })
+  if (chat?.isOn !== true || chat.phase !== 'winding' || (!isResend && chat.deliveredAt !== undefined)) return
+  if (!(await claimDelivery($, sid, chat, isResend ? { resends: (chat.resends ?? 0) + 1 } : {}))) return
   const text = windDownText(await fileOf($, sid, chat))
   const got = await $.prompt.submit({ text: isResend ? RESEND_PREFIX + text : text })
   if (got.drop !== undefined) {
-    await save($, sid, { isDelivered: false })
-    await pause($, sid, TOAST_DROPPED)
+    debug($, `wind-down prompt dropped: ${got.drop}`)
+    await giveUp($, sid)
   }
 }
 
@@ -284,13 +240,10 @@ const beginWindDown = async ($: EngineInterface, sid: string): Promise<void> => 
     const chat = await load($, sid)
     if (chat?.isOn !== true || chat.phase === 'winding') return
     const file = handoffFile(await $.session.root(), sid)
-    await save($, sid, { phase: 'winding', ...WIND_DOWN_RESET, startedAt: await $.clock.now(), file, undeliveredFile: undefined })
-    try {
-      await $.fs.write(`${dirOf(file)}/.gitignore`, '*\n')
-    } catch (error) {
-      debug($, error)
-    }
-    $.ui.toast("Devir başladı: süren işler bitiriliyor, devam prompt'u yazılacak.")
+    claimed.clear()
+    await save($, sid, { phase: 'winding', ...WIND_DOWN_RESET, ...COUNTS_RESET, startedAt: await $.clock.now(), file, isResumeNoteDue: false })
+    await safely($, () => $.fs.write(`${dirOf(file)}/.gitignore`, '*\n'))
+    $.ui.toast("Devir başladı: iş toparlanıyor, devam prompt'u yazılacak.")
     await refreshStatus($)
     if (!isTurnRunning) later($, () => submitWindDown($, sid, false))
   } finally {
@@ -298,23 +251,47 @@ const beginWindDown = async ($: EngineInterface, sid: string): Promise<void> => 
   }
 }
 
-/** Idle at max(threshold, floor + gap): begin. A paused chat re-arms well under its threshold. */
+/** Idle at max(threshold, floor + gap): begin. */
 const checkThreshold = async ($: EngineInterface, sid: string, given?: number): Promise<void> => {
   const chat = await load($, sid)
-  if (chat?.isOn !== true || chat.phase === 'winding' || isBeginning) return
+  if (chat?.isOn !== true || chat.phase !== 'idle' || isBeginning) return
   const percent = given ?? (await contextPercent($))
   if (percent === undefined) return
   if (chat.floor !== undefined && percent < chat.floor) await save($, sid, { floor: percent })
-  if (chat.phase === 'paused') {
-    if (chat.undeliveredFile === undefined && percent < chat.threshold - REARM_MARGIN) await save($, sid, { phase: 'idle' })
-    return
-  }
   const floor = Math.min(chat.floor ?? Number.NEGATIVE_INFINITY, percent)
   if (percent >= Math.max(chat.threshold, floor + MIN_GAP)) await beginWindDown($, sid)
 }
 
-/** What a main-loop tool result carries for the model, if anything. */
+/** Aborts the main turn that goes on past the end note; its end (turn.complete, isAborted) runs the handoff. */
+const abortTurn = ($: EngineInterface, sid: string, turnId: string, started: number): void => {
+  abortedTurnId = turnId
+  const isCancelled = (): boolean => abortedTurnId !== turnId || epoch !== started // `/devir kapat` since
+  later($, async () => {
+    if (isCancelled()) return
+    try {
+      await $.turn.abort({ turnId })
+    } catch (error) {
+      abortedTurnId = undefined
+      return debug($, error)
+    }
+    // An aborted run's end is heard (its turn.complete clears abortedTurnId). While the
+    // turn still counts as running, check again; after ABORT_CHECKS, drive the handoff here.
+    const check = async (tries: number): Promise<void> => {
+      if (isCancelled()) return
+      if (runningTurnId === turnId && tries < ABORT_CHECKS) return later($, () => check(tries + 1), ABORT_WAIT_MS)
+      if (runningTurnId === turnId) {
+        isTurnRunning = false
+        runningTurnId = undefined
+      } else if (runningTurnId !== undefined) return // another turn runs: its end hands off
+      await afterTurn($, sid, false)
+    }
+    later($, () => check(1), ABORT_WAIT_MS)
+  })
+}
+
+/** What a main-loop tool result carries for the model, at the tool boundary of a running turn. */
 const midTurnNote = async ($: EngineInterface, sid: string): Promise<string | undefined> => {
+  const started = epoch
   let chat = await load($, sid)
   if (chat === undefined) return undefined
   if (chat.isResumeNoteDue === true) {
@@ -324,37 +301,42 @@ const midTurnNote = async ($: EngineInterface, sid: string): Promise<string | un
   if (!chat.isOn) return undefined
   await checkThreshold($, sid)
   chat = await load($, sid)
-  if (chat?.phase !== 'winding' || chat.startedAt === undefined) return undefined
-  const startedAt = chat.startedAt
-  if (chat.isDelivered !== true) {
-    if (deliveringFor === startedAt) return undefined
-    deliveringFor = startedAt
-    await save($, sid, { isDelivered: true })
-    return windDownText(await fileOf($, sid, chat))
+  if (chat?.phase !== 'winding') return undefined
+  const file = await fileOf($, sid, chat)
+  if ((await readFresh($, file, chat.deliveredAt)) === undefined) {
+    // Not delivered yet, or the fill moved far since: more work (capped), or a compaction
+    // dropped the message (a drop always re-delivers; it needs the fill to fall each time).
+    const percent = await contextPercent($).catch(() => undefined)
+    const last = chat.deliveredPercent
+    if (chat.deliveredAt !== undefined && last === undefined && percent !== undefined) {
+      await save($, sid, { deliveredPercent: percent }) // delivered while the fill was unknown: this is the baseline
+      return undefined
+    }
+    const isMoved = percent !== undefined && last !== undefined && Math.abs(percent - last) >= REDELIVER_STEP
+    const isDrop = isMoved && percent < last
+    const isDue = chat.deliveredAt === undefined || isDrop || (isMoved && (chat.deliveries ?? 0) < MAX_DELIVERIES)
+    return isDue && (await claimDelivery($, sid, chat)) ? windDownText(file) : undefined
   }
-  // The file is written but the turn goes on: one reminder to end it.
-  if (chat.isEndReminded === true || remindedFor === startedAt) return undefined
-  if ((await readFresh($, await fileOf($, sid, chat), startedAt)) === undefined) return undefined
-  if ((await runningWork($, chat)).length > 0 || remindedFor === startedAt) return undefined
-  remindedFor = startedAt
-  await save($, sid, { isEndReminded: true })
-  return END_TURN_NOTE
+  // The file is written but the turn goes on: one note per turn, then the turn is ended for it.
+  const now = await $.clock.now()
+  if (chat.endNoteAt === undefined) {
+    if (!claim(`end:${chat.deliveredAt}:${runningTurnId}`)) return undefined
+    await save($, sid, { endNoteAt: now, toolsSinceEndNote: 0 })
+    return END_TURN_NOTE
+  }
+  const tools = (chat.toolsSinceEndNote ?? 0) + 1
+  await save($, sid, { toolsSinceEndNote: tools })
+  const isOverdue = tools >= END_NOTE_TOOLS || now - chat.endNoteAt >= END_NOTE_MS
+  if (isOverdue && runningTurnId !== undefined && abortedTurnId !== runningTurnId) abortTurn($, sid, runningTurnId, started)
+  return undefined
 }
 
 /** Keeps the used file as `<sid>.done-<time>.md`, and only the newest KEEP_DONE of those. */
 const archive = async ($: EngineInterface, file: string, text: string): Promise<void> => {
   const stamp = new Date(await $.clock.now()).toISOString().replace(/[:.]/g, '-')
   const done = file.replace(/\.md$/, `.done-${stamp}.md`)
-  let isMoved = false
-  try {
-    isMoved = (await $.process.run(['mv', file, done])).exitCode === 0
-  } catch (error) {
-    debug($, error)
-  }
-  if (!isMoved) {
-    await $.fs.write(done, text)
-    await $.fs.write(file, '')
-  }
+  const isMoved = await $.process.run(['mv', file, done]).then(r => r.exitCode === 0, () => false)
+  if (!isMoved) await $.fs.write(done, text).then(() => $.fs.write(file, ''))
   const dir = dirOf(file)
   const old = (await $.fs.list(dir))
     .filter(entry => /\.done-.+\.md$/.test(entry.name))
@@ -363,13 +345,12 @@ const archive = async ($: EngineInterface, file: string, text: string): Promise<
   if (old.length > 0) await $.process.run(['rm', '-f', ...old.map(entry => `${dir}/${entry.name}`)])
 }
 
-/** Compacts between turns, then submits the continuation prompt (unless a prompt that entered first carried it). */
+/** Compacts between turns, then submits the continuation (unless a prompt that entered first carried it). */
 const finish = async ($: EngineInterface, sid: string, text: string): Promise<void> => {
   if (isFinishing) return
   isFinishing = true
   const started = epoch
   try {
-    stopWaitTimer()
     const chat = await load($, sid)
     if (chat?.isOn !== true || chat.phase !== 'winding') return
     const file = await fileOf($, sid, chat)
@@ -379,42 +360,39 @@ const finish = async ($: EngineInterface, sid: string, text: string): Promise<vo
     try {
       compacted = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS })
     } catch (error) {
-      // A turn started meanwhile: the next main turn end tries again (bounded).
       pending = undefined
       debug($, error)
-      const fails = (chat.compactFails ?? 0) + 1
-      if (fails >= MAX_COMPACT_FAILS) await pause($, sid, TOAST_COMPACT)
-      else await save($, sid, { compactFails: fails })
-      return
+      if (isTurnRunning) return // a turn started meanwhile: its end tries again, not counted
+      // Failed while idle (the summary request erred): retry after a wait, bounded, then give up.
+      const fails = ((await load($, sid))?.compactFails ?? 0) + 1
+      if (fails >= MAX_COMPACT_FAILS) return giveUp($, sid)
+      await save($, sid, { compactFails: fails })
+      return later($, () => afterTurn($, sid, false), COMPACT_RETRY_MS * fails)
     }
-    const isUsed = pending?.isUsed === true
+    const handed = pending
     pending = undefined
+    const isUsed = handed?.isUsed === true
     if (compacted.skip !== undefined) {
       debug($, `compaction skipped: ${compacted.skip}`)
-      return pause($, sid, TOAST_COMPACT)
+      return giveUp($, sid)
     }
     // `/devir kapat` during the compaction wins: nothing more.
     const now = await load($, sid)
     if (epoch !== started || now?.isOn !== true || now.phase !== 'winding') return
-    await save($, sid, {
-      phase: 'idle',
-      ...WIND_DOWN_RESET,
-      floor: before ?? now.threshold,
-      handoffs: (now.handoffs ?? 0) + 1,
-    })
+    await save($, sid, { phase: 'idle', ...WIND_DOWN_RESET, ...COUNTS_RESET, floor: before ?? now.threshold, handoffs: (now.handoffs ?? 0) + 1 })
+    if (handed !== undefined) handed.isHandedOver = isUsed // a prompt carrying it that is dropped later re-sends it
     if (!isUsed) {
       const got = await $.prompt.submit({ text: continuationText(text), asUser: true }).catch(error => {
         debug($, error)
         return { drop: 'rejected' }
       })
       if (got.drop !== undefined) {
-        await save($, sid, { phase: 'paused', undeliveredFile: file })
-        await $.prompt.fill({ text: continuationText(text) }).catch(error => debug($, error))
-        $.ui.toast(toastUndelivered(file), { timeoutMs: 20_000 })
-        return refreshStatus($)
+        // The file stays where it is; the person sends it from the prompt box.
+        await safely($, () => $.prompt.fill({ text: continuationText(text) }))
+        return $.ui.toast(toastUndelivered(file), { timeoutMs: 30_000 })
       }
     }
-    await archive($, file, text).catch(error => debug($, error))
+    await safely($, () => archive($, file, text))
     $.ui.toast(TOAST_DONE, { timeoutMs: 8000 })
     await refreshStatus($)
   } finally {
@@ -422,83 +400,20 @@ const finish = async ($: EngineInterface, sid: string, text: string): Promise<vo
   }
 }
 
-/** The light re-check while the wind-down waits on work. It never compacts: it gives the model a turn. */
-const waitTick = async ($: EngineInterface, sid: string): Promise<void> => {
-  const chat = await load($, sid)
-  if (chat?.isOn !== true || chat.phase !== 'winding') return stopWaitTimer()
-  const now = await $.clock.now()
-  if (chat.waitingSince !== undefined && now - chat.waitingSince >= MAX_WAIT_MS) return pause($, sid, TOAST_WAIT)
-  if ((await runningWork($, chat)).length > 0) {
-    emptyTicks = 0
-    await save($, sid, { workSeenAt: now })
-    return
-  }
-  if (isTurnRunning || isFinishing) {
-    emptyTicks = 0
-    return
-  }
-  emptyTicks += 1
-  // The work ended and no turn picked its results up: ask for one (once).
-  if (emptyTicks < 2) return
-  stopWaitTimer()
-  if (chat.isNudged === true) return
-  await save($, sid, { isNudged: true })
-  await $.prompt.submit({ text: nudgeText(await fileOf($, sid, chat)) })
-}
-
-const startWaitTimer = ($: EngineInterface, sid: string): void => {
-  if (waitTimer !== undefined) return
-  waitTimer = $.clock.every(WAIT_TICK_MS, () => {
-    waitTick($, sid).catch(error => debug($, error))
-  })
-}
-
-/** After a main turn ended: deliver, wait, re-send, pause or finish. */
-const afterTurn = async ($: EngineInterface, isAborted: boolean): Promise<void> => {
-  const sid = await $.session.id()
+/** After a main turn ended: hand off when the file is fresh, else re-send once, else give up. */
+const afterTurn = async ($: EngineInterface, sid: string, isPersonAbort: boolean): Promise<void> => {
   const chat = await load($, sid)
   if (chat?.isOn !== true) return
   if (chat.phase !== 'winding') return checkThreshold($, sid)
-  if (isAborted || isTurnRunning) return
-  if (chat.isDelivered !== true) return submitWindDown($, sid, false)
-  const text = await readFresh($, await fileOf($, sid, chat), chat.startedAt)
-  const now = await $.clock.now()
-  if ((await runningWork($, chat)).length > 0) {
-    await save($, sid, { workSeenAt: now, waitingSince: chat.waitingSince ?? now })
-    await refreshStatus($)
-    return startWaitTimer($, sid)
-  }
-  // Work was seen after this turn began: its results may not be handled yet.
-  if (chat.workSeenAt !== undefined && chat.workSeenAt >= lastTurnStartAt) return startWaitTimer($, sid)
+  if (isPersonAbort || isTurnRunning) return
+  if (chat.deliveredAt === undefined) return submitWindDown($, sid, false)
+  const text = await readFresh($, await fileOf($, sid, chat), chat.deliveredAt)
   if (text !== undefined) return finish($, sid, text)
   if ((chat.resends ?? 0) < MAX_RESENDS) return submitWindDown($, sid, true)
-  await pause($, sid, TOAST_MISSING)
+  await giveUp($, sid)
 }
 
-// ---------------------------------------------------------------------------
 // /devir
-// ---------------------------------------------------------------------------
-
-const PHASE_TR: Record<Chat['phase'], string> = {
-  idle: 'izleniyor',
-  winding: 'işler bitiriliyor',
-  paused: 'duraklatıldı (/devir simdi ile yeniden dene)',
-}
-
-/** `/devir simdi` after a continuation could not be submitted: send it now. */
-const resendContinuation = async ($: EngineInterface, sid: string, file: string): Promise<string> => {
-  const text = await readFresh($, file, undefined)
-  await save($, sid, { phase: 'idle', undeliveredFile: undefined })
-  if (text === undefined) return `Devam prompt'u dosyası bulunamadı: ${file}`
-  const got = await $.prompt.submit({ text: continuationText(text), asUser: true })
-  if (got.drop !== undefined) {
-    await save($, sid, { phase: 'paused', undeliveredFile: file })
-    return `Devam prompt'u yine gönderilemedi. Dosya: ${file}`
-  }
-  await archive($, file, text).catch(error => debug($, error))
-  await refreshStatus($)
-  return "Devam prompt'u gönderildi."
-}
 
 const devirCommand = async ($: EngineInterface, args: string): Promise<string> => {
   const [verb = '', value] = args.trim().split(/\s+/)
@@ -510,16 +425,15 @@ const devirCommand = async ($: EngineInterface, args: string): Promise<string> =
   switch (verb.toLowerCase()) {
     case '': {
       if (!chat.isOn) return `Devir bu sohbette kapalı (şu an %${percent ?? 0}). Açmak için: /devir ac [eşik]`
-      const wait = chat.phase === 'winding' && chat.waitingSince !== undefined ? ' · alt ajanlar bekleniyor' : ''
-      const file = chat.phase === 'winding' ? ` · dosya: ${await fileOf($, sid, chat)}` : ''
-      return `Devir açık · eşik %${chat.threshold} · şu an %${percent ?? 0} · aşama: ${PHASE_TR[chat.phase]}${wait}${file}`
+      const phase = chat.phase === 'winding' ? `işler bitiriliyor · dosya: ${await fileOf($, sid, chat)}` : 'izleniyor'
+      return `Devir açık · eşik %${chat.threshold} · şu an %${percent ?? 0} · aşama: ${phase}`
     }
     case 'ac':
     case 'aç': {
       const n = parseThreshold(value)
       if (Number.isNaN(n)) return `Eşik ${MIN_THRESHOLD}-${MAX_THRESHOLD} arasında bir tam sayı olmalı. ${USAGE}`
       const threshold = n ?? chat.threshold
-      await save($, sid, { isOn: true, threshold, ...(chat.phase === 'paused' && !chat.undeliveredFile ? { phase: 'idle' } : {}) })
+      await save($, sid, { isOn: true, threshold })
       if (!chat.isOn) $.ui.toast(`Devir açıldı (eşik %${threshold})`)
       await refreshStatus($, percent)
       return `Devir bu sohbette açık · eşik %${threshold} · şu an %${percent ?? 0}. Kapatmak için: /devir kapat${warn(threshold)}`
@@ -530,20 +444,16 @@ const devirCommand = async ($: EngineInterface, args: string): Promise<string> =
       if (n === undefined || Number.isNaN(n)) return `Kullanım: /devir esik <${MIN_THRESHOLD}-${MAX_THRESHOLD}>`
       await save($, sid, { threshold: n })
       await refreshStatus($, percent)
-      return (chat.isOn ? `Bu sohbetin devir eşiği %${n}.` : `Bu sohbetin devir eşiği %${n} (devir kapalı; açmak için /devir ac).`) + warn(n)
+      const off = chat.isOn ? '' : ' (devir kapalı; açmak için /devir ac)'
+      return `Bu sohbetin devir eşiği %${n}${off}.${warn(n)}`
     }
     case 'kapat': {
       epoch += 1
       pending = undefined
-      stopWaitTimer()
+      abortedTurnId = undefined
       const wasWinding = chat.phase === 'winding'
-      await save($, sid, {
-        isOn: false,
-        phase: 'idle',
-        ...WIND_DOWN_RESET,
-        undeliveredFile: undefined,
-        isResumeNoteDue: wasWinding && chat.isDelivered === true,
-      })
+      const isNoteDue = wasWinding && chat.deliveredAt !== undefined
+      await save($, sid, { isOn: false, phase: 'idle', ...WIND_DOWN_RESET, ...COUNTS_RESET, isResumeNoteDue: isNoteDue })
       if (chat.isOn) $.ui.toast('Devir kapatıldı')
       $.ui.status(undefined)
       return wasWinding ? 'Devir bu sohbette kapatıldı; süren devir iptal edildi.' : 'Devir bu sohbette kapatıldı.'
@@ -551,124 +461,96 @@ const devirCommand = async ($: EngineInterface, args: string): Promise<string> =
     case 'simdi':
     case 'şimdi': {
       if (!chat.isOn) return 'Devir bu sohbette kapalı. Önce: /devir ac [eşik]'
-      if (chat.undeliveredFile !== undefined) {
-        // A command hook may not submit (it would wait on itself): right after it.
-        const file = chat.undeliveredFile
-        later($, async () => $.ui.toast(await resendContinuation($, sid, file)))
-        return "Devam prompt'u gönderiliyor."
-      }
       if (chat.phase === 'winding') return 'Devir zaten sürüyor: işler bitiriliyor.'
       await beginWindDown($, sid)
-      return "Devir başlatıldı: süren işler bitirilecek, devam prompt'u yazılınca sohbet sıkıştırılıp iş sürecek."
+      return "Devir başlatıldı: devam prompt'u yazılınca sohbet sıkıştırılıp iş aynı sohbette sürecek."
     }
     default:
       return USAGE
   }
 }
 
-// ---------------------------------------------------------------------------
-// Hooks
-// ---------------------------------------------------------------------------
+// Hooks.
 
 const resetModule = (): void => {
   isTurnRunning = false
-  stopWork = []
-  deliveringFor = undefined
-  remindedFor = undefined
+  runningTurnId = undefined
+  endedTurnId = undefined
+  abortedTurnId = undefined
+  claimed = new Set()
   pending = undefined
-  stopWaitTimer()
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     resetModule()
     registeredSid = undefined
-    try {
+    await safely($, async () => {
       await ensureCommand($)
       await refreshStatus($)
-      const sid = await $.session.id()
-      const chat = await load($, sid)
-      if (chat?.isOn === true && chat.phase === 'winding' && chat.waitingSince !== undefined) startWaitTimer($, sid)
-    } catch (error) {
-      debug($, error)
-    }
+    })
     return next(e)
   })
 
-  // A /clear ends the session (no session.start follows): drop its line and timers.
+  // A /clear ends the session (no session.start follows): drop its line.
   on('session.end', async ($, e, next) => {
     resetModule()
-    try {
-      $.ui.status(undefined)
-    } catch (error) {
-      debug($, error)
-    }
+    await safely($, async () => $.ui.status(undefined))
     return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
     const result = await next(e)
-    try {
+    await safely($, async () => {
       await ensureCommand($)
       const sid = await $.session.id()
-      if ((await load($, sid))?.isOn === true) {
-        await checkThreshold($, sid, e.context.percent)
-        await refreshStatus($, e.context.percent)
-      }
-    } catch (error) {
-      debug($, error)
-    }
+      if ((await load($, sid))?.isOn !== true) return
+      await checkThreshold($, sid, e.context.percent)
+      await refreshStatus($, e.context.percent)
+    })
     return result
   })
 
+  // A new main turn while winding gets its own end note and count (an Esc'd turn's do not carry over).
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
       isTurnRunning = true
-      try {
-        lastTurnStartAt = await $.clock.now()
+      runningTurnId = e.turnId
+      await safely($, async () => {
         await ensureCommand($)
-      } catch (error) {
-        debug($, error)
-      }
+        const sid = await $.session.id()
+        const chat = await load($, sid)
+        if (chat?.phase === 'winding' && chat.endNoteAt !== undefined) await save($, sid, { endNoteAt: undefined, toolsSinceEndNote: 0 })
+      })
     }
     return next(e)
   })
 
-  // Records the main loop's in-flight background work; never blocks.
-  on('classic.Stop', async ($, e, next) => {
-    if (e.agent_id === undefined) stopWork = e.background_tasks ?? []
-    return next(e)
-  }).catch(($, e, next) => next(e))
+  // Each model request of the main loop: the running turn is known even when the
+  // mod (re)loaded inside it, after its turn.start.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId === undefined && e.turnId !== endedTurnId) {
+      isTurnRunning = true
+      runningTurnId = e.turnId
+    }
+    return yield* next(e)
+  })
 
-  // The main turn's end: subagents' turns are ignored; the work runs after the turn settled.
+  // The main turn's end (subagents' turns are ignored); the work runs after the turn settled.
+  // A person's Esc does nothing; the mod's own abort is the handoff's turn end.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId !== undefined) return result
-    isTurnRunning = false
-    later($, () => afterTurn($, e.isAborted))
+    endedTurnId = e.turnId
+    if (runningTurnId === undefined || runningTurnId === e.turnId) {
+      isTurnRunning = false // a late end of an older turn leaves the running one alone
+      runningTurnId = undefined
+    }
+    const isOwnAbort = abortedTurnId !== undefined && abortedTurnId === e.turnId
+    if (isOwnAbort) abortedTurnId = undefined
+    later($, async () => afterTurn($, await $.session.id(), e.isAborted && !isOwnAbort))
     return result
   })
-
-  // Claude's own (or the person's) compaction during a wind-down drops the
-  // message: the next main tool result carries it again. Observes only.
-  on('session.compact', async ($, e, next) => {
-    const result = await next(e)
-    try {
-      if (e.agentId === undefined && e.trigger !== 'plugin' && e.trigger !== 'precompute' && result.skip === undefined) {
-        const sid = await $.session.id()
-        const chat = await load($, sid)
-        if (chat?.isOn === true && chat.phase === 'winding' && chat.isDelivered === true) {
-          deliveringFor = undefined
-          remindedFor = undefined
-          await save($, sid, { isDelivered: false, isEndReminded: false })
-          if (!isTurnRunning) later($, () => submitWindDown($, sid, false))
-        }
-      }
-    } catch (error) {
-      debug($, error)
-    }
-    return result
-  }).catch(($, e, next) => next(e))
 
   // The mid-turn channel: a main-loop tool result's `context` is read by the
   // model right after that result, inside the running turn.
@@ -676,10 +558,9 @@ export const register: Register = on => {
     const result = await next(e)
     try {
       if (next.origin.plugin !== 'engine' || e.agentId !== undefined || result.deny !== undefined) return result
-      isTurnRunning = true
+      if (next.signal.aborted) return result // a call cut by an abort: its turn is over
       const note = await midTurnNote($, await $.session.id())
-      if (note === undefined) return result
-      return { ...result, context: [...(result.context ?? []), note] } as typeof result
+      return note === undefined ? result : ({ ...result, context: [...(result.context ?? []), note] } as typeof result)
     } catch (error) {
       debug($, error)
       return result
@@ -687,30 +568,36 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   // The first prompt to enter while the mod's compaction runs carries the
-  // continuation; a due resume note rides on the next prompt too.
+  // continuation; a due resume note rides on the next prompt too. Both are
+  // taken only for a prompt that enters: a dropped one hands them back.
   on('prompt.submit', async ($, e, next) => {
     const context: string[] = []
-    try {
-      const isOwn = e.origin.kind === 'plugin' && e.origin.name === PLUGIN
-      const sid = await $.session.id()
-      if (!isOwn && e.command === undefined) {
-        if (pending !== undefined && !pending.isUsed && pending.sid === sid) {
-          pending.isUsed = true
-          context.push(continuationText(pending.text))
-        }
-        const chat = await load($, sid)
-        if (chat?.isResumeNoteDue === true) {
-          await save($, sid, { isResumeNoteDue: false })
-          context.push(RESUME_NOTE)
-        }
-        if (chat?.undeliveredFile !== undefined && e.text.startsWith(CONTINUE_PREFIX)) {
-          await save($, sid, { phase: 'idle', undeliveredFile: undefined })
-        }
+    let carried: typeof pending
+    let sid = ''
+    await safely($, async () => {
+      if ((e.origin.kind === 'plugin' && e.origin.name === PLUGIN) || e.command !== undefined) return
+      sid = await $.session.id()
+      if (pending !== undefined && !pending.isUsed && pending.sid === sid) {
+        carried = pending
+        carried.isUsed = true // held while it enters, so a parallel prompt does not carry it too
+        context.push(continuationText(carried.text))
       }
-    } catch (error) {
-      debug($, error)
+      const chat = await load($, sid)
+      if (chat?.isResumeNoteDue === true) {
+        await save($, sid, { isResumeNoteDue: false })
+        context.push(RESUME_NOTE)
+      }
+    })
+    const result = await next(context.length === 0 ? e : { ...e, context: [...(e.context ?? []), ...context] })
+    if (result.drop !== undefined && context.length > 0) {
+      await safely($, async () => {
+        if (context.includes(RESUME_NOTE)) await save($, sid, { isResumeNoteDue: true })
+        if (carried === undefined) return
+        if (pending === carried) carried.isUsed = false // the mod's finish still submits it
+        else if (carried.isHandedOver === true) later($, () => $.prompt.submit({ text: continuationText(carried!.text), asUser: true }))
+      })
     }
-    return next(context.length === 0 ? e : { ...e, context: [...(e.context ?? []), ...context] })
+    return result
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'devir' }, async ($, e) => {

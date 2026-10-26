@@ -1,24 +1,22 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import {
+  ABORT_CHECKS,
+  ABORT_WAIT_MS,
   COMPACT_INSTRUCTIONS,
+  COMPACT_RETRY_MS,
   CONTINUE_PREFIX,
   continuationText,
+  END_NOTE_MS,
   END_TURN_NOTE,
   handoffFile,
   KEEP_DONE,
   MAX_COMPACT_FAILS,
-  MAX_WAIT_MS,
-  nudgeText,
   RESEND_PREFIX,
   RESUME_NOTE,
-  SHELL_WAIT_MS,
-  TOAST_COMPACT,
   TOAST_DONE,
-  TOAST_MISSING,
-  TOAST_WAIT,
+  TOAST_GAVE_UP,
   toastUndelivered,
-  WAIT_TICK_MS,
   windDownText,
 } from '../hooks/register'
 
@@ -46,17 +44,21 @@ const setup = (on: any) => {
     compactMode: 'ok' as 'ok' | 'reject' | 'skip',
     onCompact: undefined as undefined | (() => Promise<void>),
     dropPlugin: false,
+    dropTyped: false,
+    onSet: undefined as undefined | ((key: string, value: any) => Promise<void>),
     toasts: [] as string[],
     statuses: [] as (string | undefined)[],
     commands: [] as any[],
     fills: [] as string[],
     runs: [] as string[][],
     logs: [] as string[],
+    aborts: [] as string[],
   }
   const clock = mock.clock(on, { now: NOW })
   const clone = (v: unknown) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)))
   on('store.get', (_: any, e: any) => ({ value: clone(world.store[e.key]) }))
-  on('store.set', (_: any, e: any) => {
+  on('store.set', async (_: any, e: any) => {
+    if (world.onSet !== undefined) await world.onSet(e.key, e.value)
     world.store[e.key] = clone(e.value)
     return { value: undefined }
   })
@@ -68,7 +70,10 @@ const setup = (on: any) => {
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 100, percent: world.percent }, rateLimits: [] } }))
   on('session.measure', (_: any, e: any) => ({ changed: e.changed }))
   on('session.compact', async (_: any, e: any) => {
-    if (world.compactMode === 'reject') throw new Error('a turn is running')
+    if (world.compactMode === 'reject') {
+      if (world.onCompact !== undefined) await world.onCompact()
+      throw new Error('a turn is running')
+    }
     world.compacts.push({ instructions: e.instructions })
     world.order.push('compact')
     if (world.onCompact !== undefined) await world.onCompact()
@@ -77,6 +82,13 @@ const setup = (on: any) => {
   })
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', (_: any, e: any) => ({ text: e.answer }))
+  on('turn.step', async function* (_: any, e: any) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [] }
+  })
+  on('turn.abort', (_: any, e: any) => {
+    world.aborts.push(e.turnId)
+    return { value: undefined }
+  })
   on('classic.Stop', () => ({}))
   on('command.register', (_: any, e: any) => {
     world.commands.push(e)
@@ -87,6 +99,7 @@ const setup = (on: any) => {
   on('tool.call', () => ({ result: {}, text: 'ok' }))
   on('prompt.submit', (_: any, e: any) => {
     if (world.dropPlugin && e.origin?.kind === 'plugin') return { drop: 'host limit' }
+    if (world.dropTyped && e.origin?.kind === 'composer') return { drop: 'dropped beneath' }
     world.submitted.push({ text: e.text, asUser: e.origin?.asUser, context: e.context })
     world.order.push('submit')
     return { text: e.text, context: e.context }
@@ -149,6 +162,10 @@ const turnEnd = async ($: any, clock: any, extra: Record<string, unknown> = {}) 
   await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: `t${seq}`, reason: 'answer', ...extra })
   await clock.advance(100)
 }
+/** One model request of a main-loop turn (an observer sees it before its tool calls). */
+const step = async ($: any, turnId = `t${seq}`, agentId?: string) => {
+  for await (const _ of $.turn.step({ turnId, index: 0, model: 'm', messageCount: 1, agentId })) void _
+}
 const bash = ($: any, extra: Record<string, unknown> = {}) => $.tool.call({ tool: 'Bash', command: 'ls', ...extra })
 const measure = ($: any, percent: number) =>
   $.session.measure({ context: { window: 100, percent }, rateLimits: [], changed: ['context'] })
@@ -167,6 +184,7 @@ const windDownMidTurn = async ($: any, world: any) => {
   world.percent = 65
   return bash($)
 }
+const ctx = async (p: Promise<any>): Promise<readonly string[]> => (await p).context ?? []
 
 describe('otomatik-devir v2', () => {
   test('kapalıyken (varsayılan) hiçbir şey yapmaz', async ($, on) => {
@@ -174,10 +192,10 @@ describe('otomatik-devir v2', () => {
     await start($)
     await turnBegin($)
     world.percent = 95
-    expect((await bash($)).context ?? []).toEqual([])
+    expect(await ctx(bash($))).toEqual([])
     await measure($, 95)
     await turnEnd($, clock)
-    await clock.advance(10 * WAIT_TICK_MS)
+    await clock.advance(10 * 60_000)
     expect(world.submitted).toEqual([])
     expect(world.compacts).toEqual([])
     expect(world.toasts).toEqual([])
@@ -186,7 +204,7 @@ describe('otomatik-devir v2', () => {
     expect(await devir($, '')).toContain('kapalı')
   })
 
-  test('/devir ac, esik, kapat, simdi ve durum; komut turun içinde hemen çalışır (M1)', async ($, on) => {
+  test('/devir ac, esik, kapat, simdi ve durum; komut turun içinde hemen çalışır', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     expect(world.commands[0]).toMatchObject({ name: 'devir', immediate: true })
@@ -199,49 +217,41 @@ describe('otomatik-devir v2', () => {
     expect(await devir($, 'ac 70')).not.toContain('Uyarı')
     expect(await devir($, 'ac 85')).toContain('Uyarı')
     expect(await devir($, 'ac 10')).toContain('20-90')
-    expect(chat(world).threshold).toBe(85)
     expect(await devir($, 'esik 45')).toBe('Bu sohbetin devir eşiği %45.')
     expect(await devir($, 'esik 95')).toContain('Kullanım')
-    expect(await devir($, 'esik')).toContain('Kullanım')
     expect(chat(world).threshold).toBe(45)
     expect(await devir($, 'xyz')).toContain('Kullanım')
     expect(await devir($, 'kapat')).toBe('Devir bu sohbette kapatıldı.')
-    expect(chat(world).isOn).toBe(false)
     expect(world.statuses.at(-1)).toBeUndefined()
     expect(await devir($, 'simdi')).toContain('kapalı')
     expect(world.submitted).toEqual([])
-    // simdi while idle: the wind-down is submitted as a prompt, regardless of the fill.
     await devir($, 'ac')
     expect(await devir($, 'simdi')).toContain('Devir başlatıldı')
     await clock.advance(100)
     expect(world.submitted.map(s => s.text)).toEqual([windDownText(FILE)])
-    expect(chat(world)).toMatchObject({ phase: 'winding', isDelivered: true, startedAt: NOW, file: FILE })
+    expect(chat(world)).toMatchObject({ phase: 'winding', deliveredAt: NOW + 50, deliveries: 1, file: FILE })
     expect(await devir($, 'simdi')).toContain('zaten')
     expect(await devir($, '')).toContain(`aşama: işler bitiriliyor · dosya: ${FILE}`)
     expect(world.statuses.at(-1)).toBe('Devir: işler bitiriliyor…')
-    // m9: the handoff folder is created and git-ignored.
     expect(world.files['/proj/.workflow/devir/.gitignore']?.text).toBe('*\n')
   })
 
-  test('eşik geçilince devir bir kez başlar ve mesaj turun içinde bir kez iletilir (m1)', async ($, on) => {
+  test('eşik geçilince devir bir kez başlar, paralel sonuçlarda mesaj bir kez iletilir', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await devir($, 'ac')
     await turnBegin($)
     world.percent = 30
-    expect((await bash($)).context ?? []).toEqual([])
+    expect(await ctx(bash($))).toEqual([])
     world.percent = 65
-    // Three parallel results right after the crossing, no measurement first: one start, one delivery.
     const got = await Promise.all([bash($), bash($), bash($)])
     expect(got.flatMap(r => r.context ?? [])).toEqual([windDownText(FILE)])
-    expect((await bash($)).context ?? []).toEqual([])
-    // A subagent's tool result never carries it.
-    expect((await bash($, { agentId: 'a1' })).context ?? []).toEqual([])
+    expect(await ctx(bash($))).toEqual([])
+    expect(await ctx(bash($, { agentId: 'a1' }))).toEqual([])
     await measure($, 66)
     await clock.advance(100)
     expect(world.submitted).toEqual([])
     expect(world.toasts.filter(t => t.startsWith('Devir başladı'))).toHaveLength(1)
-    expect(chat(world)).toMatchObject({ phase: 'winding', isDelivered: true, startedAt: NOW })
   })
 
   test('simdi ile hemen ardından başlayan tur: mesaj yalnızca bir kez iletilir', async ($, on) => {
@@ -250,7 +260,7 @@ describe('otomatik-devir v2', () => {
     await devir($, 'ac')
     await devir($, 'simdi')
     await turnBegin($)
-    expect((await bash($)).context).toEqual([windDownText(FILE)])
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
     await clock.advance(100)
     expect(world.submitted).toEqual([])
   })
@@ -268,46 +278,154 @@ describe('otomatik-devir v2', () => {
     expect(world.submitted).toHaveLength(1)
   })
 
-  test('dosya hazır ve iş yok: sıkıştır, sonra dosya metnini gönder; eski dosyalar budanır', async ($, on) => {
+  test('canlı senaryo: dosya alt ajanlar ve shell\'ler sürerken yazıldı → tur sonunda hemen sıkıştır + gönder', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     for (let i = 1; i <= KEEP_DONE + 1; i += 1) writeFile(world, clock, 'eski', `/proj/.workflow/devir/x.done-2026-01-0${i}.md`)
-    expect((await windDownMidTurn($, world)).context).toEqual([windDownText(FILE)])
-    await clock.advance(5000)
+    await clock.advance(1000)
+    expect(await ctx(windDownMidTurn($, world))).toEqual([windDownText(FILE)])
+    world.agents = Array.from({ length: 5 }, (_, i) => ({ id: `a${i}`, description: 'iş', type: 'general-purpose', status: 'running' }))
+    await clock.advance(60_000)
     writeFile(world, clock)
-    await stop($)
+    await stop($, [{ id: 'b1', type: 'shell', status: 'running', description: 'içerik üretimi (saatler)' }])
     await turnEnd($, clock)
     expect(world.compacts).toEqual([{ instructions: COMPACT_INSTRUCTIONS }])
-    expect(COMPACT_INSTRUCTIONS).toContain('next step')
     expect(world.order).toEqual(['compact', 'submit'])
     expect(world.submitted).toEqual([{ text: continuationText(PROMPT_TEXT), asUser: true, context: undefined }])
     expect(world.toasts).toContain(TOAST_DONE)
     expect(chat(world)).toMatchObject({ isOn: true, phase: 'idle', floor: 65, handoffs: 1 })
+    expect(world.statuses.at(-1)).toContain('Devir açık')
     // The used file is kept under a new name; only the newest KEEP_DONE used files stay.
     expect(world.files[FILE]).toBeUndefined()
     const done = Object.keys(world.files).filter(p => p.includes('.done-'))
     expect(done).toHaveLength(KEEP_DONE)
     expect(done.some(p => /\/s1\.done-.+\.md$/.test(p))).toBe(true)
-    expect(world.files['/proj/.workflow/devir/x.done-2026-01-01.md']).toBeUndefined()
   })
 
-  test('sıkıştırma sırasında giren prompt devam prompt\'unu taşır, ikinci kez gönderilmez (M3)', async ($, on) => {
+  test('tek uzun tur: +%10\'da yeniden iletim (en çok 3), dosya → turu bitir notu → 3 araç sonra abort → sıkıştır + gönder', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    expect(await ctx(windDownMidTurn($, world))).toEqual([windDownText(FILE)])
+    const turnId = `t${seq}`
+    world.percent = 70
+    expect(await ctx(bash($))).toEqual([])
+    world.percent = 75
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+    world.percent = 80
+    expect(await ctx(bash($))).toEqual([])
+    world.percent = 85
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+    world.percent = 95
+    expect(await ctx(bash($))).toEqual([])
+    expect(chat(world).deliveries).toBe(3)
+    await clock.advance(1000)
+    writeFile(world, clock)
+    const [a, b] = await Promise.all([bash($), bash($)])
+    expect([...(a.context ?? []), ...(b.context ?? [])]).toEqual([END_TURN_NOTE])
+    await bash($)
+    await bash($)
+    await clock.advance(100)
+    expect(world.aborts).toEqual([])
+    await bash($)
+    await clock.advance(100)
+    expect(world.aborts).toEqual([turnId])
+    expect(world.compacts).toEqual([])
+    // The abort ends the turn: its end (isAborted) is the handoff's turn end.
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId, reason: 'aborted' })
+    await clock.advance(100)
+    expect(world.order).toEqual(['compact', 'submit'])
+    expect(continuations(world)).toHaveLength(1)
+    await clock.advance(10_000)
+    expect(world.compacts).toHaveLength(1)
+  })
+
+  test('turu bitir notundan 10 dakika sonra tek araç sonucu da abort ettirir; abort sonu gelmezse mod kendisi devreder', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await windDownMidTurn($, world)
     writeFile(world, clock)
-    world.onCompact = async () => {
-      await typed($, 'ne oluyor?')
-    }
-    await turnEnd($, clock)
-    expect(world.submitted).toEqual([
-      { text: 'ne oluyor?', asUser: undefined, context: [continuationText(PROMPT_TEXT)] },
-    ])
-    expect(world.toasts).toContain(TOAST_DONE)
-    expect(chat(world).phase).toBe('idle')
+    expect(await ctx(bash($))).toEqual([END_TURN_NOTE])
+    await clock.advance(END_NOTE_MS)
+    await bash($)
+    await clock.advance(100)
+    expect(world.aborts).toEqual([`t${seq}`])
+    // No turn.complete arrives: the mod re-checks, then drives the turn end itself (bounded).
+    await clock.advance(ABORT_WAIT_MS)
+    expect(world.compacts).toEqual([])
+    await clock.advance(ABORT_WAIT_MS * ABORT_CHECKS)
+    expect(world.order).toEqual(['compact', 'submit'])
   })
 
-  test('sıkıştırma sonrası eşik tekrarı: boşluk ve yeniden kurma (m6)', async ($, on) => {
+  test('son iletimden önce yazılmış (eski) dosya kullanılmaz', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    writeFile(world, clock, 'saatler önceki devir')
+    await clock.advance(5000)
+    await windDownMidTurn($, world)
+    expect(await ctx(bash($))).toEqual([])
+    await turnEnd($, clock)
+    expect(world.compacts).toEqual([])
+    expect(world.submitted.map(s => s.text)).toEqual([RESEND_PREFIX + windDownText(FILE)])
+  })
+
+  test('eski sürümden kalan "winding" kaydı temiz yeniden başlar; eski dosya gönderilmez', async ($, on) => {
+    const { world, clock } = setup(on)
+    world.store[KEY] = {
+      isOn: true,
+      threshold: 60,
+      phase: 'winding',
+      isDelivered: true,
+      startedAt: NOW - 6 * 3600_000,
+      file: FILE,
+      resends: 1,
+      waitingSince: NOW - 6 * 3600_000,
+      isNudged: true,
+    }
+    world.files[FILE] = { text: 'eski devir', mtimeMs: NOW - 6 * 3600_000 }
+    await start($)
+    await turnBegin($)
+    world.percent = 71
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+    expect(chat(world)).toMatchObject({ deliveredAt: NOW, deliveries: 1, resends: 0 })
+    await turnEnd($, clock)
+    expect(world.compacts).toEqual([])
+    expect(world.submitted.map(s => s.text)).toEqual([RESEND_PREFIX + windDownText(FILE)])
+  })
+
+  test('vazgeçme: bir yeniden gönderimden sonra boşa döner, modeli işe döndürür, eşik yukarıda yeniden kurulur', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    await turnEnd($, clock)
+    await turnBegin($)
+    await turnEnd($, clock)
+    expect(world.toasts).toContain(TOAST_GAVE_UP)
+    expect(chat(world)).toMatchObject({ phase: 'idle', isOn: true, floor: 65 })
+    expect(world.submitted.map(s => s.text)).toEqual([RESEND_PREFIX + windDownText(FILE), RESUME_NOTE])
+    expect(world.statuses.at(-1)).toContain('Devir açık')
+    // No loop: over the threshold but under floor + gap, nothing starts.
+    await turnBegin($)
+    world.percent = 70
+    expect(await ctx(bash($))).toEqual([])
+    await turnEnd($, clock)
+    expect(world.submitted).toHaveLength(2)
+    // Re-armed: the fill dropped to 50, so the next wind-down starts at 65.
+    await measure($, 50)
+    await turnBegin($)
+    world.percent = 66
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+  })
+
+  test('Claude\'un kendi sıkıştırması (doluluk düşer) mesajı turun içinde yeniden iletir', async ($, on) => {
+    const { world } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    world.percent = 30
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+    expect(await ctx(bash($))).toEqual([])
+  })
+
+  test('sıkıştırma sonrası eşik tekrarı: boşluk ve yeniden kurma (eşik 20)', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await devir($, 'ac 20')
@@ -317,130 +435,14 @@ describe('otomatik-devir v2', () => {
     writeFile(world, clock)
     await turnEnd($, clock)
     expect(chat(world)).toMatchObject({ phase: 'idle', floor: 25 })
-    // Stale high fill right after the compaction: no new wind-down.
     await turnBegin($)
-    expect((await bash($)).context ?? []).toEqual([])
-    // The baseline after compaction is 15: the next one needs 30 (floor + gap), not 20.
+    expect(await ctx(bash($))).toEqual([])
     world.percent = 15
     await measure($, 15)
     world.percent = 25
-    expect((await bash($)).context ?? []).toEqual([])
+    expect(await ctx(bash($))).toEqual([])
     world.percent = 30
-    expect((await bash($)).context).toEqual([windDownText(FILE)])
-  })
-
-  test('alt ajan (waiting dahil) ya da workflow çalışırken bekler, sonuçlar işlenince devreder (M2, m5)', async ($, on) => {
-    const { world, clock } = setup(on)
-    await start($)
-    await windDownMidTurn($, world)
-    writeFile(world, clock)
-    world.agents = [{ id: 'a1', description: 'araştır', type: 'general-purpose', status: 'waiting' }]
-    await turnEnd($, clock)
-    expect(world.compacts).toEqual([])
-    expect(world.submitted).toEqual([])
-    expect(chat(world).waitingSince).toBeDefined()
-    expect(world.statuses.at(-1)).toBe('Devir: alt ajanlar bekleniyor…')
-    // A notification turn: the agent is done, but a workflow is still in flight.
-    world.agents = [{ ...world.agents[0]!, status: 'completed' }]
-    await turnBegin($)
-    await stop($, [{ id: 'w1', type: 'workflow', status: 'running', description: 'denetim' }])
-    await turnEnd($, clock)
-    expect(world.compacts).toEqual([])
-    await clock.advance(WAIT_TICK_MS)
-    expect(world.compacts).toEqual([])
-    // The workflow's notification turn: nothing in flight now.
-    await turnBegin($)
-    await stop($)
-    await turnEnd($, clock)
-    expect(world.order).toEqual(['compact', 'submit'])
-    expect(continuations(world)).toHaveLength(1)
-  })
-
-  test('zamanlayıcı sıkıştırmaz: iş bitince modele bir tur verir, o turun sonunda devreder; 60 dakikada duraklar (m5)', async ($, on) => {
-    const { world, clock } = setup(on)
-    await start($)
-    await windDownMidTurn($, world)
-    writeFile(world, clock)
-    world.agents = [{ id: 'a1', description: 'x', type: 'general-purpose', status: 'running' }]
-    await turnEnd($, clock)
-    await clock.advance(WAIT_TICK_MS)
-    world.agents = []
-    await clock.advance(3 * WAIT_TICK_MS)
-    expect(world.compacts).toEqual([])
-    expect(world.submitted.map(s => s.text)).toEqual([nudgeText(FILE)])
-    await turnBegin($)
-    await stop($)
-    await turnEnd($, clock)
-    expect(world.order).toEqual(['submit', 'compact', 'submit'])
-
-    // A second wind-down whose agent never ends: paused after MAX_WAIT_MS.
-    world.percent = 10
-    await measure($, 10)
-    await windDownMidTurn($, world)
-    writeFile(world, clock)
-    world.agents = [{ id: 'a2', description: 'y', type: 'general-purpose', status: 'running' }]
-    await turnEnd($, clock)
-    await clock.advance(MAX_WAIT_MS + WAIT_TICK_MS)
-    expect(world.compacts).toHaveLength(1)
-    expect(world.toasts).toContain(TOAST_WAIT)
-    expect(chat(world).phase).toBe('paused')
-    // m2: the model is told to go back to normal work.
-    expect(world.submitted.at(-1)?.text).toBe(RESUME_NOTE)
-  })
-
-  test('arka plan shell\'i sınırlı süre beklenir (m9)', async ($, on) => {
-    const { world, clock } = setup(on)
-    await start($)
-    await windDownMidTurn($, world)
-    writeFile(world, clock)
-    const shell = { id: 'b1', type: 'shell', status: 'running', description: 'npm test' }
-    await stop($, [shell])
-    await turnEnd($, clock)
-    expect(world.compacts).toEqual([])
-    await clock.advance(SHELL_WAIT_MS)
-    await turnBegin($)
-    await stop($, [shell])
-    await turnEnd($, clock)
-    expect(world.compacts).toHaveLength(1)
-  })
-
-  test('dosya yazılıp tur sürerse bir kez "turu bitir" hatırlatması (m4)', async ($, on) => {
-    const { world, clock } = setup(on)
-    await start($)
-    await windDownMidTurn($, world)
-    expect((await bash($)).context ?? []).toEqual([])
-    writeFile(world, clock)
-    world.agents = [{ id: 'a1', description: 'x', type: 'general-purpose', status: 'running' }]
-    expect((await bash($)).context ?? []).toEqual([])
-    world.agents = []
-    const [a, b] = await Promise.all([bash($), bash($)])
-    expect([...(a.context ?? []), ...(b.context ?? [])]).toEqual([END_TURN_NOTE])
-    expect((await bash($)).context ?? []).toEqual([])
-  })
-
-  test('dosya yoksa bir kez yeniden gönderir, sonra duraklar, bildirir ve modeli işe döndürür (m2)', async ($, on) => {
-    const { world, clock } = setup(on)
-    await start($)
-    // A file older than the wind-down (an earlier handoff's) does not count.
-    world.files[FILE] = { text: 'eski devir', mtimeMs: NOW - 600_000 }
-    await clock.advance(5000)
-    await windDownMidTurn($, world)
-    await turnEnd($, clock)
-    expect(world.submitted.map(s => s.text)).toEqual([RESEND_PREFIX + windDownText(FILE)])
-    await turnBegin($)
-    await turnEnd($, clock)
-    expect(world.toasts).toContain(TOAST_MISSING)
-    expect(chat(world)).toMatchObject({ phase: 'paused', isOn: true })
-    expect(world.statuses.at(-1)).toBe('Devir duraklatıldı · /devir simdi')
-    expect(world.submitted.map(s => s.text)).toEqual([RESEND_PREFIX + windDownText(FILE), RESUME_NOTE])
-    // No loop: later turns and timers send nothing more, even over the threshold.
-    await turnBegin($)
-    expect((await bash($)).context ?? []).toEqual([])
-    await turnEnd($, clock)
-    await clock.advance(10 * WAIT_TICK_MS)
-    expect(world.submitted).toHaveLength(2)
-    expect(world.compacts).toEqual([])
-    expect(await devir($, '')).toContain('duraklatıldı')
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
   })
 
   test('/devir kapat süren devri iptal eder ve modele turun içinde bir kez söyler', async ($, on) => {
@@ -448,11 +450,10 @@ describe('otomatik-devir v2', () => {
     await start($)
     await windDownMidTurn($, world)
     expect(await devir($, 'kapat')).toContain('iptal')
-    expect((await bash($)).context).toEqual([RESUME_NOTE])
-    expect((await bash($)).context ?? []).toEqual([])
+    expect(await ctx(bash($))).toEqual([RESUME_NOTE])
+    expect(await ctx(bash($))).toEqual([])
     writeFile(world, clock)
     await turnEnd($, clock)
-    await clock.advance(10 * WAIT_TICK_MS)
     expect(world.compacts).toEqual([])
     expect(world.submitted).toEqual([])
     expect(chat(world)).toMatchObject({ isOn: false, phase: 'idle' })
@@ -469,17 +470,15 @@ describe('otomatik-devir v2', () => {
     expect((await typed($, 'sonra')).context ?? []).toEqual([])
   })
 
-  test('kapat, tur sonunu ve süren sıkıştırmayı yener (M1)', async ($, on) => {
+  test('kapat, tur sonunu ve süren sıkıştırmayı yener', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await windDownMidTurn($, world)
     writeFile(world, clock)
-    // Queued right at the turn end, before the mod's own after-turn work.
     await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: `t${seq}`, reason: 'answer' })
     await devir($, 'kapat')
     await clock.advance(100)
     expect(world.compacts).toEqual([])
-    // During the compaction itself: nothing is submitted after it.
     await devir($, 'ac')
     await devir($, 'simdi')
     await turnBegin($)
@@ -496,7 +495,20 @@ describe('otomatik-devir v2', () => {
     expect(world.files[FILE]).toBeDefined()
   })
 
-  test('devam prompt\'u düşerse dosya kalır, dürüst bildirir, /devir simdi gönderir (m3)', async ($, on) => {
+  test('sıkıştırma sırasında giren prompt devam prompt\'unu taşır, ikinci kez gönderilmez', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    world.onCompact = async () => {
+      await typed($, 'ne oluyor?')
+    }
+    await turnEnd($, clock)
+    expect(world.submitted).toEqual([{ text: 'ne oluyor?', asUser: undefined, context: [continuationText(PROMPT_TEXT)] }])
+    expect(world.toasts).toContain(TOAST_DONE)
+  })
+
+  test('devam prompt\'u düşerse dosya kalır, prompt kutusuna konur, dürüstçe bildirilir', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await windDownMidTurn($, world)
@@ -508,31 +520,10 @@ describe('otomatik-devir v2', () => {
     expect(world.toasts).not.toContain(TOAST_DONE)
     expect(world.fills).toEqual([continuationText(PROMPT_TEXT)])
     expect(world.files[FILE]?.text).toBe(PROMPT_TEXT)
-    expect(chat(world)).toMatchObject({ phase: 'paused', undeliveredFile: FILE })
-    world.dropPlugin = false
-    expect(await devir($, 'simdi')).toContain('gönderiliyor')
-    await clock.advance(100)
-    expect(world.logs).toEqual([])
-    expect(world.toasts.at(-1)).toContain('gönderildi')
-    expect(continuations(world)).toHaveLength(1)
-    expect(world.files[FILE]).toBeUndefined()
-    expect(chat(world)).toMatchObject({ phase: 'idle' })
+    expect(chat(world)).toMatchObject({ phase: 'idle', isOn: true })
   })
 
-  test('devir sürerken Claude\'un kendi sıkıştırması: mesaj turun içinde yeniden iletilir (M4)', async ($, on) => {
-    const { world, clock } = setup(on)
-    await start($)
-    await windDownMidTurn($, world)
-    expect((await bash($)).context ?? []).toEqual([])
-    await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'x', toolUses: [] }] } as never)
-    expect((await bash($)).context).toEqual([windDownText(FILE)])
-    expect((await bash($)).context ?? []).toEqual([])
-    // Re-delivery is not a re-send: a turn end without the file still gets its one re-send.
-    await turnEnd($, clock)
-    expect(world.submitted.map(s => s.text)).toEqual([RESEND_PREFIX + windDownText(FILE)])
-  })
-
-  test('kök değişse de dosya yolu devrin başındaki kalır (m7)', async ($, on) => {
+  test('kök değişse de dosya yolu devrin başındaki kalır', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await windDownMidTurn($, world)
@@ -542,7 +533,7 @@ describe('otomatik-devir v2', () => {
     expect(world.order).toEqual(['compact', 'submit'])
   })
 
-  test('/clear: durum satırı temizlenir, yeni oturumda komut yeniden kaydedilir (m8)', async ($, on) => {
+  test('/clear: durum satırı temizlenir, yeni oturumda komut yeniden kaydedilir', async ($, on) => {
     const { world } = setup(on)
     await start($)
     await devir($, 'ac')
@@ -555,30 +546,22 @@ describe('otomatik-devir v2', () => {
     expect(await devir($, '')).toContain('kapalı')
   })
 
-  test('alt ajanın turn.complete olayı yok sayılır', async ($, on) => {
+  test('alt ajanın turn.complete olayı ve kişinin Esc\'i yok sayılır', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await windDownMidTurn($, world)
     writeFile(world, clock)
     await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 'sub1', reason: 'answer', agentId: 'a1' })
-    await clock.advance(10 * WAIT_TICK_MS)
+    await clock.advance(100)
+    await turnEnd($, clock, { isAborted: true, reason: 'aborted' })
     expect(world.compacts).toEqual([])
     expect(world.submitted).toEqual([])
+    await turnBegin($)
     await turnEnd($, clock)
     expect(world.order).toEqual(['compact', 'submit'])
   })
 
-  test('kesilen (Esc) turda hiçbir şey yapılmaz', async ($, on) => {
-    const { world, clock } = setup(on)
-    await start($)
-    await windDownMidTurn($, world)
-    writeFile(world, clock)
-    await turnEnd($, clock, { isAborted: true, reason: 'aborted' })
-    expect(world.compacts).toEqual([])
-    expect(world.submitted).toEqual([])
-  })
-
-  test('sıkıştırma reddedilirse sınırlı dener, sonra duraklar; atlanırsa göndermez', async ($, on) => {
+  test('sıkıştırma reddedilirse sınırlı dener, sonra vazgeçer; atlanırsa göndermez', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await windDownMidTurn($, world)
@@ -588,8 +571,8 @@ describe('otomatik-devir v2', () => {
       await turnEnd($, clock)
       await turnBegin($)
     }
-    expect(world.toasts).toContain(TOAST_COMPACT)
-    expect(chat(world).phase).toBe('paused')
+    expect(world.toasts).toContain(TOAST_GAVE_UP)
+    expect(chat(world).phase).toBe('idle')
     expect(continuations(world)).toEqual([])
 
     world.compactMode = 'skip'
@@ -599,7 +582,7 @@ describe('otomatik-devir v2', () => {
     await turnEnd($, clock)
     expect(world.compacts).toHaveLength(1)
     expect(continuations(world)).toEqual([])
-    expect(chat(world).phase).toBe('paused')
+    expect(chat(world).phase).toBe('idle')
   })
 
   test('ayarlar sohbete aittir ve yeniden başlatmada (sıkıştırma, yeniden yükleme) kalır', async ($, on) => {
@@ -610,5 +593,217 @@ describe('otomatik-devir v2', () => {
     expect(await devir($, '')).toContain('eşik %75')
     world.store['sohbet:s2'] = { isOn: false, threshold: 30, phase: 'idle' }
     expect(chat(world)).toMatchObject({ isOn: true, threshold: 75 })
+  })
+
+  // Review 2: one test per finding.
+
+  /** Wind-down delivered, file written, end note given; returns the running turn's id. */
+  const toEndNote = async ($: any, world: any, clock: any) => {
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    expect(await ctx(bash($))).toEqual([END_TURN_NOTE])
+    return `t${seq}`
+  }
+
+  test('M1: kendi abort\'undan sonra geç gelen araç sonucu devri durdurmaz', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    const turnId = await toEndNote($, world, clock)
+    for (let i = 0; i < 3; i += 1) await bash($)
+    await clock.advance(100)
+    expect(world.aborts).toEqual([turnId])
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId, reason: 'aborted' })
+    await bash($) // the cut call's hook settles after the turn's end
+    await clock.advance(100)
+    expect(world.order).toEqual(['compact', 'submit'])
+  })
+
+  test('M2: abort sonu 5 sn\'den geç gelse de kendi abort\'u sayılır; eski turun sonu yeni turu silmez', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    const turnId = await toEndNote($, world, clock)
+    for (let i = 0; i < 3; i += 1) await bash($)
+    await clock.advance(100)
+    await clock.advance(ABORT_WAIT_MS + 2000)
+    expect(world.compacts).toEqual([])
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId, reason: 'aborted' })
+    await clock.advance(100)
+    expect(world.order).toEqual(['compact', 'submit'])
+    // A late end of an older turn does not end the new one.
+    await turnBegin($)
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId, reason: 'aborted' })
+    await devir($, 'simdi')
+    await clock.advance(100)
+    expect(world.submitted.map(s => s.text)).not.toContain(windDownText(FILE))
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+  })
+
+  test('M3: boştayken başarısız sıkıştırma beklemeyle yeniden denenir, sonra vazgeçilir', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    world.compactMode = 'reject'
+    await turnEnd($, clock)
+    expect(chat(world).compactFails).toBe(1)
+    world.compactMode = 'ok'
+    await clock.advance(COMPACT_RETRY_MS)
+    expect(world.order).toEqual(['compact', 'submit'])
+    // Every retry fails: bounded, then the give-up resumes the work.
+    await devir($, 'esik 20')
+    await devir($, 'simdi')
+    await clock.advance(100)
+    writeFile(world, clock)
+    world.compactMode = 'reject'
+    await turnBegin($)
+    await turnEnd($, clock)
+    await clock.advance(COMPACT_RETRY_MS * MAX_COMPACT_FAILS * MAX_COMPACT_FAILS)
+    expect(world.toasts).toContain(TOAST_GAVE_UP)
+    expect(chat(world).phase).toBe('idle')
+    expect(world.submitted.at(-1)?.text).toBe(RESUME_NOTE)
+  })
+
+  test('M4: Esc\'ten sonra kişinin yeni turu not almadan kesilmez; her tur kendi notunu ve sayacını alır', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await toEndNote($, world, clock)
+    await bash($)
+    await bash($)
+    await turnEnd($, clock, { isAborted: true, reason: 'aborted' })
+    await turnBegin($)
+    expect(await ctx(bash($))).toEqual([END_TURN_NOTE])
+    await clock.advance(100)
+    expect(world.aborts).toEqual([])
+    for (let i = 0; i < 3; i += 1) await bash($)
+    await clock.advance(100)
+    expect(world.aborts).toEqual([`t${seq}`])
+  })
+
+  test('M5: üst sınıra ulaşılmış olsa da Claude\'un kendi sıkıştırması (düşüş) yeniden iletir', async ($, on) => {
+    const { world } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    for (const p of [75, 85]) {
+      world.percent = p
+      expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+    }
+    expect(chat(world).deliveries).toBe(3)
+    world.percent = 95
+    expect(await ctx(bash($))).toEqual([])
+    world.percent = 30
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+  })
+
+  test('M6: tur ortasında yeniden yüklenen mod turu turn.step\'ten tanır: prompt kuyruğa girmez, abort çalışır', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await devir($, 'ac')
+    await step($, 'tx') // reloaded inside turn tx: its turn.start was before the mod
+    await devir($, 'simdi')
+    await clock.advance(100)
+    expect(world.submitted).toEqual([])
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+    writeFile(world, clock)
+    expect(await ctx(bash($))).toEqual([END_TURN_NOTE])
+    for (let i = 0; i < 3; i += 1) await bash($)
+    await clock.advance(100)
+    expect(world.aborts).toEqual(['tx'])
+    await step($, 'sub', 'a1') // a subagent's step does not change the main turn
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'tx', reason: 'aborted' })
+    await clock.advance(100)
+    expect(world.order).toEqual(['compact', 'submit'])
+  })
+
+  test('m1: sıkıştırmadan hemen sonraki iletimde doluluk yoksa ilk ölçüm temel alınır', async ($, on) => {
+    const { world } = setup(on)
+    await start($)
+    await devir($, 'ac')
+    await turnBegin($)
+    await devir($, 'simdi')
+    world.percent = undefined
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+    world.percent = 40
+    expect(await ctx(bash($))).toEqual([])
+    expect(chat(world).deliveredPercent).toBe(40)
+    world.percent = 52
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+  })
+
+  test('m2: kapat\'tan kalan iptal notu yeni devri bozmaz', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await devir($, 'ac')
+    await devir($, 'simdi')
+    await clock.advance(100)
+    await devir($, 'kapat')
+    expect(chat(world).isResumeNoteDue).toBe(true)
+    await devir($, 'ac')
+    await devir($, 'simdi')
+    await clock.advance(100)
+    expect(chat(world).isResumeNoteDue).toBe(false)
+    await turnBegin($)
+    expect(await ctx(bash($))).toEqual([])
+  })
+
+  test('m3: abort planlandıktan hemen sonra kapat, abort\'u iptal eder', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await toEndNote($, world, clock)
+    for (let i = 0; i < 3; i += 1) await bash($)
+    await devir($, 'kapat')
+    await clock.advance(ABORT_WAIT_MS * (ABORT_CHECKS + 1))
+    expect(world.aborts).toEqual([])
+    expect(world.compacts).toEqual([])
+  })
+
+  test('m4: kayıt yazımları sıralıdır; araç sonucunun yazımı kapat\'ı geri almaz', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await toEndNote($, world, clock)
+    let closing: Promise<string> | undefined
+    world.onSet = async (_key, value) => {
+      if (value.toolsSinceEndNote !== 1 || closing !== undefined) return
+      closing = devir($, 'kapat') // the person's immediate command lands between a load and its write
+      for (let i = 0; i < 200; i += 1) await Promise.resolve()
+    }
+    await bash($)
+    await closing
+    world.onSet = undefined
+    expect(chat(world)).toMatchObject({ isOn: false, phase: 'idle' })
+    await bash($)
+    await bash($)
+    await clock.advance(100)
+    expect(world.aborts).toEqual([])
+  })
+
+  test('m5: yeni tur başladığı için reddedilen sıkıştırma sayılmaz', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    world.compactMode = 'reject'
+    world.onCompact = async () => {
+      world.onCompact = undefined
+      await turnBegin($)
+    }
+    await turnEnd($, clock)
+    expect(chat(world).compactFails ?? 0).toBe(0)
+    world.compactMode = 'ok'
+    await turnEnd($, clock)
+    expect(world.order).toEqual(['compact', 'submit'])
+  })
+
+  test('m6: sıkıştırma sırasında giren prompt düşerse devam prompt\'u yine gönderilir', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    world.dropTyped = true
+    world.onCompact = async () => {
+      await typed($, 'ne oluyor?')
+    }
+    await turnEnd($, clock)
+    expect(continuations(world)).toEqual([{ text: continuationText(PROMPT_TEXT), asUser: true, context: undefined }])
+    expect(world.toasts).toContain(TOAST_DONE)
   })
 })

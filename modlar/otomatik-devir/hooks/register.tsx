@@ -174,7 +174,7 @@ const MACHINE_TURN_DENY = `otomatik-devir: bu tur kullanıcının yazdığı bir
 const CARD_DENY = `otomatik-devir: devir için kart açma (own_initiative, proposal_id); ${START_SESSION} aracını initiation "user_asked" ile çağır.`
 const HAND_OFF_DENY = `otomatik-devir: devir için ${HAND_OFF} kullanma; devir dosyasını yaz ve ${START_SESSION} aracını initiation "user_asked" ile çağır.`
 const REMOVED_VERB = "v1.0'da kaldırıldı; tek mod otomatik. Kapatmak için: /devir kapat"
-const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | limit <n>]]'
+const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | devam | limit <n>]]'
 
 // ---------------------------------------------------------------------------
 // v1.1 orkestra modu (Contract): the main chat starts managed sub-chats one
@@ -1908,8 +1908,9 @@ const childRunning = async ($: EngineInterface, childId: string): Promise<boolea
 
 /**
  * What the main chat does next, from its record and its child's; undefined
- * outside a live main chat. Decides only: its one write is O19's stall count,
- * under `isCycle` (the Stop's wait cycle).
+ * outside a live main chat. Decides only, with two writes: O19's stall count
+ * under `isCycle` (the Stop's wait cycle), and O7''s revive of a `durdu` chain
+ * whose child lives again (`reviveIfAlive`, also run by O4 and the O7 typed path).
  */
 const orkestraDecision = async (
   $: EngineInterface,
@@ -2147,7 +2148,7 @@ const otonomDevam = async (
   return ORKESTRA_DEVAM_TEXT
 }
 
-/** `/devir otonom [dur | limit <n>]` (O8; the limit is the chain's, Decision 22). */
+/** `/devir otonom [dur | devam | limit <n>]` (O8, O7'; the limit is the chain's, Decision 22). */
 const otonomVerb = async (
   $: EngineInterface,
   held: OtomatikDevirConv,
@@ -2199,8 +2200,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'devir',
-      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac, otonom [dur | limit <n>]',
-      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | limit <n>]]',
+      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac, otonom [dur | devam | limit <n>]',
+      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | devam | limit <n>]]',
     })
     isPersonTurn = false
     isNextTurnPerson = false
@@ -2393,8 +2394,8 @@ export const register: Register = on => {
           await patchConv($, held.sid, { isPaused: undefined })
         }
       }
-      // O14b: a managed sub-chat's turn start is a heartbeat.
-      if (held.role === 'alt') await beatChild($, { bg: bgCount(lastStopTasks?.tasks) })
+      // O14b: a managed sub-chat's turn start is a heartbeat (`bg` only from a same-turn Stop).
+      if (held.role === 'alt') await beatChild($, {})
     }
 
     return next(e)
@@ -2427,7 +2428,8 @@ export const register: Register = on => {
         own?.role === 'alt' &&
         own.status !== 'finished' &&
         own.status !== 'cancelled' &&
-        (await runningWork($, idleTasks)).length === 0
+        // O14': every running background task (Monitor and background shell too) keeps it `working`.
+        (idleTasks === undefined ? (await runningWork($, undefined)).length : (bgCount(idleTasks) ?? 0)) === 0
       ) {
         await writeRecord($, own.localId, {
           ...own,

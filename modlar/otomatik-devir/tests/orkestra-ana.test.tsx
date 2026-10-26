@@ -1281,4 +1281,18 @@ describe('orkestra ana v1.1.1', () => {
     expect((await startSession($)).deny).toBe(ORKESTRA_END_DENY)
     expect(rec(world, 'local_main')).toMatchObject({ ended: 'bitti' })
   })
+  test('(F4) durdu, tur biter, çocuk nabzı: sonraki makine turunun Stopu zinciri diriltir ve bekleme metni verir', async ($, on) => {
+    const { world, clock } = setup(on)
+    const k = await stallUp($, world, clock, 'main')
+    await clock.advance(MIN)
+    seedChild(world, clock, k, 'local_main', 1, 'working', { beatAt: clock.now(), bg: 1 })
+    world.running[childId(k)] = true
+    await machine($, 'alt sohbet bir turu bitirdi')
+    await turnBegin($)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    const main = rec(world, 'local_main')
+    expect(main.ended).toBeUndefined()
+    expect(main.stallCount).toBeUndefined()
+    expect(main.isHeld).toBe(true)
+  })
 })

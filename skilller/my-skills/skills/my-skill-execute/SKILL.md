@@ -24,7 +24,7 @@ REQUIRED SUB-SKILL: my-skill-orchestrate
 8. **PASS: merge at once**, in dependency order: `git merge --no-ff task/<id> -m "feat(<id>): <goal>"`; non-blocking notes go to `## Gotchas`. Conflict: dispatch `Resolve merge conflict <id>`. Then remove worktree and branch, dispatch newly runnable tasks.
 9. **FAIL:** resume the implementer (Cloudroom: `thread tell`) with the findings. A second FAIL, or an implementer blocked inside its own scope: fresh `Implement <id> (review fixes)` on opus with all reports. A third FAIL: blocking stop.
 10. **Verify.** Run the plan's global verify yourself (keep only the tail) after merges when fast; when slow, after each parallel group and at phase gates.
-11. **Record.** After every merge: ledger `[x]` with sha and deviations, `Progress:` count, `## Files`. Keep state current; a compaction continues the run.
+11. **Record.** After every merge: ledger `[x]` with sha and deviations, `Progress:` count, `## Files`. Keep state current; a handoff continues the run from the state files.
 
 ## Finish
 

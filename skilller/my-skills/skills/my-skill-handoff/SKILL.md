@@ -9,7 +9,7 @@ A fresh chat resumes exactly here without re-asking anything.
 
 REQUIRED SUB-SKILL: my-skill-orchestrate
 
-Used when the user asks for a new chat; long chats otherwise rely on auto-compaction. No 🛑, no questions: run start to finish, ending with the resume prompt. STATE.md is a claim; git is evidence.
+Used when the user asks for a new chat, or when a message gives a file path for the continuation prompt ("Context handoff point reached"). No 🛑, no questions: run start to finish, ending with the resume prompt. STATE.md is a claim; git is evidence.
 
 ## Steps
 
@@ -18,6 +18,8 @@ Used when the user asks for a new chat; long chats otherwise rely on auto-compac
 3. **Update plan.** Checkbox plan: tick done boxes. Ledger plan: PROGRESS.md. Add `Deviations:` per changed task.
 4. **Write `.workflow/HANDOFF.md`** (never the repo root) from the template. In a git repo make sure it is not ignored (init's `.gitignore` rule), commit it with STATE.md/PLAN.md/PROGRESS.md and nothing else, never push.
 5. **Print the resume prompt**, filled, in a code block, last in the reply. No table after it.
+
+**Target path given:** also write the filled resume prompt to exactly that path, paste-ready and self-contained (it may land right after a compaction): the plan/STATE/PROGRESS paths, the next step, agents and worktrees still in flight, and "continue non-stop". Ask nothing, then end the turn.
 
 ## HANDOFF.md template
 

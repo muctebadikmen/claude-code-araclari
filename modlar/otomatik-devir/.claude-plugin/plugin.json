@@ -1,0 +1,20 @@
+{
+  "name": "otomatik-devir",
+  "version": "2.0.0",
+  "description": "Tek sohbette otomatik devir: bu sohbette /devir ac ile açılır; bağlam eşiğe gelince yeni iş başlatılmaz, süren işler biter, devam prompt'u dosyaya yazılır, sonra sohbet sıkıştırılır ve iş aynı sohbette o prompt'la kendiliğinden sürer.",
+  "author": {
+    "name": "Mustafa Dikmen",
+    "url": "https://github.com/muctebadikmen"
+  },
+  "keywords": [
+    "mods",
+    "context",
+    "handoff",
+    "compact",
+    "turkce"
+  ],
+  "types": "./types/index.d.ts",
+  "homepage": "https://github.com/muctebadikmen/claude-code-araclari",
+  "repository": "https://github.com/muctebadikmen/claude-code-araclari",
+  "license": "MIT"
+}

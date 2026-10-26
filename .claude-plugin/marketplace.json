@@ -14,6 +14,11 @@
       "description": "Süren işin ilerlemesini (görev listesi ya da PLAN.md / STATE.md planı) prompt kutusunun üstünde çubuk olarak gösterir (/ilerleme)."
     },
     {
+      "name": "otomatik-devir",
+      "source": "./modlar/otomatik-devir",
+      "description": "Tek sohbette otomatik devir (/devir ac): bağlam eşiğe gelince süren işler biter, devam prompt'u yazılır, sohbet sıkıştırılır ve iş aynı sohbette sürer."
+    },
+    {
       "name": "my-skills",
       "source": "./skilller/my-skills",
       "description": "İş akışı skill'leri: init → audit/research → masterplan → execute → ship, araya handoff; orchestrate hepsini alt ajanlarla yönetir."

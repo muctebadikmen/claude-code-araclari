@@ -73,44 +73,6 @@ Sonra Claude Code'u yeniden başlatın.
 
 ## Nasıl kullanılır
 
-### uzun-gorev
-
-Uzun bir işi tek sohbette yürütmek için. Sohbet, işin gerektirdiği kadar sürer: bağlam Claude Code'un otomatik sıkıştırma penceresine (`autoCompactWindow`) gelince Claude Code bağlamı aynı sohbette sıkıştırır, bir kanca Claude'a durum dosyalarını yeniden okutur ve iş kaldığı yerden sürer. Hiçbir yeni sohbet açılmaz.
-
-**Kurulum** (`~/.claude/settings.json`):
-
-```json
-{
-  "autoCompactWindow": 400000,
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "compact",
-        "hooks": [
-          { "type": "command", "command": "$HOME/Desktop/Projects/claude-code-araclari/uzun-gorev/devam.sh" }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Betik depodaki `uzun-gorev/devam.sh`; yolu kendi klonunuza göre değiştirin. Sıkıştırmadan sonra Claude'a `.workflow/STATE.md` ile planı/kaydı yeniden okuyup devam etmesini söyler.
-
-Küresel `~/.claude/CLAUDE.md` dosyanıza özetin neyi koruması gerektiğini yazan bir bölüm ekleyin:
-
-```markdown
-# Compact Instructions
-When compacting, keep: the user's current request in their own words; the active skill and the paths of the plan, PROGRESS.md and .workflow/STATE.md; ids and purpose of background agents, worktrees and branches still in flight; decisions already made; the exact next step. Drop file dumps and tool output whose results are already recorded in the state files.
-```
-
-**Kullanım:** İşi normal başlatın (örneğin bir my-skill-execute prompt'u yapıştırın). Pencereyi `/autocompact 300k` ile değiştirebilir, `/autocompact auto` ile sıfırlayabilirsiniz. Denemek için `/compact` yazın; kanca devreye girip işi sürdürmeli.
-
-**Sınırlar:**
-- Sohbet yalnızca çalışırken sürer. Yürütücü durmadan çalışır ve arka plan ajanlarını tur içinde bekler; Claude turu bitirip kullanıcıyı beklerse sıkıştırma da, devam da olmaz.
-- Sıkıştırma öncesi çalışan ajanlar durdurulmaz; sonuçları sıkıştırmadan sonra gelir ve kanca bunları beklemesini söyler.
-- Özeti model yazar; gerçek kayıt durum dosyalarıdır (`.workflow/STATE.md`, plan, ilerleme kaydı). Bu yüzden her birleştirmede ve aşamada güncel tutulurlar.
-
 ### ilerleme-cubugu
 
 İki kaynaktan çubuk çizer:
@@ -135,7 +97,21 @@ Videodaki gibi başlatmak için örnek mesaj:
 | `/ilerleme gizle` | Çubuğu gizler |
 | `/ilerleme goster` | Çubuğu geri getirir |
 
-Sıkıştırmadan sonra (uzun-gorev) ya da yeni sohbette devam prompt'u plan dosyalarından (`PLAN.md`, `STATE.md`, `HANDOFF.md`) bahsettiğinde çubuk geri gelir. Bahsetmiyorsa Claude o dosyaları okuduğu anda gelir.
+Sıkıştırmadan sonra ya da yeni sohbette devam prompt'u plan dosyalarından (`PLAN.md`, `STATE.md`, `HANDOFF.md`) bahsettiğinde çubuk geri gelir. Bahsetmiyorsa Claude o dosyaları okuduğu anda gelir.
+
+### otomatik-devir
+
+Uzun bir işi tek sohbette saatlerce sürdürmek için. Varsayılan olarak kapalıdır; yalnızca açtığınız sohbette çalışır. Bağlam eşiğe gelince Claude'a yeni iş başlatmamasını, süren alt ajanları bitirmesini ve devam prompt'unu `.workflow/devir/<sohbet-kimliği>.md` dosyasına yazmasını söyler. Dosya yazılıp alt ajanlar bitince sohbeti sıkıştırır ve işi o prompt'la aynı sohbette kendiliğinden sürdürür. Yeni sohbet açmaz.
+
+| Komut | Ne yapar |
+|---|---|
+| `/devir` | Durum: açık mı, eşik, şu anki bağlam yüzdesi |
+| `/devir ac [eşik]` | Bu sohbette açar (eşik %20-90, varsayılan %60) |
+| `/devir esik <n>` | Bu sohbetin eşiğini değiştirir |
+| `/devir kapat` | Bu sohbette kapatır, süren devri iptal eder |
+| `/devir simdi` | Yüzdeye bakmadan devri hemen başlatır |
+
+Açık olduğu sohbette durum satırında `Devir açık · eşik %60 · şu an %34` yazar. Devam prompt'u iki denemede de yazılmazsa devir durur ve uyarı verir; `/devir simdi` ile yeniden deneyebilirsiniz.
 
 ## Kaldırma
 
@@ -153,7 +129,7 @@ Modlar Claude Code'un içinde sizin yetkilerinizle çalışır, bu yüzden kurma
 claude plugin validate modlar/ilerleme-cubugu
 ```
 
-Çıktı, modun hangi işlemleri yaptığını listeler. ilerleme-cubugu'nun listesinde ağ çağrısı yoktur; yalnızca proje klasöründeki plan dosyalarını okur, hiçbir dosyaya yazmaz. `uzun-gorev/devam.sh` ağa çıkmaz ve dosya yazmaz; yalnızca `.workflow/STATE.md`'yi okuyup Claude'a bir hatırlatma metni yazdırır.
+Çıktı, modun hangi işlemleri yaptığını listeler. ilerleme-cubugu'nun listesinde ağ çağrısı yoktur; yalnızca proje klasöründeki plan dosyalarını okur, hiçbir dosyaya yazmaz.
 
 ## Bilinen sınırlar
 

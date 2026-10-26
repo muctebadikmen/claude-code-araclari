@@ -73,6 +73,12 @@ export type OrkestraAlt = {
   report?: string
   /** The child was aborted before it could hand off. */
   isAborted?: boolean
+  /** Heartbeat (O14b): clock ms of the child's last main-loop turn start, turn end or tool result. */
+  beatAt?: number
+  /** Background tasks (all types, Monitor and Bash too) running or pending at the child's last Stop. */
+  bg?: number
+  /** The child's last assistant message, cut to 500 chars. */
+  last?: string
   /** Clock ms of the last write to this record. */
   at: number
 }

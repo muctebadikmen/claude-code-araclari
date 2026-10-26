@@ -174,7 +174,7 @@ const MACHINE_TURN_DENY = `otomatik-devir: bu tur kullanıcının yazdığı bir
 const CARD_DENY = `otomatik-devir: devir için kart açma (own_initiative, proposal_id); ${START_SESSION} aracını initiation "user_asked" ile çağır.`
 const HAND_OFF_DENY = `otomatik-devir: devir için ${HAND_OFF} kullanma; devir dosyasını yaz ve ${START_SESSION} aracını initiation "user_asked" ile çağır.`
 const REMOVED_VERB = "v1.0'da kaldırıldı; tek mod otomatik. Kapatmak için: /devir kapat"
-const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | limit <n>]]'
+const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | devam | limit <n>]]'
 
 // ---------------------------------------------------------------------------
 // v1.1 orkestra modu (Contract): the main chat starts managed sub-chats one
@@ -226,6 +226,11 @@ export const chainEsikText = (n: number): string =>
 /** `/devir ac` in a chain: it writes nothing (Decisions 20, 22). */
 export const AC_CHAIN_OPEN = 'Bu zincir açık; durdurmak için /devir kapat.'
 export const AC_CHAIN_STOPPED = 'Bu zincir durdu ve sürdürülmez; yeni zincir için ' + START_HINT + ' yaz.'
+/** `/devir ac` in a `durdu` chain (O7'): it is paused, not over. */
+export const AC_CHAIN_DURDU =
+  'Bu zincir duraklatıldı (alt sohbet sessiz); sürdürmek için ana sohbette /devir otonom devam yaz.'
+/** `/devir otonom devam` in a `durdu` main chat (O7'); a command opens no model turn. */
+export const ORKESTRA_DEVAM_TEXT = 'Zincir sürüyor; devam etmek için bir mesaj yaz.'
 
 /** The prefix trigger (`orkestra: <görev>`): an undocumented alias of `/devir-otonom`. */
 export const ORKESTRA_RE = /^\s*orkestra:\s*/i
@@ -242,6 +247,12 @@ export const STARTING_STALE_MS = 120_000
 /** Stalled child (O19): checks at least this far apart, this many in a row. */
 export const STALL_GAP_MS = 240_000
 export const STALL_CYCLES = 2
+/** O19' (D2): a stall counts only after the child was quiet this long with no background work... */
+export const STALL_QUIET_MS = 30 * 60_000
+/** ...or this long with background agents, Workflows or Monitors in flight at its last Stop. */
+export const STALL_QUIET_BG_MS = 120 * 60_000
+/** A managed sub-chat's tool-result heartbeat is written at most this often (O14b). */
+export const BEAT_GAP_MS = 60_000
 
 /** Where the records live (store-probe.md `BACKEND: file`: the store is stale across sessions). */
 export const RECORD_BACKEND: 'store' | 'file' = 'file'
@@ -278,6 +289,9 @@ export const orkestraRelayText = (n: number, title: string): string =>
 
 /** Why a chain ended (types/index.d.ts `OrkestraEnd`). */
 type EndKind = NonNullable<OrkestraAna['ended']>
+
+/** An end that is final: set and not `durdu` (O3', O19': a stalled chain may revive). */
+const isFinalEnd = (ended: OrkestraAna['ended']): boolean => ended !== undefined && ended !== 'durdu'
 
 /** The chain is over (O5/O6 `end`, O19 `durdu`): the main chat summarises and opens nothing. */
 export const orkestraEndText = (
@@ -664,6 +678,44 @@ const childBase = async ($: EngineInterface, held: OtomatikDevirConv): Promise<O
   }
 }
 
+// Clock ms of this engine's last heartbeat write (O14b). Reset at session.start.
+let lastBeat: number | undefined
+
+/** Background tasks of a Stop that are still running or pending, of every type (Monitor and Bash too). */
+const bgCount = (tasks: readonly { status: string }[] | undefined): number | undefined =>
+  tasks?.filter(task => task.status === 'running' || task.status === 'pending').length
+
+/**
+ * O14b: a managed sub-chat's heartbeat in its own record, so the main chat has
+ * a liveness signal besides `isRunning` (O19). Only a `working` record (never
+ * `ready`, `finished` or `cancelled`) of a role `alt` chat not yet `done`.
+ * `isThrottled` (a tool result) writes at most once per BEAT_GAP_MS. `bg` and
+ * `last` unset keep the record's own. Never throws.
+ */
+const beatChild = async (
+  $: EngineInterface,
+  patch: { bg?: number; last?: string; isThrottled?: boolean },
+): Promise<void> => {
+  try {
+    const held = await read($, conv)
+    if (held === null || held.sid !== (await $.session.id()) || held.role !== 'alt' || held.phase === 'done') return
+    const now = await $.clock.now()
+    if (patch.isThrottled === true && lastBeat !== undefined && now - lastBeat < BEAT_GAP_MS) return
+    const own = await childBase($, held)
+    if (own === undefined || own.status !== 'working') return
+    lastBeat = now
+    await writeRecord($, own.localId, {
+      ...own,
+      beatAt: now,
+      bg: patch.bg ?? own.bg,
+      last: patch.last === undefined ? own.last : patch.last.slice(0, 500),
+      at: now,
+    })
+  } catch (error) {
+    $.ui.log(`otomatik-devir: nabız yazılamadı: ${String(error)}`, { to: 'debug' })
+  }
+}
+
 /**
  * O15: a `ready` sub-chat whose parent moved on (a later child, or the chain
  * ended) is consumed: `done`, so its drain lifts.
@@ -671,7 +723,8 @@ const childBase = async ($: EngineInterface, held: OtomatikDevirConv): Promise<O
 const consumeChild = async ($: EngineInterface, held: OtomatikDevirConv): Promise<OtomatikDevirConv> => {
   if (held.parentId === undefined) return held
   const parent = await readRecord($, held.parentId).catch(() => undefined)
-  if (parent?.role !== 'ana' || !(parent.n > (held.childN ?? 0) || parent.ended !== undefined)) return held
+  // O15': a `durdu` parent may revive (O19'): its ready child waits, unconsumed.
+  if (parent?.role !== 'ana' || !(parent.n > (held.childN ?? 0) || isFinalEnd(parent.ended))) return held
   // O21 over O15 also when the chain settings were not readable now: a main
   // chat that ended `kapatildi` was closed, so its ready child is cancelled.
   if (parent.ended === 'kapatildi') return cancelHandoff($, held.sid, true)
@@ -867,7 +920,8 @@ const isDue = async ($: EngineInterface, held: OtomatikDevirConv): Promise<{ thr
   if ((await roleOf($)) !== 'alt') return undefined
   const chainId = await chainIdOf($)
   const parent = chainId === undefined ? undefined : await readRecord($, chainId).catch(() => undefined)
-  if (parent?.role !== 'ana' || parent.ended !== undefined) return undefined
+  // O3': a `durdu` chain may revive (O19'), so its sub-chat still trips.
+  if (parent?.role !== 'ana' || isFinalEnd(parent.ended)) return undefined
   const settings = await readSettings($)
   if (!settings.isEnabled) return undefined
   if ((await handedOf($, held.sid)) !== undefined) return undefined
@@ -1139,6 +1193,27 @@ const readChild = async ($: EngineInterface, childId: string | undefined): Promi
   return rec?.role === 'alt' ? rec : undefined
 }
 
+/**
+ * O7': a `durdu` chain resumes once its child shows life: a heartbeat newer
+ * than the last stall check, or a `ready`/`finished` record. Clears the end and
+ * the stall fields (record) and the stalled band (conv); returns the live main
+ * record, else `main` as it was. Every other end is final.
+ */
+const reviveIfAlive = async ($: EngineInterface, main: OrkestraAna): Promise<OrkestraAna> => {
+  if (main.ended !== 'durdu') return main
+  const child = await readChild($, main.childId)
+  const isAlive =
+    child !== undefined &&
+    ((child.beatAt ?? 0) > (main.stallAt ?? 0) || child.status === 'ready' || child.status === 'finished')
+  if (!isAlive) return main
+  const live = await patchMain($, main.localId, { ended: undefined, stallCount: undefined, stallAt: undefined })
+  await patchConv($, main.sid, { stalledN: undefined })
+  $.ui.log(`otomatik-devir: zincir sürüyor; alt sohbet ${main.n} yeniden canlı (${child.status})`, { to: 'debug' })
+  later($, () => refreshStatus($))
+
+  return live ?? main
+}
+
 /** Writes a chain's settings whole (Decision 22). */
 export const writeChainSettings = async ($: EngineInterface, mainLocalId: string, rec: OrkestraAyar): Promise<void> => {
   const home = await homeOf($)
@@ -1238,7 +1313,7 @@ const resolveRole = async ($: EngineInterface, sid: string): Promise<OrkestraRol
   const parent = got.kind === 'ok' && got.rec.role === 'ana' ? got.rec : undefined
   if (
     parent === undefined ||
-    parent.ended !== undefined ||
+    isFinalEnd(parent.ended) ||
     !(parent.childId === self.id || parent.childId === UNKNOWN_CHILD || parent.starting === true)
   ) {
     await patchConv($, sid, { role: 'yok' })
@@ -1373,8 +1448,10 @@ const orkestraTyped = async (
   const sid = await $.session.id()
   const held = await read($, conv)
   if (held === null || held.sid !== sid || held.role !== 'ana' || held.localId === undefined) return undefined
-  const main = await readMain($, held.localId)
-  if (main === undefined) return undefined
+  const found = await readMain($, held.localId)
+  if (found === undefined) return undefined
+  // O7': a `durdu` chain whose child lives again takes the normal hold path below.
+  const main = await reviveIfAlive($, found)
   if (main.ended !== undefined) {
     // O7: a chain that ended while paused gives the next typed message its end text, once.
     if (held.isPaused !== true) return undefined
@@ -1576,8 +1653,10 @@ const orkestraStart = async (
 ): Promise<Awaited<ReturnType<ToolNext>> | undefined> => {
   const sid = await $.session.id()
   const localId = await selfLocal($)
-  const main = localId === undefined ? undefined : await readMain($, localId)
-  if (localId === undefined || main === undefined) return undefined
+  const found = localId === undefined ? undefined : await readMain($, localId)
+  if (localId === undefined || found === undefined) return undefined
+  // O7': a `durdu` chain whose child lives again is not ended.
+  const main = await reviveIfAlive($, found)
   // O21: no new sub-chat once this chain is closed (`ended` is written by O5/O6/O7).
   if (main.ended === undefined && (await readChainSettings($, localId).catch(() => undefined))?.isClosed === true) {
     return { deny: ORKESTRA_END_DENY }
@@ -1873,8 +1952,9 @@ const childRunning = async ($: EngineInterface, childId: string): Promise<boolea
 
 /**
  * What the main chat does next, from its record and its child's; undefined
- * outside a live main chat. Decides only: its one write is O19's stall count,
- * under `isCycle` (the Stop's wait cycle).
+ * outside a live main chat. Decides only, with two writes: O19's stall count
+ * under `isCycle` (the Stop's wait cycle), and O7''s revive of a `durdu` chain
+ * whose child lives again (`reviveIfAlive`, also run by O4 and the O7 typed path).
  */
 const orkestraDecision = async (
   $: EngineInterface,
@@ -1882,8 +1962,11 @@ const orkestraDecision = async (
 ): Promise<{ decision: OrkestraDecision; main: OrkestraAna } | undefined> => {
   if ((await roleOf($)) !== 'ana') return undefined
   const localId = await selfLocal($)
-  const main = localId === undefined ? undefined : await readMain($, localId)
-  if (localId === undefined || main === undefined || main.ended !== undefined) return undefined
+  const found = localId === undefined ? undefined : await readMain($, localId)
+  if (localId === undefined || found === undefined) return undefined
+  // O7': a `durdu` chain whose child lives again decides as a live one.
+  const main = await reviveIfAlive($, found)
+  if (main.ended !== undefined) return undefined
   const done = (decision: OrkestraDecision) => ({ decision, main })
   const n = main.n
   // O21: this chain closed (`/devir kapat`) or its child cancelled: the chain ends first, paused too.
@@ -1924,10 +2007,21 @@ const orkestraDecision = async (
 
     return done({ kind: 'relay', n, text: orkestraRelayText(n + 1, childTitle(main.task, n + 1)) })
   }
-  // O19: the child not running, in STALL_CYCLES checks at least STALL_GAP_MS apart.
+  // O19': a stall counts only when the child (record absent or `working`) has
+  // been quiet STALL_QUIET_MS (STALL_QUIET_BG_MS with background work at its
+  // last Stop) and is not running, in STALL_CYCLES checks at least STALL_GAP_MS
+  // apart. Quiet is measured from the child's heartbeat (`beatAt`), else its
+  // record's `at`, else (no record) the chain's start; a beat newer than the
+  // last check resets the count. `isRunning` alone never stalls a chain.
   if (opts.isCycle === true && main.childId !== undefined && main.childId !== UNKNOWN_CHILD) {
     let stallCount = main.stallCount
-    if (now - (main.stallAt ?? 0) >= STALL_GAP_MS) {
+    const quietFrom = child?.beatAt ?? child?.at ?? main.startedAt
+    if (stallCount !== undefined && child?.beatAt !== undefined && child.beatAt > (main.stallAt ?? 0)) {
+      stallCount = undefined
+      await patchMain($, localId, { stallCount: undefined })
+    }
+    const quietNeeded = (child?.bg ?? 0) === 0 ? STALL_QUIET_MS : STALL_QUIET_BG_MS
+    if (now - quietFrom >= quietNeeded && now - (main.stallAt ?? 0) >= STALL_GAP_MS) {
       const isRunning = await childRunning($, main.childId)
       if (isRunning === false) {
         stallCount = (stallCount ?? 0) + 1
@@ -2082,7 +2176,31 @@ const esikTail = async ($: EngineInterface, held: OtomatikDevirConv): Promise<st
   return equivalent === '' ? '' : ` · eşik %${threshold}${equivalent}`
 }
 
-/** `/devir otonom [dur | limit <n>]` (O8; the limit is the chain's, Decision 22). */
+/**
+ * O7': `/devir otonom devam` in the main chat clears a `durdu` end whatever the
+ * child shows; the chain then waits paused for the person's next message (a
+ * command opens no model turn). Other ends stay final.
+ */
+const otonomDevam = async (
+  $: EngineInterface,
+  held: OtomatikDevirConv,
+  role: OrkestraRole,
+  chainId: string | undefined,
+): Promise<string> => {
+  if (role === 'alt' && chainId !== undefined) return 'Bu bir alt sohbet; zinciri ana sohbette /devir otonom devam ile sürdür.'
+  if (role !== 'ana' || chainId === undefined) return NOT_ORCHESTRATED
+  const main = await readMain($, chainId)
+  if (main === undefined) return NOT_ORCHESTRATED
+  if (main.ended === undefined) return 'Zincir zaten sürüyor.'
+  if (main.ended !== 'durdu') return AC_CHAIN_STOPPED
+  await patchMain($, chainId, { ended: undefined, stallCount: undefined, stallAt: undefined, isHeld: false })
+  await patchConv($, held.sid, { stalledN: undefined, isPaused: true })
+  await refreshStatus($).catch(() => undefined)
+
+  return ORKESTRA_DEVAM_TEXT
+}
+
+/** `/devir otonom [dur | devam | limit <n>]` (O8, O7'; the limit is the chain's, Decision 22). */
 const otonomVerb = async (
   $: EngineInterface,
   held: OtomatikDevirConv,
@@ -2100,6 +2218,7 @@ const otonomVerb = async (
 
     return `Orkestra: sınır ${limit} alt sohbet.`
   }
+  if (sub === 'devam') return otonomDevam($, held, role, chainId)
   if (sub !== '' && sub !== 'dur') return USAGE
   if (role === 'ana' && chainId !== undefined) {
     if (sub === 'dur') {
@@ -2133,8 +2252,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'devir',
-      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac, otonom [dur | limit <n>]',
-      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | limit <n>]]',
+      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac, otonom [dur | devam | limit <n>]',
+      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | devam | limit <n>]]',
     })
     isPersonTurn = false
     isNextTurnPerson = false
@@ -2144,6 +2263,7 @@ export const register: Register = on => {
     // O18: no module state leaks from another session (or an older load).
     timeoutFor = undefined
     lastStopTasks = undefined
+    lastBeat = undefined
     orkestraStartBlocks = undefined
     orkestraNoted = undefined
     orkestraEndTold = undefined
@@ -2328,6 +2448,8 @@ export const register: Register = on => {
           await patchConv($, held.sid, { isPaused: undefined })
         }
       }
+      // O14b: a managed sub-chat's turn start is a heartbeat (`bg` only from a same-turn Stop).
+      if (held.role === 'alt') await beatChild($, {})
     }
 
     return next(e)
@@ -2360,7 +2482,8 @@ export const register: Register = on => {
         own?.role === 'alt' &&
         own.status !== 'finished' &&
         own.status !== 'cancelled' &&
-        (await runningWork($, idleTasks)).length === 0
+        // O14': every running background task (Monitor and background shell too) keeps it `working`.
+        (idleTasks === undefined ? (await runningWork($, undefined)).length : (bgCount(idleTasks) ?? 0)) === 0
       ) {
         await writeRecord($, own.localId, {
           ...own,
@@ -2370,6 +2493,11 @@ export const register: Register = on => {
           at: await $.clock.now(),
         })
       }
+    }
+    // O14b: a turn end that did not finish the sub-chat is a heartbeat (a `finished` record is left alone).
+    if (held.role === 'alt' || child !== null) {
+      const stopTasks = lastStopTasks?.turnId === e.turnId ? lastStopTasks.tasks : undefined
+      await beatChild($, { bg: bgCount(stopTasks), last: e.answer })
     }
     if (held.phase === 'handoff_running') {
       if (e.isAborted) $.ui.log('otomatik-devir: tur durduruldu; devir sürüyor', { to: 'debug' })
@@ -2425,6 +2553,8 @@ export const register: Register = on => {
     }
     const result = await next(e)
     if (result.deny !== undefined) return result
+    // O14b: a managed sub-chat's tool result is a heartbeat (at most one write per BEAT_GAP_MS).
+    await beatChild($, { isThrottled: true })
     // O6: the main chat's next step rides on this result.
     const step = await orkestraNote($)
     if (step !== undefined) return { ...result, context: [...(result.context ?? []), step] } as typeof result
@@ -2670,6 +2800,8 @@ export const register: Register = on => {
         const isClosed = (await readChainSettings($, chainId).catch(() => undefined))?.isClosed === true
         const main = isClosed ? undefined : await readRecord($, chainId).catch(() => undefined)
         const isEnded = main?.role === 'ana' && main.ended !== undefined
+        // O7': a `durdu` chain is paused, not over: it points to `/devir otonom devam`.
+        if (!isClosed && main?.role === 'ana' && main.ended === 'durdu') return { text: AC_CHAIN_DURDU }
 
         return { text: isClosed || isEnded ? AC_CHAIN_STOPPED : AC_CHAIN_OPEN }
       }

@@ -323,6 +323,9 @@ export const orkestraResumeNote = (n: number, state: string): string =>
 export const managedChildNote = (n: number, limit: number): string =>
   `\n\n## otomatik-devir\nBu sohbet otonom bir zincirin yönetilen alt sohbeti (${n}/${limit}). Kullanıcıya soru sorma, onay bekleme: kararları kendin ver ve gerekçesini yaz. Yeni sohbet açma, kendiliğinden devir yapma: bağlam eşiğe ulaşınca mod talimat verir. Çok adımlı işi my-skill-orchestrate becerisiyle alt ajanlara dağıt; model seçimi o becerideki yönlendirmeye göre (varsayılan sonnet). İş bitince sonucu kısaca raporla.`
 
+/** The managed note inside a sub-chat's first prompt (`managedChildNote`). */
+const MANAGED_FIRST_PROMPT = /## otomatik-devir\nBu sohbet otonom bir zincirin yönetilen alt sohbeti \(\d+\/\d+\)/
+
 /** A managed sub-chat's handoff (O12): the file only, the main chat starts the next one. */
 export const managedHandoff = (threshold: number, file: string, hasSkill = true): string =>
   `Bağlam %${threshold}${dative(threshold)} ulaştı (bağlam sınırı): bu yönetilen alt sohbet devredilecek. Elindeki adımı güvenli bir noktada tamamla (yarım dosya bırakma). ${NO_NEW_WORK} Her şey bitince: ${writeStep(file, hasSkill)} Dosyanın en üstünde tek satır olsun: iş tamamen bittiyse \`Kalan: yok\`, kalan iş varsa \`Kalan: var\`. ${START_SESSION} ve ${HAND_OFF} çağırma, kart açma: sıradaki sohbeti ana sohbet açar. Dosyayı yazınca turu bitir.`
@@ -2215,7 +2218,9 @@ export const register: Register = on => {
     if (isPerson) {
       try {
         // O7: a person's prompt also clears the stalled band.
-        await patchConv($, (await currentConv($)).sid, { lastTyped: e.text, stalledN: undefined })
+        // T9: a managed sub-chat's first prompt (start_session) is the main chat's brief, not the person's ask.
+        const patch = MANAGED_FIRST_PROMPT.test(e.text) ? { stalledN: undefined } : { lastTyped: e.text, stalledN: undefined }
+        await patchConv($, (await currentConv($)).sid, patch)
       } catch (error) {
         $.ui.log(`otomatik-devir: son istem kaydedilemedi: ${String(error)}`, { to: 'debug' })
       }

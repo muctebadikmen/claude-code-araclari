@@ -21,6 +21,7 @@ import {
   orkestraWaitText,
   READY_BAND,
   RECORD_BACKEND,
+  SKILL_HANDOFF_DENY,
   START_NOW,
   timeoutText,
   waitText,
@@ -804,5 +805,17 @@ describe('orkestra alt', () => {
     expect(await phase($)).toContain('aşama: idle')
     expect(rec(world, C1)).toMatchObject({ status: 'cancelled' })
     expect(rec(world, C1).file).toBeUndefined()
+  })
+
+  test('(B-T9) ilk prompt "HANDOFF.md" geçse de düz Skill my-skill-handoff reddedilir; sonradan yazılan "devir yap" geçer', async ($, on) => {
+    const { world } = setup(on)
+    await chainToChild($, world)
+    // The start_session-delivered first prompt (any origin kind) names HANDOFF.md and carries the managed note.
+    await typed($, `Önceki işi .workflow/HANDOFF.md dosyasından oku, devam et.${managedChildNote(1, 5)}`)
+    const plain = await $.tool.call({ tool: 'Skill', skill: SKILL })
+    expect(plain.deny).toBe(SKILL_HANDOFF_DENY)
+    // A message the person types later asks for the handoff: allowed.
+    await typed($, 'şimdi devir yap')
+    expect((await $.tool.call({ tool: 'Skill', skill: SKILL })).deny).toBeUndefined()
   })
 })

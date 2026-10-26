@@ -104,6 +104,7 @@ Mevcut kurulumunuzda eski sürümden kalan `otomatik-devir-*` zamanlanmış gör
 | `/devir otonom` | Orkestra durumunu ve sınırı gösterir |
 | `/devir otonom dur` | Zinciri şu anki alt sohbetten sonra durdurur |
 | `/devir otonom devam` | Ana sohbette: sessiz alt sohbet yüzünden duraklatılan (`durdu`) zinciri sürdürür; sonraki mesajınız zinciri yeniden tutar |
+| `/devir otonom devret` | Ana sohbette (ya da zincirin bir alt sohbetinde): şu anki alt sohbeti hemen devrettirir; alt sohbet bir sonraki araç sonucunda ya da tur sonunda kendi devir dosyasını (`Kalan:` satırıyla) yazar. Duraklatılmış (`durdu`) zincirde önce duraklatmayı kaldırır. Serbest metinle alt sohbete devir söylemeye gerek kalmaz. |
 | `/devir otonom limit <n>` | Bu zincirin alt sohbet sınırını ayarlar (1-1000, varsayılan 100) |
 | `/devir esik 70` | Bu zincirin alt sohbet eşiğini %70 yapar, ana ya da alt sohbette (1-99, varsayılan 60; pencere biliniyorsa durum satırı ve `/devir otonom` token karşılığını da gösterir, örn. `eşik %60 ≈ 600k`, token sınırı yoktur); başka zincirleri ve sohbetleri etkilemez; normal sohbette hiçbir şey değiştirmez |
 | `/devir dene 20` | Bu sohbetin deneme eşiği; alt sohbette onun, ana sohbette ya da başlatmadan önce yazılınca zincirin alt sohbetlerinin; `/devir dene` yazınca kaldırır |

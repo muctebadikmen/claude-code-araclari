@@ -174,7 +174,7 @@ const MACHINE_TURN_DENY = `otomatik-devir: bu tur kullanıcının yazdığı bir
 const CARD_DENY = `otomatik-devir: devir için kart açma (own_initiative, proposal_id); ${START_SESSION} aracını initiation "user_asked" ile çağır.`
 const HAND_OFF_DENY = `otomatik-devir: devir için ${HAND_OFF} kullanma; devir dosyasını yaz ve ${START_SESSION} aracını initiation "user_asked" ile çağır.`
 const REMOVED_VERB = "v1.0'da kaldırıldı; tek mod otomatik. Kapatmak için: /devir kapat"
-const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | devam | limit <n>]]'
+const USAGE = 'Kullanım: /devir [esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | devam | devret | limit <n>]]'
 
 // ---------------------------------------------------------------------------
 // v1.1 orkestra modu (Contract): the main chat starts managed sub-chats one
@@ -410,6 +410,7 @@ const toAyar = (got: Record<string, unknown>): OrkestraAyar => ({
   esik: typeof got.esik === 'number' ? got.esik : undefined,
   limit: typeof got.limit === 'number' ? got.limit : undefined,
   isClosed: got.isClosed === true ? true : undefined,
+  forceN: typeof got.forceN === 'number' ? got.forceN : undefined,
   at: typeof got.at === 'number' ? got.at : 0,
 })
 
@@ -436,7 +437,7 @@ export const orkestraLimit = async ($: EngineInterface, mainLocalId: string): Pr
 const NOT_ORCHESTRATED = `Bu sohbet orkestra modunda değil (sınır ${DEFAULT_LIMIT} alt sohbet). Başlatmak için ${START_HINT} yaz.`
 
 type SelfSettings = { effort?: string; model?: string; permissionMode?: string }
-type Settings = { threshold: number; isEnabled: boolean }
+type Settings = { threshold: number; isEnabled: boolean; forceN?: number }
 
 const isThreshold = (n: unknown): n is number =>
   typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= 99
@@ -464,6 +465,7 @@ const readSettings = async ($: EngineInterface): Promise<Settings> => {
   return {
     threshold: isThreshold(esik) ? esik : DEFAULT_THRESHOLD,
     isEnabled: ayar?.isClosed !== true,
+    forceN: ayar?.forceN,
   }
 }
 
@@ -926,7 +928,8 @@ const isDue = async ($: EngineInterface, held: OtomatikDevirConv): Promise<{ thr
   if (!settings.isEnabled) return undefined
   if ((await handedOf($, held.sid)) !== undefined) return undefined
   const threshold = thresholdOf(settings, held)
-  if (held.isForced === true) return { threshold }
+  // T7: `/devir otonom devret` in the main chat forces this very child (its number), not a later one.
+  if (held.isForced === true || (settings.forceN !== undefined && settings.forceN === held.childN)) return { threshold }
   const percent = await contextPercent($)
   if (percent === undefined || percent < threshold) return undefined
 
@@ -934,6 +937,14 @@ const isDue = async ($: EngineInterface, held: OtomatikDevirConv): Promise<{ thr
 }
 
 const newHandoffId = (sid: string, now: number): string => `${sid.slice(0, 8)}-${now.toString(36)}`
+
+/** T7: drops the chain's `forceN` when it names this sub-chat (a later sub-chat's number is left alone). */
+const clearForceN = async ($: EngineInterface, held: OtomatikDevirConv): Promise<void> => {
+  const chainId = held.parentId
+  if (chainId === undefined || held.childN === undefined) return
+  const ayar = await readChainSettings($, chainId)
+  if (ayar?.forceN === held.childN) await patchChainSettings($, chainId, { forceN: undefined })
+}
 
 /**
  * Starts a handoff: `handoff_running` with a new id, its time and file, and the
@@ -964,6 +975,8 @@ const claimHandoff = async (
   if (!isClaimed) return undefined
   later($, () => noteSelf($, sid))
   const held = await read($, conv)
+  // T7: the handoff took the chain's `devret` for this child; it must not outlive it.
+  if (isManaged && held !== null && held.sid === sid) await clearForceN($, held).catch(() => undefined)
 
   return held !== null && held.sid === sid ? held : undefined
 }
@@ -2176,6 +2189,27 @@ const esikTail = async ($: EngineInterface, held: OtomatikDevirConv): Promise<st
   return equivalent === '' ? '' : ` · eşik %${threshold}${equivalent}`
 }
 
+/** `/devir simdi` in a sub-chat (also `/devir otonom devret` there): this chat hands off in the running turn or at the next message. */
+const simdiText = async ($: EngineInterface, held: OtomatikDevirConv, settings: Settings): Promise<string> => {
+  const handed = await handedOf($, held.sid)
+  if (handed !== undefined || held.phase === 'done') {
+    return `Bu sohbet zaten devredildi${handed?.startedId ? ` (${handed.startedId})` : ''}.`
+  }
+  if (isDrainPhase(held.phase)) return 'Devir zaten çalışıyor.'
+  // Decision 22: a closed chain is not reopened.
+  if (!settings.isEnabled) return AC_CHAIN_STOPPED
+  await patchConv($, held.sid, { isForced: true })
+
+  return 'Devir istendi: çalışan turda ya da bir sonraki mesajınla başlayacak.'
+}
+
+/** O7' and T7: a `durdu` end cleared by hand (`devam`, `devret`); the chain then waits for the person's next message. */
+const clearDurdu = async ($: EngineInterface, held: OtomatikDevirConv, chainId: string): Promise<void> => {
+  await patchMain($, chainId, { ended: undefined, stallCount: undefined, stallAt: undefined, isHeld: false })
+  await patchConv($, held.sid, { stalledN: undefined, isPaused: true })
+  await refreshStatus($).catch(() => undefined)
+}
+
 /**
  * O7': `/devir otonom devam` in the main chat clears a `durdu` end whatever the
  * child shows; the chain then waits paused for the person's next message (a
@@ -2193,14 +2227,38 @@ const otonomDevam = async (
   if (main === undefined) return NOT_ORCHESTRATED
   if (main.ended === undefined) return 'Zincir zaten sürüyor.'
   if (main.ended !== 'durdu') return AC_CHAIN_STOPPED
-  await patchMain($, chainId, { ended: undefined, stallCount: undefined, stallAt: undefined, isHeld: false })
-  await patchConv($, held.sid, { stalledN: undefined, isPaused: true })
-  await refreshStatus($).catch(() => undefined)
+  await clearDurdu($, held, chainId)
 
   return ORKESTRA_DEVAM_TEXT
 }
 
-/** `/devir otonom [dur | devam | limit <n>]` (O8, O7'; the limit is the chain's, Decision 22). */
+/**
+ * T7: `/devir otonom devret`. In the main chat it writes the chain's
+ * `forceN` (the current child's number): that child hands off through the
+ * mod's own path at its next tool result or turn end (`isDue`). A `durdu` end
+ * is cleared first; any other end is final. In a sub-chat it is `/devir simdi`.
+ */
+const otonomDevret = async (
+  $: EngineInterface,
+  held: OtomatikDevirConv,
+  role: OrkestraRole,
+  chainId: string | undefined,
+): Promise<string> => {
+  if (role === 'alt' && chainId !== undefined) return simdiText($, held, await readSettings($))
+  if (role !== 'ana' || chainId === undefined) return NOT_ORCHESTRATED
+  const main = await readMain($, chainId)
+  if (main === undefined) return NOT_ORCHESTRATED
+  if (isFinalEnd(main.ended) || !(await readSettings($)).isEnabled) return AC_CHAIN_STOPPED
+  if (main.n < 1) return 'Henüz alt sohbet yok.'
+  const child = await readChild($, main.childId)
+  if (child !== undefined && child.status !== 'working') return `Alt sohbet ${main.n} zaten devretti.`
+  if (main.ended === 'durdu') await clearDurdu($, held, chainId)
+  await patchChainSettings($, chainId, { forceN: main.n })
+
+  return `Alt sohbet ${main.n} devredecek (sonraki araç sonucunda ya da tur sonunda).`
+}
+
+/** `/devir otonom [dur | devam | devret | limit <n>]` (O8, O7'; the limit is the chain's, Decision 22). */
 const otonomVerb = async (
   $: EngineInterface,
   held: OtomatikDevirConv,
@@ -2219,6 +2277,7 @@ const otonomVerb = async (
     return `Orkestra: sınır ${limit} alt sohbet.`
   }
   if (sub === 'devam') return otonomDevam($, held, role, chainId)
+  if (sub === 'devret') return otonomDevret($, held, role, chainId)
   if (sub !== '' && sub !== 'dur') return USAGE
   if (role === 'ana' && chainId !== undefined) {
     if (sub === 'dur') {
@@ -2252,8 +2311,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'devir',
-      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac, otonom [dur | devam | limit <n>]',
-      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | devam | limit <n>]]',
+      description: 'Otomatik devir: durum, esik <n>, dene <n> (yalnızca bu sohbet), simdi, kapat, ac, otonom [dur | devam | devret | limit <n>]',
+      argumentHint: '[esik <n> | dene <n> | simdi | kapat | ac | otonom [dur | devam | devret | limit <n>]]',
     })
     isPersonTurn = false
     isNextTurnPerson = false
@@ -2759,18 +2818,8 @@ export const register: Register = on => {
         // O3: the main chat never hands off; O20: nor does a normal chat.
         if (role === 'ana') return { text: 'Ana sohbet devredilmez (orkestra modu).' }
         if (isNormal) return { text: NORMAL_INFO }
-        const handed = await handedOf($, held.sid)
-        if (handed !== undefined || held.phase === 'done') {
-          return {
-            text: `Bu sohbet zaten devredildi${handed?.startedId ? ` (${handed.startedId})` : ''}.`,
-          }
-        }
-        if (isDrainPhase(held.phase)) return { text: 'Devir zaten çalışıyor.' }
-        // Decision 22: a closed chain is not reopened.
-        if (!settings.isEnabled) return { text: AC_CHAIN_STOPPED }
-        await patchConv($, held.sid, { isForced: true })
 
-        return { text: 'Devir istendi: çalışan turda ya da bir sonraki mesajınla başlayacak.' }
+        return { text: await simdiText($, held, settings) }
       }
       case 'kapat': {
         if (isNormal) return { text: NORMAL_INFO }

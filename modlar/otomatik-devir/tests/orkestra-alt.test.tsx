@@ -982,3 +982,110 @@ describe('orkestra alt v1.1.1', () => {
     expect(rec(world, C1)).toMatchObject({ status: 'working', bg: 1 })
   })
 })
+
+// v1.1.1 T7: `/devir otonom devret` makes the current managed child hand off now.
+const DEVRET_1 = 'Alt sohbet 1 devredecek (sonraki araç sonucunda ya da tur sonunda).'
+
+describe('orkestra alt devret (T7)', () => {
+  test('(T7a) ana sohbette devret: ayara forceN yazılır; alt sohbetin sonraki araç sonucu managedHandoff taşır, forceN temizlenir, Kalan: satırlı dosyayla ready', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await typed($, 'iş')
+    await as($, world, 'main')
+    expect(await devir($, 'otonom devret')).toBe(DEVRET_1)
+    expect(ayar(world, 'local_main')).toMatchObject({ forceN: 1 })
+    await as($, world, 'c1')
+    world.percent = 10
+    await turnBegin($)
+    const got = await bash($)
+    expect(got.context).toEqual([managedHandoff(60, FILE_C1, true)])
+    expect(ayar(world, 'local_main').forceN).toBeUndefined()
+    expect(await phase($)).toContain('aşama: handoff_running')
+    await clock.advance(100)
+    writeHandoff(world, clock, FILE_C1, HANDOFF_VAR)
+    expect((await stop($, [])).block).toBeUndefined()
+    expect(rec(world, C1)).toMatchObject({ status: 'ready', file: FILE_C1 })
+  })
+
+  test('(T7b) tur sonunda da devreder: araç çağrısız tur Stopta managedHandoff blokunu alır', async ($, on) => {
+    const { world } = setup(on)
+    await chainToChild($, world)
+    await as($, world, 'main')
+    await devir($, 'otonom devret')
+    await as($, world, 'c1')
+    world.percent = 10
+    await typed($, 'iş')
+    await turnBegin($)
+    expect((await stop($, [])).block).toBe(managedHandoff(60, FILE_C1, true))
+  })
+
+  test('(T7c) durdu sonrası devret: durdu kalkar, forceN yazılır, alt sohbet devreder', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await typed($, 'iş')
+    seedRec(world, clock, 'local_main', { ...rec(world, 'local_main'), ended: 'durdu', stallCount: 2, stallAt: clock.now() })
+    await as($, world, 'main')
+    expect(await devir($, 'otonom devret')).toBe(DEVRET_1)
+    expect(rec(world, 'local_main').ended).toBeUndefined()
+    expect(ayar(world, 'local_main')).toMatchObject({ forceN: 1 })
+    await as($, world, 'c1')
+    world.percent = 10
+    await turnBegin($)
+    expect((await bash($)).context).toEqual([managedHandoff(60, FILE_C1, true)])
+  })
+
+  test('(T7d) ikinci alt sohbet (n 2) eski forceN 1 ile devretmez; forceN 2 onu devreder', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await childReady($, world, clock, FILE_C1, HANDOFF_VAR)
+    await turnEnd($)
+    world.percent = 10
+    await as($, world, 'main')
+    await turnBegin($)
+    await stop($, [])
+    expect((await startSession($, { prompt: 'devam' })).deny).toBeUndefined()
+    seedAyar(world, clock, 'local_main', { ...ayar(world, 'local_main'), forceN: 1 })
+    await as($, world, 'c2')
+    await typed($, 'iş')
+    await turnBegin($)
+    expect((await bash($)).context ?? []).toEqual([])
+    expect(await phase($)).toContain('aşama: idle')
+    await as($, world, 'main')
+    expect(await devir($, 'otonom devret')).toBe('Alt sohbet 2 devredecek (sonraki araç sonucunda ya da tur sonunda).')
+    expect(ayar(world, 'local_main')).toMatchObject({ forceN: 2 })
+    await as($, world, 'c2')
+    world.percent = 10
+    await turnBegin($)
+    expect((await bash($)).context).toEqual([managedHandoff(60, FILE_C2, true)])
+  })
+
+  test('(T7e) alt sohbette devret simdi gibi yanıtlar ve devreder; bitmiş zincirde AC_CHAIN_STOPPED; normal sohbette NOT_ORCHESTRATED', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await typed($, 'iş')
+    expect(await devir($, 'otonom devret')).toBe('Devir istendi: çalışan turda ya da bir sonraki mesajınla başlayacak.')
+    world.percent = 10
+    await turnBegin($)
+    expect((await bash($)).context).toEqual([managedHandoff(60, FILE_C1, true)])
+    seedRec(world, clock, 'local_main', { ...rec(world, 'local_main'), ended: 'bitti' })
+    await as($, world, 'main')
+    expect(await devir($, 'otonom devret')).toBe(AC_CHAIN_STOPPED)
+    await as($, world, 'plain')
+    expect(await devir($, 'otonom devret')).toContain('Bu sohbet orkestra modunda değil')
+  })
+
+  test('(T7f) ana sohbette alt sohbet henüz yokken ya da zaten hazırken devret forceN yazmaz', async ($, on) => {
+    const { world, clock } = setup(on)
+    await as($, world, 'main')
+    await go($, TASK)
+    expect(await devir($, 'otonom devret')).toBe('Henüz alt sohbet yok.')
+    await turnBegin($)
+    expect((await startSession($)).deny).toBeUndefined()
+    await as($, world, 'c1')
+    await childReady($, world, clock)
+    await turnEnd($)
+    await as($, world, 'main')
+    expect(await devir($, 'otonom devret')).toBe('Alt sohbet 1 zaten devretti.')
+    expect(ayar(world, 'local_main')?.forceN).toBeUndefined()
+  })
+})

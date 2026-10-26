@@ -31,6 +31,8 @@ import {
   RECORD_BACKEND,
   RUN_PREFIX,
   START_HINT,
+  STALL_QUIET_BG_MS,
+  STALL_QUIET_MS,
   UNKNOWN_CHILD,
   ZINCIR_AYAR_PREFIX,
   zincirAyarFile,
@@ -611,13 +613,17 @@ describe('orkestra ana', () => {
     expect(await devir($, 'simdi')).toBe('Ana sohbet devredilmez (orkestra modu).')
   })
 
-  test('(A15) yanıt vermeyen çocuk: iki kontrol en az 4 dk arayla; durdu sonu, bant; çalışırsa sayaç sıfırlanır', async ($, on) => {
+  test('(A15) yanıt vermeyen çocuk: 30 dk sessizlikten sonra iki kontrol en az 4 dk arayla; durdu sonu, bant; çalışırsa sayaç sıfırlanır', async ($, on) => {
     const { world, clock } = setup(on)
     const k = await chainUp($, world, 'main')
     const id = childId(k)
     seedChild(world, clock, k, 'local_main', 1, 'working')
     world.running[id] = false
     const gets = () => callsOf(world, GET).filter((c: any) => c.session_id === id).length
+    // O19': quiet under STALL_QUIET_MS (the record's `at`, no beat yet): no GET at all.
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    expect(gets()).toBe(0)
+    await clock.advance(STALL_QUIET_MS + 60_000)
     expect((await stop($, [])).block).toBe(orkestraWaitText(1))
     expect(gets()).toBe(1)
     await clock.advance(60_000)
@@ -640,6 +646,7 @@ describe('orkestra ana', () => {
     const id2 = childId(k2)
     seedChild(world, clock, k2, 'local_m2', 1, 'working')
     world.running[id2] = false
+    await clock.advance(STALL_QUIET_MS + 60_000)
     expect((await stop($, [])).block).toBe(orkestraWaitText(1))
     await clock.advance(5 * 60_000)
     world.running[id2] = true
@@ -653,14 +660,14 @@ describe('orkestra ana', () => {
     const k3 = await chainUp($, world, 'm3')
     readyChild(world, clock, k3, 'local_m3', 1)
     const before = callsOf(world, GET).filter((c: any) => c.session_id !== 'self').length
-    await clock.advance(5 * 60_000)
+    await clock.advance(STALL_QUIET_MS + 60_000)
     expect((await stop($, [])).block).toBe(orkestraRelayText(2, `${TASK} · 2`))
     chat(world, 'm4')
     await as($, world, 'm4')
     await go($, TASK)
     seedRec(world, clock, 'local_m4', { ...rec(world, 'local_m4'), n: 1, childId: UNKNOWN_CHILD })
     await as($, world, 'm4')
-    await clock.advance(5 * 60_000)
+    await clock.advance(STALL_QUIET_MS + 60_000)
     expect((await stop($, [])).block).toBe(orkestraWaitText(1))
     await clock.advance(5 * 60_000)
     expect((await stop($, [])).block).toBe(orkestraWaitText(1))
@@ -1060,5 +1067,102 @@ describe('orkestra ana', () => {
     await turnBegin($)
     expect((await stop($, [])).block).toBeUndefined()
     expect(await devir($, 'otonom')).toContain('Bu sohbet orkestra modunda değil')
+  })
+})
+
+// v1.1.1 (orkestra-run1 fixes): T2 stall on liveness (O19').
+describe('orkestra ana v1.1.1', () => {
+  const MIN = 60_000
+
+  test('(T2a) run-1 tekrarı: çocuk +5 ve +10 dkda isRunning false, +2 ve +9 dkda nabız, bg 8: bekler, durdu yok', async ($, on) => {
+    const { world, clock } = setup(on)
+    const k = await chainUp($, world, 'main')
+    const id = childId(k)
+    seedChild(world, clock, k, 'local_main', 1, 'working')
+    world.running[id] = false
+    const gets = () => callsOf(world, GET).filter((c: any) => c.session_id === id).length
+    await clock.advance(2 * MIN)
+    seedChild(world, clock, k, 'local_main', 1, 'working', { beatAt: clock.now(), bg: 8 })
+    await clock.advance(3 * MIN)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    await clock.advance(4 * MIN)
+    seedChild(world, clock, k, 'local_main', 1, 'working', { beatAt: clock.now(), bg: 8 })
+    await clock.advance(1 * MIN)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    // bg 8: 51 min quiet is still under STALL_QUIET_BG_MS, every Stop waits.
+    for (let t = 0; t < 10; t += 1) {
+      await clock.advance(5 * MIN)
+      expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    }
+    expect(gets()).toBe(0)
+    expect(rec(world, 'local_main').ended).toBeUndefined()
+    expect(rec(world, 'local_main').stallCount).toBeUndefined()
+  })
+
+  test('(T2b) 31 dk eski nabız, bg 0, en az 4 dk arayla iki false kontrol: bir kez durdu', async ($, on) => {
+    const { world, clock } = setup(on)
+    const k = await chainUp($, world, 'main')
+    const id = childId(k)
+    seedChild(world, clock, k, 'local_main', 1, 'working', { beatAt: clock.now(), bg: 0 })
+    world.running[id] = false
+    await clock.advance(STALL_QUIET_MS + MIN)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    expect(rec(world, 'local_main')).toMatchObject({ stallCount: 1, stallAt: clock.now() })
+    await clock.advance(4 * MIN)
+    expect((await stop($, [])).block).toBe(orkestraEndText('durdu', 1, undefined, undefined, id))
+    expect(rec(world, 'local_main')).toMatchObject({ ended: 'durdu' })
+    expect((await stop($, [])).block).toBeUndefined()
+  })
+
+  test('(T2c) 31 dk eski nabız ama bg 3: 121 dkya kadar bekler, sonra iki kontrolle durdu', async ($, on) => {
+    const { world, clock } = setup(on)
+    const k = await chainUp($, world, 'main')
+    const id = childId(k)
+    const t0 = clock.now()
+    seedChild(world, clock, k, 'local_main', 1, 'working', { beatAt: t0, bg: 3 })
+    world.running[id] = false
+    const gets = () => callsOf(world, GET).filter((c: any) => c.session_id === id).length
+    await clock.advance(STALL_QUIET_MS + MIN)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    await clock.advance(t0 + STALL_QUIET_BG_MS - MIN - clock.now())
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    expect(gets()).toBe(0)
+    await clock.advance(2 * MIN)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    expect(gets()).toBe(1)
+    await clock.advance(4 * MIN)
+    expect((await stop($, [])).block).toBe(orkestraEndText('durdu', 1, undefined, undefined, id))
+    expect(gets()).toBe(2)
+  })
+
+  test('(T2d) isRunning true ya da stallAttan yeni bir nabız sayacı sıfırlar', async ($, on) => {
+    const { world, clock } = setup(on)
+    const k = await chainUp($, world, 'main')
+    const id = childId(k)
+    seedChild(world, clock, k, 'local_main', 1, 'working', { beatAt: clock.now(), bg: 0 })
+    world.running[id] = false
+    await clock.advance(STALL_QUIET_MS + MIN)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    expect(rec(world, 'local_main').stallCount).toBe(1)
+    // A beat after stallAt: the child lived; the count starts over and it is not quiet now.
+    await clock.advance(MIN)
+    seedChild(world, clock, k, 'local_main', 1, 'working', { beatAt: clock.now(), bg: 0 })
+    await clock.advance(4 * MIN)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    expect(rec(world, 'local_main').stallCount).toBeUndefined()
+    expect(rec(world, 'local_main').ended).toBeUndefined()
+    // Quiet again: one false check, then isRunning true resets, then one false check: still no end.
+    await clock.advance(STALL_QUIET_MS)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    expect(rec(world, 'local_main').stallCount).toBe(1)
+    await clock.advance(4 * MIN)
+    world.running[id] = true
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    expect(rec(world, 'local_main').stallCount).toBeUndefined()
+    await clock.advance(4 * MIN)
+    world.running[id] = false
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    expect(rec(world, 'local_main')).toMatchObject({ stallCount: 1 })
+    expect(rec(world, 'local_main').ended).toBeUndefined()
   })
 })

@@ -242,6 +242,10 @@ export const STARTING_STALE_MS = 120_000
 /** Stalled child (O19): checks at least this far apart, this many in a row. */
 export const STALL_GAP_MS = 240_000
 export const STALL_CYCLES = 2
+/** O19' (D2): a stall counts only after the child was quiet this long with no background work... */
+export const STALL_QUIET_MS = 30 * 60_000
+/** ...or this long with background agents, Workflows or Monitors in flight at its last Stop. */
+export const STALL_QUIET_BG_MS = 120 * 60_000
 /** A managed sub-chat's tool-result heartbeat is written at most this often (O14b). */
 export const BEAT_GAP_MS = 60_000
 
@@ -1925,10 +1929,21 @@ const orkestraDecision = async (
 
     return done({ kind: 'relay', n, text: orkestraRelayText(n + 1, childTitle(main.task, n + 1)) })
   }
-  // O19: the child not running, in STALL_CYCLES checks at least STALL_GAP_MS apart.
+  // O19': a stall counts only when the child (record absent or `working`) has
+  // been quiet STALL_QUIET_MS (STALL_QUIET_BG_MS with background work at its
+  // last Stop) and is not running, in STALL_CYCLES checks at least STALL_GAP_MS
+  // apart. Quiet is measured from the child's heartbeat (`beatAt`), else its
+  // record's `at`, else (no record) the chain's start; a beat newer than the
+  // last check resets the count. `isRunning` alone never stalls a chain.
   if (opts.isCycle === true && main.childId !== undefined && main.childId !== UNKNOWN_CHILD) {
     let stallCount = main.stallCount
-    if (now - (main.stallAt ?? 0) >= STALL_GAP_MS) {
+    const quietFrom = child?.beatAt ?? child?.at ?? main.startedAt
+    if (stallCount !== undefined && child?.beatAt !== undefined && child.beatAt > (main.stallAt ?? 0)) {
+      stallCount = undefined
+      await patchMain($, localId, { stallCount: undefined })
+    }
+    const quietNeeded = (child?.bg ?? 0) === 0 ? STALL_QUIET_MS : STALL_QUIET_BG_MS
+    if (now - quietFrom >= quietNeeded && now - (main.stallAt ?? 0) >= STALL_GAP_MS) {
       const isRunning = await childRunning($, main.childId)
       if (isRunning === false) {
         stallCount = (stallCount ?? 0) + 1

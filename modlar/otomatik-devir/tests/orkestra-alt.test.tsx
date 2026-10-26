@@ -1032,6 +1032,33 @@ describe('orkestra alt devret (T7)', () => {
     world.percent = 10
     await turnBegin($)
     expect((await bash($)).context).toEqual([managedHandoff(60, FILE_C1, true)])
+    // The chain stays held: the ready child is relayed on a machine turn, no typed message needed.
+    await clock.advance(100)
+    writeHandoff(world, clock, FILE_C1, HANDOFF_VAR)
+    expect((await stop($, [])).block).toBeUndefined()
+    await turnEnd($)
+    world.percent = 10
+    await as($, world, 'main')
+    expect(rec(world, 'local_main')).toMatchObject({ isHeld: true })
+    await machine($, 'alt sohbet bir turu bitirdi')
+    await turnBegin($)
+    expect(String((await stop($, [])).block)).toContain(`${TASK} · 2`)
+  })
+
+  test('(T7g) /devir otonom ana sohbette durdu zinciri bitti diye göstermez; bitmiş zinciri bitti: ile gösterir; kapalı zincirde devam AC_CHAIN_STOPPED', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    seedRec(world, clock, 'local_main', { ...rec(world, 'local_main'), ended: 'durdu', stallCount: 2 })
+    await as($, world, 'main')
+    const shown = await devir($, 'otonom')
+    expect(shown).toContain('duraklatıldı (alt sohbet sessiz; /devir otonom devam)')
+    expect(shown).not.toContain('bitti')
+    expect(await devir($, 'kapat')).toContain(KAPAT_CHAIN)
+    expect(await devir($, 'otonom devam')).toBe(AC_CHAIN_STOPPED)
+    expect(await devir($, 'otonom devret')).toBe(AC_CHAIN_STOPPED)
+    seedRec(world, clock, 'local_main', { ...rec(world, 'local_main'), ended: 'bitti' })
+    await as($, world, 'main')
+    expect(await devir($, 'otonom')).toContain('bitti: bitti')
   })
 
   test('(T7d) ikinci alt sohbet (n 2) eski forceN 1 ile devretmez; forceN 2 onu devreder', async ($, on) => {

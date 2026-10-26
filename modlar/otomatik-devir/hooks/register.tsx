@@ -2243,7 +2243,7 @@ const otonomDevam = async (
   const main = await readMain($, chainId)
   if (main === undefined) return NOT_ORCHESTRATED
   if (main.ended === undefined) return 'Zincir zaten sürüyor.'
-  if (main.ended !== 'durdu') return AC_CHAIN_STOPPED
+  if (main.ended !== 'durdu' || !(await readSettings($)).isEnabled) return AC_CHAIN_STOPPED
   await clearDurdu($, held, chainId)
 
   return ORKESTRA_DEVAM_TEXT
@@ -2253,7 +2253,7 @@ const otonomDevam = async (
  * T7: `/devir otonom devret`. In the main chat it writes the chain's
  * `forceN` (the current child's number): that child hands off through the
  * mod's own path at its next tool result or turn end (`isDue`). A `durdu` end
- * is cleared first; any other end is final. In a sub-chat it is `/devir simdi`.
+ * is cleared first (the chain stays held: the relay needs no typed message); any other end is final. In a sub-chat it is `/devir simdi`.
  */
 const otonomDevret = async (
   $: EngineInterface,
@@ -2269,7 +2269,12 @@ const otonomDevret = async (
   if (main.n < 1) return 'Henüz alt sohbet yok.'
   const child = await readChild($, main.childId)
   if (child !== undefined && child.status !== 'working') return `Alt sohbet ${main.n} zaten devretti.`
-  if (main.ended === 'durdu') await clearDurdu($, held, chainId)
+  if (main.ended === 'durdu') {
+    // Not clearDurdu: the chain stays held (no `isPaused`), so the main chat still relays to the next child by itself.
+    await patchMain($, chainId, { ended: undefined, stallCount: undefined, stallAt: undefined })
+    await patchConv($, held.sid, { stalledN: undefined })
+    await refreshStatus($).catch(() => undefined)
+  }
   await patchChainSettings($, chainId, { forceN: main.n })
 
   return `Alt sohbet ${main.n} devredecek (sonraki araç sonucunda ya da tur sonunda).`
@@ -2306,7 +2311,13 @@ const otonomVerb = async (
     if (main === undefined) return NOT_ORCHESTRATED
     const limit = await orkestraLimit($, chainId)
     const child = main.n >= 1 ? await readChild($, main.childId) : undefined
-    const state = main.ended !== undefined ? `bitti: ${main.ended}` : main.isHeld ? 'tutuluyor' : 'duraklatıldı'
+    const state = isFinalEnd(main.ended)
+      ? `bitti: ${main.ended}`
+      : main.ended === 'durdu'
+        ? 'duraklatıldı (alt sohbet sessiz; /devir otonom devam)'
+        : main.isHeld
+          ? 'tutuluyor'
+          : 'duraklatıldı'
 
     return `Orkestra: ana sohbet · görev "${main.title}" · alt sohbet ${main.n}/${limit} · alt durum ${child?.status ?? 'yok'} · ${state}${await esikTail($, held)}`
   }

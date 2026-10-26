@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import {
+  AC_CHAIN_DURDU,
   AC_CHAIN_OPEN,
   AC_CHAIN_STOPPED,
   chainEsikText,
@@ -19,6 +20,7 @@ import {
   ORKESTRA_SECTION_ID,
   orkestraBusyDeny,
   orkestraCapDeny,
+  ORKESTRA_DEVAM_TEXT,
   orkestraEndText,
   orkestraLimit,
   orkestraRecordFile,
@@ -1164,5 +1166,119 @@ describe('orkestra ana v1.1.1', () => {
     expect((await stop($, [])).block).toBe(orkestraWaitText(1))
     expect(rec(world, 'local_main')).toMatchObject({ stallCount: 1 })
     expect(rec(world, 'local_main').ended).toBeUndefined()
+  })
+
+  /** Chat `sid` starts a chain; its child goes quiet past STALL_QUIET_MS and two checks end it `durdu`; the turn ends. */
+  const stallUp = async ($: any, world: World, clock: Clock, sid: string) => {
+    const k = await chainUp($, world, sid)
+    const id = childId(k)
+    seedChild(world, clock, k, `local_${sid}`, 1, 'working', { beatAt: clock.now(), bg: 0 })
+    world.running[id] = false
+    await clock.advance(STALL_QUIET_MS + MIN)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    await clock.advance(4 * MIN)
+    expect((await stop($, [])).block).toBe(orkestraEndText('durdu', 1, undefined, undefined, id))
+    expect((await stop($, [])).block).toBeUndefined()
+    await turnEnd($)
+    expect(rec(world, `local_${sid}`)).toMatchObject({ ended: 'durdu', stallCount: 2 })
+    return k
+  }
+
+  test('(T4a) durdu, sonra çocuk nabzı, sonra kullanıcı mesajı: zincir sürer (resume notu, isHeld), sonraki Stop bekler', async ($, on) => {
+    const { world, clock } = setup(on)
+    const k = await stallUp($, world, clock, 'main')
+    await clock.advance(MIN)
+    seedChild(world, clock, k, 'local_main', 1, 'working', { beatAt: clock.now(), bg: 2 })
+    world.running[childId(k)] = true
+    await typed($, 'nasıl gidiyor')
+    expect(world.typed.at(-1)?.context).toContain(orkestraResumeNote(1, 'working'))
+    const main = rec(world, 'local_main')
+    expect(main).toMatchObject({ isHeld: true, pendingMessage: 'nasıl gidiyor' })
+    expect(main.ended).toBeUndefined()
+    expect(main.stallCount).toBeUndefined()
+    expect(main.stallAt).toBeUndefined()
+    await turnBegin($)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    await clock.advance(100)
+    const ui = await mountBand($)
+    expect(JSON.stringify(await ui.drawn())).not.toContain(orkestraStalledBand(1))
+    await ui.unmount()
+  })
+
+  test('(T4b) durdu + çocuk ready (T3) + kullanıcı mesajı: aktarım metni, start_session geçer, n 2', async ($, on) => {
+    const { world, clock } = setup(on)
+    const k = await stallUp($, world, clock, 'main')
+    readyChild(world, clock, k, 'local_main', 1)
+    await typed($, 'devam')
+    expect(world.typed.at(-1)?.context).toContain(orkestraResumeNote(1, 'ready'))
+    await turnBegin($)
+    expect((await stop($, [])).block).toBe(orkestraRelayText(2, `${TASK} · 2`))
+    expect((await startSession($, { prompt: 'devam' })).deny).toBeUndefined()
+    expect(rec(world, 'local_main')).toMatchObject({ n: 2, childId: childId(k + 1) })
+    expect(rec(world, 'local_main').ended).toBeUndefined()
+  })
+
+  test('(T4c) durdu ve yeni nabız yok: kullanıcı mesajı sürdürmez, son metni bir kez kalır, açış reddedilir', async ($, on) => {
+    const { world, clock } = setup(on)
+    const k = await stallUp($, world, clock, 'main')
+    const end = orkestraEndText('durdu', 1, undefined, undefined, childId(k))
+    await clock.advance(MIN)
+    await typed($, 'ne oldu')
+    expect(world.typed.at(-1)?.context ?? []).not.toContain(orkestraResumeNote(1, 'working'))
+    expect(world.typed.at(-1)?.context ?? []).not.toContain(end)
+    await turnBegin($)
+    expect((await stop($, [])).block).toBeUndefined()
+    expect((await bash($)).context ?? []).toEqual([])
+    expect((await startSession($)).deny).toBe(ORKESTRA_END_DENY)
+    expect(rec(world, 'local_main')).toMatchObject({ ended: 'durdu', n: 1 })
+  })
+
+  test('(T4d) /devir ac durdu zincirde devam\'ı gösterir; /devir otonom devam durdu\'yu kaldırır, sonraki mesaj sürdürür', async ($, on) => {
+    const { world, clock } = setup(on)
+    const k = await stallUp($, world, clock, 'main')
+    expect(await devir($, 'ac')).toBe(AC_CHAIN_DURDU)
+    expect(AC_CHAIN_DURDU).toContain('/devir otonom devam')
+    expect(await devir($, 'otonom devam')).toBe(ORKESTRA_DEVAM_TEXT)
+    expect(ORKESTRA_DEVAM_TEXT).toBe('Zincir sürüyor; devam etmek için bir mesaj yaz.')
+    const main = rec(world, 'local_main')
+    expect(main.ended).toBeUndefined()
+    expect(main.stallCount).toBeUndefined()
+    expect(main.stallAt).toBeUndefined()
+    expect(main.isHeld).toBe(false)
+    await clock.advance(100)
+    const ui = await mountBand($)
+    const drawn = JSON.stringify(await ui.drawn())
+    expect(drawn).toContain(ORKESTRA_PAUSED_BAND)
+    expect(drawn).not.toContain(orkestraStalledBand(1))
+    await ui.unmount()
+    await typed($, 'sürdür')
+    expect(world.typed.at(-1)?.context).toContain(orkestraResumeNote(1, 'working'))
+    expect(rec(world, 'local_main')).toMatchObject({ isHeld: true })
+    await turnBegin($)
+    expect((await stop($, [])).block).toBe(orkestraWaitText(1))
+    expect(await devir($, 'otonom devam')).toBe('Zincir zaten sürüyor.')
+    // In the child: it points to the main chat.
+    await as($, world, `c${k}`)
+    await typed($, 'iş')
+    expect(await devir($, 'otonom devam')).toBe('Bu bir alt sohbet; zinciri ana sohbette /devir otonom devam ile sürdür.')
+  })
+
+  test('(T4e) bitti hiç diriltilmez: yeni nabız, mesaj ve /devir otonom devam zinciri açmaz', async ($, on) => {
+    const { world, clock } = setup(on)
+    const k = await chainUp($, world, 'main')
+    seedChild(world, clock, k, 'local_main', 1, 'finished', { report: 'tamam', beatAt: clock.now() })
+    expect((await stop($, [])).block).toBe(orkestraEndText('bitti', 1, 'tamam', undefined, childId(k), 100))
+    await turnEnd($)
+    seedRec(world, clock, 'local_main', { ...rec(world, 'local_main'), stallAt: 0 })
+    await clock.advance(MIN)
+    seedChild(world, clock, k, 'local_main', 1, 'working', { beatAt: clock.now() })
+    await typed($, 'devam')
+    expect(world.typed.at(-1)?.context ?? []).not.toContain(orkestraResumeNote(1, 'working'))
+    expect(await devir($, 'otonom devam')).toBe(AC_CHAIN_STOPPED)
+    expect(await devir($, 'ac')).toBe(AC_CHAIN_STOPPED)
+    await turnBegin($)
+    expect((await stop($, [])).block).toBeUndefined()
+    expect((await startSession($)).deny).toBe(ORKESTRA_END_DENY)
+    expect(rec(world, 'local_main')).toMatchObject({ ended: 'bitti' })
   })
 })

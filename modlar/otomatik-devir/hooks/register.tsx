@@ -226,6 +226,11 @@ export const chainEsikText = (n: number): string =>
 /** `/devir ac` in a chain: it writes nothing (Decisions 20, 22). */
 export const AC_CHAIN_OPEN = 'Bu zincir açık; durdurmak için /devir kapat.'
 export const AC_CHAIN_STOPPED = 'Bu zincir durdu ve sürdürülmez; yeni zincir için ' + START_HINT + ' yaz.'
+/** `/devir ac` in a `durdu` chain (O7'): it is paused, not over. */
+export const AC_CHAIN_DURDU =
+  'Bu zincir duraklatıldı (alt sohbet sessiz); sürdürmek için ana sohbette /devir otonom devam yaz.'
+/** `/devir otonom devam` in a `durdu` main chat (O7'); a command opens no model turn. */
+export const ORKESTRA_DEVAM_TEXT = 'Zincir sürüyor; devam etmek için bir mesaj yaz.'
 
 /** The prefix trigger (`orkestra: <görev>`): an undocumented alias of `/devir-otonom`. */
 export const ORKESTRA_RE = /^\s*orkestra:\s*/i
@@ -1163,6 +1168,27 @@ const readChild = async ($: EngineInterface, childId: string | undefined): Promi
   return rec?.role === 'alt' ? rec : undefined
 }
 
+/**
+ * O7': a `durdu` chain resumes once its child shows life: a heartbeat newer
+ * than the last stall check, or a `ready`/`finished` record. Clears the end and
+ * the stall fields (record) and the stalled band (conv); returns the live main
+ * record, else `main` as it was. Every other end is final.
+ */
+const reviveIfAlive = async ($: EngineInterface, main: OrkestraAna): Promise<OrkestraAna> => {
+  if (main.ended !== 'durdu') return main
+  const child = await readChild($, main.childId)
+  const isAlive =
+    child !== undefined &&
+    ((child.beatAt ?? 0) > (main.stallAt ?? 0) || child.status === 'ready' || child.status === 'finished')
+  if (!isAlive) return main
+  const live = await patchMain($, main.localId, { ended: undefined, stallCount: undefined, stallAt: undefined })
+  await patchConv($, main.sid, { stalledN: undefined })
+  $.ui.log(`otomatik-devir: zincir sürüyor; alt sohbet ${main.n} yeniden canlı (${child.status})`, { to: 'debug' })
+  later($, () => refreshStatus($))
+
+  return live ?? main
+}
+
 /** Writes a chain's settings whole (Decision 22). */
 export const writeChainSettings = async ($: EngineInterface, mainLocalId: string, rec: OrkestraAyar): Promise<void> => {
   const home = await homeOf($)
@@ -1378,8 +1404,10 @@ const orkestraTyped = async (
   const sid = await $.session.id()
   const held = await read($, conv)
   if (held === null || held.sid !== sid || held.role !== 'ana' || held.localId === undefined) return undefined
-  const main = await readMain($, held.localId)
-  if (main === undefined) return undefined
+  const found = await readMain($, held.localId)
+  if (found === undefined) return undefined
+  // O7': a `durdu` chain whose child lives again takes the normal hold path below.
+  const main = await reviveIfAlive($, found)
   if (main.ended !== undefined) {
     // O7: a chain that ended while paused gives the next typed message its end text, once.
     if (held.isPaused !== true) return undefined
@@ -1581,8 +1609,10 @@ const orkestraStart = async (
 ): Promise<Awaited<ReturnType<ToolNext>> | undefined> => {
   const sid = await $.session.id()
   const localId = await selfLocal($)
-  const main = localId === undefined ? undefined : await readMain($, localId)
-  if (localId === undefined || main === undefined) return undefined
+  const found = localId === undefined ? undefined : await readMain($, localId)
+  if (localId === undefined || found === undefined) return undefined
+  // O7': a `durdu` chain whose child lives again is not ended.
+  const main = await reviveIfAlive($, found)
   // O21: no new sub-chat once this chain is closed (`ended` is written by O5/O6/O7).
   if (main.ended === undefined && (await readChainSettings($, localId).catch(() => undefined))?.isClosed === true) {
     return { deny: ORKESTRA_END_DENY }
@@ -1887,8 +1917,11 @@ const orkestraDecision = async (
 ): Promise<{ decision: OrkestraDecision; main: OrkestraAna } | undefined> => {
   if ((await roleOf($)) !== 'ana') return undefined
   const localId = await selfLocal($)
-  const main = localId === undefined ? undefined : await readMain($, localId)
-  if (localId === undefined || main === undefined || main.ended !== undefined) return undefined
+  const found = localId === undefined ? undefined : await readMain($, localId)
+  if (localId === undefined || found === undefined) return undefined
+  // O7': a `durdu` chain whose child lives again decides as a live one.
+  const main = await reviveIfAlive($, found)
+  if (main.ended !== undefined) return undefined
   const done = (decision: OrkestraDecision) => ({ decision, main })
   const n = main.n
   // O21: this chain closed (`/devir kapat`) or its child cancelled: the chain ends first, paused too.
@@ -2090,6 +2123,30 @@ const bandRow = async ($: EngineInterface, held: OtomatikDevirConv): Promise<str
   return held.phase === 'ready' && held.role !== 'alt' ? READY_BAND : undefined
 }
 
+/**
+ * O7': `/devir otonom devam` in the main chat clears a `durdu` end whatever the
+ * child shows; the chain then waits paused for the person's next message (a
+ * command opens no model turn). Other ends stay final.
+ */
+const otonomDevam = async (
+  $: EngineInterface,
+  held: OtomatikDevirConv,
+  role: OrkestraRole,
+  chainId: string | undefined,
+): Promise<string> => {
+  if (role === 'alt' && chainId !== undefined) return 'Bu bir alt sohbet; zinciri ana sohbette /devir otonom devam ile sürdür.'
+  if (role !== 'ana' || chainId === undefined) return NOT_ORCHESTRATED
+  const main = await readMain($, chainId)
+  if (main === undefined) return NOT_ORCHESTRATED
+  if (main.ended === undefined) return 'Zincir zaten sürüyor.'
+  if (main.ended !== 'durdu') return AC_CHAIN_STOPPED
+  await patchMain($, chainId, { ended: undefined, stallCount: undefined, stallAt: undefined, isHeld: false })
+  await patchConv($, held.sid, { stalledN: undefined, isPaused: true })
+  await refreshStatus($).catch(() => undefined)
+
+  return ORKESTRA_DEVAM_TEXT
+}
+
 /** `/devir otonom [dur | limit <n>]` (O8; the limit is the chain's, Decision 22). */
 const otonomVerb = async (
   $: EngineInterface,
@@ -2108,6 +2165,7 @@ const otonomVerb = async (
 
     return `Orkestra: sınır ${limit} alt sohbet.`
   }
+  if (sub === 'devam') return otonomDevam($, held, role, chainId)
   if (sub !== '' && sub !== 'dur') return USAGE
   if (role === 'ana' && chainId !== undefined) {
     if (sub === 'dur') {
@@ -2684,6 +2742,8 @@ export const register: Register = on => {
         const isClosed = (await readChainSettings($, chainId).catch(() => undefined))?.isClosed === true
         const main = isClosed ? undefined : await readRecord($, chainId).catch(() => undefined)
         const isEnded = main?.role === 'ana' && main.ended !== undefined
+        // O7': a `durdu` chain is paused, not over: it points to `/devir otonom devam`.
+        if (!isClosed && main?.role === 'ana' && main.ended === 'durdu') return { text: AC_CHAIN_DURDU }
 
         return { text: isClosed || isEnded ? AC_CHAIN_STOPPED : AC_CHAIN_OPEN }
       }

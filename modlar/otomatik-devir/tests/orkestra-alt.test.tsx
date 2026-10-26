@@ -806,3 +806,76 @@ describe('orkestra alt', () => {
     expect(rec(world, C1).file).toBeUndefined()
   })
 })
+
+// v1.1.1 (orkestra-run1 fixes): T1 heartbeat, T3 trip under a `durdu` parent.
+const MONITOR: Task = { id: 'm1', type: 'monitor', status: 'running', description: 'izle' }
+
+describe('orkestra alt v1.1.1', () => {
+  test('(T1a) alt sohbetin turu alt ajan sürerken bitince kayıt working kalır: beatAt saat, bg 1, last 500 karakter', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await typed($, 'iş')
+    await turnBegin($)
+    expect(rec(world, C1)).toMatchObject({ status: 'working', beatAt: clock.now() })
+    await clock.advance(5_000)
+    await stop($, [SUBAGENT, { ...WORKFLOW, status: 'completed' }])
+    const answer = 'a'.repeat(450) + 'b'.repeat(150)
+    await turnEnd($, false, answer)
+    const got = rec(world, C1)
+    expect(got).toMatchObject({ role: 'alt', status: 'working', beatAt: clock.now(), bg: 1, at: clock.now() })
+    expect(got.last).toBe(answer.slice(0, 500))
+    expect(got.report).toBeUndefined()
+  })
+
+  test('(T1b) araç sonucu nabzı 60 snde bir yazılır: 30 sn arayla tek yazım, 61 sn arayla iki', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await typed($, 'iş')
+    await turnBegin($)
+    let writes = 0
+    world.failWrite = path => {
+      if (path === recFile(C1)) writes += 1
+      return false
+    }
+    await clock.advance(61_000)
+    await bash($)
+    expect(writes).toBe(1)
+    expect(rec(world, C1).beatAt).toBe(clock.now())
+    const first = clock.now()
+    await clock.advance(30_000)
+    await bash($)
+    expect(writes).toBe(1)
+    expect(rec(world, C1).beatAt).toBe(first)
+    await clock.advance(31_000)
+    await bash($)
+    expect(writes).toBe(2)
+    expect(rec(world, C1).beatAt).toBe(clock.now())
+  })
+
+  test('(T1c) hazır kayıt: sonraki nabız status ready ve dosyayı korur; finished kayda nabız yazılmaz', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await childReady($, world, clock)
+    await turnEnd($)
+    await clock.advance(61_000)
+    await typed($, 'yeni iş')
+    await turnBegin($)
+    await bash($)
+    await turnEnd($, false, 'son')
+    expect(rec(world, C1)).toMatchObject({ status: 'ready', file: FILE_C1 })
+  })
+
+  test('(T1d) yalnızca Monitor süren arka plan işi de bg sayılır', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await childTrip($, world, clock)
+    await stop($, [MONITOR])
+    await turnEnd($, false, 'izliyor')
+    expect(rec(world, C1)).toMatchObject({ status: 'working', bg: 1, last: 'izliyor', beatAt: clock.now() })
+    await typed($, 'sürdür')
+    await turnBegin($)
+    await stop($, [])
+    await turnEnd($, false, 'bitti mi')
+    expect(rec(world, C1)).toMatchObject({ status: 'working', bg: 0, last: 'bitti mi' })
+  })
+})

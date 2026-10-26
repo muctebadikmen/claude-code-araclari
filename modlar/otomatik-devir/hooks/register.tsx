@@ -242,6 +242,8 @@ export const STARTING_STALE_MS = 120_000
 /** Stalled child (O19): checks at least this far apart, this many in a row. */
 export const STALL_GAP_MS = 240_000
 export const STALL_CYCLES = 2
+/** A managed sub-chat's tool-result heartbeat is written at most this often (O14b). */
+export const BEAT_GAP_MS = 60_000
 
 /** Where the records live (store-probe.md `BACKEND: file`: the store is stale across sessions). */
 export const RECORD_BACKEND: 'store' | 'file' = 'file'
@@ -636,6 +638,44 @@ const childBase = async ($: EngineInterface, held: OtomatikDevirConv): Promise<O
     localId: held.localId,
     status: 'working',
     at: 0,
+  }
+}
+
+// Clock ms of this engine's last heartbeat write (O14b). Reset at session.start.
+let lastBeat: number | undefined
+
+/** Background tasks of a Stop that are still running or pending, of every type (Monitor and Bash too). */
+const bgCount = (tasks: readonly { status: string }[] | undefined): number | undefined =>
+  tasks?.filter(task => task.status === 'running' || task.status === 'pending').length
+
+/**
+ * O14b: a managed sub-chat's heartbeat in its own record, so the main chat has
+ * a liveness signal besides `isRunning` (O19). Only a `working` record (never
+ * `ready`, `finished` or `cancelled`) of a role `alt` chat not yet `done`.
+ * `isThrottled` (a tool result) writes at most once per BEAT_GAP_MS. `bg` and
+ * `last` unset keep the record's own. Never throws.
+ */
+const beatChild = async (
+  $: EngineInterface,
+  patch: { bg?: number; last?: string; isThrottled?: boolean },
+): Promise<void> => {
+  try {
+    const held = await read($, conv)
+    if (held === null || held.sid !== (await $.session.id()) || held.role !== 'alt' || held.phase === 'done') return
+    const now = await $.clock.now()
+    if (patch.isThrottled === true && lastBeat !== undefined && now - lastBeat < BEAT_GAP_MS) return
+    const own = await childBase($, held)
+    if (own === undefined || own.status !== 'working') return
+    lastBeat = now
+    await writeRecord($, own.localId, {
+      ...own,
+      beatAt: now,
+      bg: patch.bg ?? own.bg,
+      last: patch.last === undefined ? own.last : patch.last.slice(0, 500),
+      at: now,
+    })
+  } catch (error) {
+    $.ui.log(`otomatik-devir: nabız yazılamadı: ${String(error)}`, { to: 'debug' })
   }
 }
 
@@ -2092,6 +2132,7 @@ export const register: Register = on => {
     // O18: no module state leaks from another session (or an older load).
     timeoutFor = undefined
     lastStopTasks = undefined
+    lastBeat = undefined
     orkestraStartBlocks = undefined
     orkestraNoted = undefined
     orkestraEndTold = undefined
@@ -2274,6 +2315,8 @@ export const register: Register = on => {
           await patchConv($, held.sid, { isPaused: undefined })
         }
       }
+      // O14b: a managed sub-chat's turn start is a heartbeat.
+      if (held.role === 'alt') await beatChild($, { bg: bgCount(lastStopTasks?.tasks) })
     }
 
     return next(e)
@@ -2316,6 +2359,11 @@ export const register: Register = on => {
           at: await $.clock.now(),
         })
       }
+    }
+    // O14b: a turn end that did not finish the sub-chat is a heartbeat (a `finished` record is left alone).
+    if (held.role === 'alt' || child !== null) {
+      const stopTasks = lastStopTasks?.turnId === e.turnId ? lastStopTasks.tasks : undefined
+      await beatChild($, { bg: bgCount(stopTasks), last: e.answer })
     }
     if (held.phase === 'handoff_running') {
       if (e.isAborted) $.ui.log('otomatik-devir: tur durduruldu; devir sürüyor', { to: 'debug' })
@@ -2371,6 +2419,8 @@ export const register: Register = on => {
     }
     const result = await next(e)
     if (result.deny !== undefined) return result
+    // O14b: a managed sub-chat's tool result is a heartbeat (at most one write per BEAT_GAP_MS).
+    await beatChild($, { isThrottled: true })
     // O6: the main chat's next step rides on this result.
     const step = await orkestraNote($)
     if (step !== undefined) return { ...result, context: [...(result.context ?? []), step] } as typeof result

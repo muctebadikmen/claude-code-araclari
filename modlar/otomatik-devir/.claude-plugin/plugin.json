@@ -1,6 +1,6 @@
 {
   "name": "otomatik-devir",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Orkestra modu: /otomatik-devir:devir-otonom <görev> yazılan sohbet ana sohbet olur; iş, eşikte devir dosyası yazan iç içe alt sohbetlere tıklamasız ve sırayla bölünür, zincir bitince ana sohbet bir özet yazar.",
   "author": {
     "name": "Mustafa Dikmen",

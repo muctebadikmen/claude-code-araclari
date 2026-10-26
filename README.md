@@ -80,7 +80,7 @@ Sonra Claude Code'u yeniden başlatın.
 
 ### otomatik-devir
 
-Sürüm 1.1.0. Otomatik devir artık yalnızca orkestra alt sohbetlerinde çalışır. Normal bir sohbet hiç devredilmez ve `Devir:` durum satırı göstermez; orada `/devir` yazarsanız tek satırla burada devir olmadığını söyler. Alt sohbet eşikte devir dosyasını yazar, sıradaki alt sohbeti ana sohbet açar. Devir tıklamasızdır: tek bir kurulum yolu, seçilecek bir mod yok.
+Sürüm 1.1.1. Otomatik devir artık yalnızca orkestra alt sohbetlerinde çalışır. Normal bir sohbet hiç devredilmez ve `Devir:` durum satırı göstermez; orada `/devir` yazarsanız tek satırla burada devir olmadığını söyler. Alt sohbet eşikte devir dosyasını yazar, sıradaki alt sohbeti ana sohbet açar. Devir tıklamasızdır: tek bir kurulum yolu, seçilecek bir mod yok.
 
 **Devir sırasında alt ajanları bekleyen tur sonu koruması.** Alt sohbette eşik aşılıp devir başladıktan sonra Claude, alt ajanlar ve Workflow'lar çalışırken turu bitirmez; her seferinde en fazla 5 dakikalık beklemelerle bekler ve sonra turu bitirmeyi yeniden dener. Devir yokken ve "Devir hazır" durumunda (dosya yazılmış) çalışan alt ajanlar ve Workflow'lar turun bitmesini engellemez. Arka plan Bash, Monitor ve geliştirme sunucuları hiç beklenmez. Esc bu beklemeyi her zaman durdurur.
 

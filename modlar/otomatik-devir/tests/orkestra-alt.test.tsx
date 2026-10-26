@@ -878,4 +878,52 @@ describe('orkestra alt v1.1.1', () => {
     await turnEnd($, false, 'bitti mi')
     expect(rec(world, C1)).toMatchObject({ status: 'working', bg: 0, last: 'bitti mi' })
   })
+  test('(T3a) ana durdu iken eşikteki alt sohbet yine devreder: araç sonucunda managedHandoff', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    seedRec(world, clock, 'local_main', { ...rec(world, 'local_main'), ended: 'durdu', stallCount: 2 })
+    const got = await childTrip($, world, clock, 70)
+    expect(got.context).toEqual([managedHandoff(60, FILE_C1, true)])
+    expect(await phase($)).toContain('aşama: handoff_running')
+  })
+
+  for (const ended of ['bitti', 'kapatildi']) {
+    test(`(T3b) ana ${ended} iken eşik devretmez (değişmedi)`, async ($, on) => {
+      const { world, clock } = setup(on)
+      await chainToChild($, world)
+      await typed($, 'iş')
+      seedRec(world, clock, 'local_main', { ...rec(world, 'local_main'), ended })
+      const got = await childTrip($, world, clock, 95)
+      expect(got.context ?? []).toEqual([])
+      expect(await phase($)).toContain('aşama: idle')
+    })
+  }
+
+  test('(T3c) durdu ananın hazır alt sohbeti tüketilmez: ready kalır, dosyası durur', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await childReady($, world, clock)
+    await turnEnd($)
+    seedRec(world, clock, 'local_main', { ...rec(world, 'local_main'), ended: 'durdu' })
+    await as($, world, 'c1')
+    await clock.advance(100)
+    expect(await phase($)).toContain('aşama: ready')
+    expect(rec(world, C1)).toMatchObject({ status: 'ready', file: FILE_C1 })
+    expect((await agentCall($)).deny).toBe(DRAIN_DENY)
+  })
+
+  test('(T3d) durdu zincirin alt sohbeti yeniden yüklenince (kendi kaydı yok) alt rolünde kalır', async ($, on) => {
+    const { world, clock } = setup(on)
+    await chainToChild($, world)
+    await typed($, 'iş')
+    seedRec(world, clock, 'local_main', { ...rec(world, 'local_main'), ended: 'durdu' })
+    delete world.files[recFile(C1)]
+    delete world.store['kimlik:c1']
+    await as($, world, 'main')
+    await as($, world, 'c1')
+    await typed($, 'yeniden')
+    await clock.advance(100)
+    expect(await devir($, 'otonom')).toBe('Orkestra: alt sohbet 1/100 (ana: local_main) · durum working')
+    expect(rec(world, C1)).toMatchObject({ role: 'alt', parent: 'local_main', status: 'working' })
+  })
 })

@@ -279,6 +279,9 @@ export const orkestraRelayText = (n: number, title: string): string =>
 /** Why a chain ended (types/index.d.ts `OrkestraEnd`). */
 type EndKind = NonNullable<OrkestraAna['ended']>
 
+/** An end that is final: set and not `durdu` (O3', O19': a stalled chain may revive). */
+const isFinalEnd = (ended: OrkestraAna['ended']): boolean => ended !== undefined && ended !== 'durdu'
+
 /** The chain is over (O5/O6 `end`, O19 `durdu`): the main chat summarises and opens nothing. */
 export const orkestraEndText = (
   kind: EndKind,
@@ -686,7 +689,8 @@ const beatChild = async (
 const consumeChild = async ($: EngineInterface, held: OtomatikDevirConv): Promise<OtomatikDevirConv> => {
   if (held.parentId === undefined) return held
   const parent = await readRecord($, held.parentId).catch(() => undefined)
-  if (parent?.role !== 'ana' || !(parent.n > (held.childN ?? 0) || parent.ended !== undefined)) return held
+  // O15': a `durdu` parent may revive (O19'): its ready child waits, unconsumed.
+  if (parent?.role !== 'ana' || !(parent.n > (held.childN ?? 0) || isFinalEnd(parent.ended))) return held
   // O21 over O15 also when the chain settings were not readable now: a main
   // chat that ended `kapatildi` was closed, so its ready child is cancelled.
   if (parent.ended === 'kapatildi') return cancelHandoff($, held.sid, true)
@@ -882,7 +886,8 @@ const isDue = async ($: EngineInterface, held: OtomatikDevirConv): Promise<{ thr
   if ((await roleOf($)) !== 'alt') return undefined
   const chainId = await chainIdOf($)
   const parent = chainId === undefined ? undefined : await readRecord($, chainId).catch(() => undefined)
-  if (parent?.role !== 'ana' || parent.ended !== undefined) return undefined
+  // O3': a `durdu` chain may revive (O19'), so its sub-chat still trips.
+  if (parent?.role !== 'ana' || isFinalEnd(parent.ended)) return undefined
   const settings = await readSettings($)
   if (!settings.isEnabled) return undefined
   if ((await handedOf($, held.sid)) !== undefined) return undefined
@@ -1253,7 +1258,7 @@ const resolveRole = async ($: EngineInterface, sid: string): Promise<OrkestraRol
   const parent = got.kind === 'ok' && got.rec.role === 'ana' ? got.rec : undefined
   if (
     parent === undefined ||
-    parent.ended !== undefined ||
+    isFinalEnd(parent.ended) ||
     !(parent.childId === self.id || parent.childId === UNKNOWN_CHILD || parent.starting === true)
   ) {
     await patchConv($, sid, { role: 'yok' })

@@ -468,6 +468,20 @@ const contextPercent = async ($: EngineInterface): Promise<number | undefined> =
   return undefined
 }
 
+/** The context window in tokens, or undefined while unknown. */
+const contextWindow = async ($: EngineInterface): Promise<number | undefined> => {
+  const { window } = (await $.session.usage()).context
+
+  return typeof window === 'number' && window > 0 ? window : undefined
+}
+
+/** D1: what a threshold percent means in tokens (`≈ 600k` on a 1M window); empty when unknown or under 1k. */
+const tokenEquivalent = (window: number | undefined, percent: number): string => {
+  const k = window === undefined ? 0 : Math.round((window * percent) / 100 / 1000)
+
+  return k > 0 ? ` ≈ ${k}k` : ''
+}
+
 const isDrainPhase = (phase: OtomatikDevirPhase): boolean => phase === 'handoff_running' || phase === 'ready'
 
 /** This chat's part in a chain, for the status line (O9). */
@@ -491,9 +505,10 @@ const statusText = (
   held: OtomatikDevirConv | null,
   running: number,
   orkestra?: OrkestraStatus,
+  window?: number,
 ): string => {
   if (orkestra?.role === 'ana') return mainStatusText(orkestra)
-  const text = v1StatusText(settings, percent, held, running)
+  const text = v1StatusText(settings, percent, held, running, window)
 
   return orkestra?.role === 'alt' ? `Orkestra alt sohbet ${orkestra.n} · ${text}` : text
 }
@@ -503,12 +518,15 @@ const v1StatusText = (
   percent: number | undefined,
   held: OtomatikDevirConv | null,
   running: number,
+  window?: number,
 ): string => {
   if (!settings.isEnabled) return 'Devir: kapalı'
   if (held?.phase === 'ready') return 'Devir hazır'
   if (held?.phase === 'handoff_running' && running > 0) return `Devir: ${running} alt ajan bitiyor`
 
-  return `Devir: %${percent ?? 0} / eşik %${thresholdOf(settings, held)}${
+  const threshold = thresholdOf(settings, held)
+
+  return `Devir: %${percent ?? 0} / eşik %${threshold}${tokenEquivalent(window, threshold)}${
     held?.testThreshold !== undefined ? ' (bu sohbet)' : ''
   }`
 }
@@ -535,7 +553,9 @@ const refreshStatus = async ($: EngineInterface, percent?: number): Promise<void
   const settings = await readSettings($)
   const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
   const orkestra = await orkestraStatusOf($, held)
-  $.ui.status(statusText(settings, percent ?? (await contextPercent($)), held, running, orkestra))
+  $.ui.status(
+    statusText(settings, percent ?? (await contextPercent($)), held, running, orkestra, await contextWindow($)),
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -2054,6 +2074,14 @@ const bandRow = async ($: EngineInterface, held: OtomatikDevirConv): Promise<str
   return held.phase === 'ready' && held.role !== 'alt' ? READY_BAND : undefined
 }
 
+/** D1: ` · eşik %60 ≈ 600k` for `/devir otonom`; empty while the window is unknown. */
+const esikTail = async ($: EngineInterface, held: OtomatikDevirConv): Promise<string> => {
+  const threshold = thresholdOf(await readSettings($), held)
+  const equivalent = tokenEquivalent(await contextWindow($), threshold)
+
+  return equivalent === '' ? '' : ` · eşik %${threshold}${equivalent}`
+}
+
 /** `/devir otonom [dur | limit <n>]` (O8; the limit is the chain's, Decision 22). */
 const otonomVerb = async (
   $: EngineInterface,
@@ -2085,7 +2113,7 @@ const otonomVerb = async (
     const child = main.n >= 1 ? await readChild($, main.childId) : undefined
     const state = main.ended !== undefined ? `bitti: ${main.ended}` : main.isHeld ? 'tutuluyor' : 'duraklatıldı'
 
-    return `Orkestra: ana sohbet · görev "${main.title}" · alt sohbet ${main.n}/${limit} · alt durum ${child?.status ?? 'yok'} · ${state}`
+    return `Orkestra: ana sohbet · görev "${main.title}" · alt sohbet ${main.n}/${limit} · alt durum ${child?.status ?? 'yok'} · ${state}${await esikTail($, held)}`
   }
   if (role === 'alt' && chainId !== undefined) {
     if (sub === 'dur') return 'Bu bir alt sohbet; zinciri ana sohbette /devir otonom dur ile durdur.'
@@ -2095,7 +2123,7 @@ const otonomVerb = async (
     const n = own?.role === 'alt' ? own.n : (held.childN ?? 1)
     const status = own?.role === 'alt' ? own.status : 'working'
 
-    return `Orkestra: alt sohbet ${n}/${limit} (ana: ${chainId}) · durum ${status}`
+    return `Orkestra: alt sohbet ${n}/${limit} (ana: ${chainId}) · durum ${status}${await esikTail($, held)}`
   }
 
   return NOT_ORCHESTRATED
@@ -2558,7 +2586,9 @@ export const register: Register = on => {
 
         const orkestra = await orkestraStatusOf($, held)
 
-        return { text: `${statusText(settings, percent, held, running, orkestra)} · aşama: ${held.phase}` }
+        const window = await contextWindow($)
+
+        return { text: `${statusText(settings, percent, held, running, orkestra, window)} · aşama: ${held.phase}` }
       }
       case 'esik': {
         if (isNormal) return { text: NORMAL_INFO }

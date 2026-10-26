@@ -253,7 +253,9 @@ export const orkestraRecordFile = (home: string, localId: string): string => `${
 
 /** The sub-chat title: the task's first line, whitespace collapsed, cut to 40 chars, + ` · n`. */
 export const childTitle = (task: string, n: number): string => {
-  const head = (task.trim().split(/\r?\n/)[0] ?? '').replace(/\s+/g, ' ').slice(0, 40).trim()
+  // Lines that are empty or only an XML-like tag (a paste wrapper) are not a title.
+  const first = task.split(/\r?\n/).find(line => line.trim() !== '' && !/^\s*<\/?[A-Za-z][^>]*>\s*$/.test(line))
+  const head = (first ?? '').replace(/\s+/g, ' ').slice(0, 40).trim()
 
   return `${head === '' ? 'Orkestra' : head} · ${n}`
 }
@@ -1290,8 +1292,27 @@ const noteTyper = (e: PromptSubmitInput, isPerson: boolean): void => {
   }
 }
 
+/** The app delivers a pasted task inside `<pasted_content …>…</pasted_content …>`; the task is what is inside. */
+export const unwrapPaste = (text: string): string => {
+  let out = text.trim()
+  for (;;) {
+    const next = out
+      .replace(/^<pasted_content[^>]*>[ \t]*\r?\n?/, '')
+      .replace(/\r?\n?[ \t]*<\/pasted_content[^>]*>$/, '')
+      .trim()
+    if (next === out) return out
+    out = next
+  }
+}
+
 /** The start trigger (O1, Decision 17): `/devir-otonom` (cmd) or `orkestra:` (pfx), with its task. */
 const otonomStart = (e: PromptSubmitInput): { entry: 'cmd' | 'pfx'; task: string } | undefined => {
+  const raw = rawOtonomStart(e)
+
+  return raw === undefined ? undefined : { ...raw, task: unwrapPaste(raw.task) }
+}
+
+const rawOtonomStart = (e: PromptSubmitInput): { entry: 'cmd' | 'pfx'; task: string } | undefined => {
   if (e.command !== undefined) {
     return OTONOM_COMMANDS.includes(e.command.name) ? { entry: 'cmd', task: e.command.args.trim() } : undefined
   }

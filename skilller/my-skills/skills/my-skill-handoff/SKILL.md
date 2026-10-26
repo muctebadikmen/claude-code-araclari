@@ -9,7 +9,7 @@ A fresh chat resumes exactly here without re-asking anything.
 
 REQUIRED SUB-SKILL: my-skill-orchestrate
 
-Orchestrate's long-chat handoff invokes this at a phase boundary when context is heavy. No 🛑, no questions: run start to finish, ending with the resume prompt. STATE.md is a claim; git is evidence.
+Used when the user asks for a new chat; long chats otherwise rely on auto-compaction. No 🛑, no questions: run start to finish, ending with the resume prompt. STATE.md is a claim; git is evidence.
 
 ## Steps
 
@@ -38,18 +38,3 @@ Verification status: <last command run and its result, or "not run">
 ```
 Continue the work in this repo. First read .workflow/HANDOFF.md and .workflow/STATE.md. Then invoke the `<skill>` skill and resume from <phase or task id>. The decisions listed there are final; do not re-ask them. Do not redo tasks marked done. Follow the my-skill-orchestrate skill. <If skill is my-skill-execute: Run non-stop.>
 ```
-
-## Auto mode (otomatik-devir)
-
-Trigger: args start with `auto <file>`. This replaces steps 1-5. The HANDOFF template still applies; the resume prompt is the one below, not the one above.
-
-- No sub-agent, no question, no orchestrate dispatch. If the mod denies a tool call, continue without it.
-- Reconcile yourself with read-only `git status --short`, `git log -10 --oneline`, `git worktree list` (skip outside git).
-- If `.workflow/STATE.md` exists, update only its In progress/Remaining lines. No commit, no push.
-- Write `<file>` (create directories), in this order:
-  1. If the mod asks for a `Kalan: yok` / `Kalan: var` line, put it alone above everything else (the mod's placement wins). Then `# HANDOFF <ISO datetime> · <handoff id if the mod gave one>`.
-  2. The HANDOFF template fields (Active skill … Verification status).
-  3. `Yeniden çalıştır:` — each stopped agent: id, description, what to rerun. Omit if none.
-  4. `Kullanıcının son mesajı:` — only if the mod gave one.
-  5. Last, `## Resume prompt` as plain text, filled: "Continue the work in this repo. Read only <file>; it is the whole handoff. Then invoke the `<skill>` skill and resume from <phase or task id>. The decisions listed there are final; do not re-ask them. Do not redo tasks marked done. Follow the my-skill-orchestrate skill. <If skill is my-skill-execute: Run non-stop.>" Name no other handoff or state file in it.
-- Reply with one line `Devir dosyası yazıldı: <file>`, then follow the mod's next instruction (start_session or end the turn).

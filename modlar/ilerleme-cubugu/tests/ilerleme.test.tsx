@@ -4,11 +4,11 @@ import type { TestBody } from 'claude-code/testing'
 type TestEngine = Parameters<TestBody>[0]
 type TestOn = Parameters<TestBody>[1]
 
-// a prompt as the engine raises it: typed in the composer, or a plugin's (otomatik-devir's) own
+// a prompt as the engine raises it: typed in the composer, or a plugin's own
 const prompt = (text: string, by: 'composer' | 'plugin' = 'composer') => ({
   text,
   wait: false,
-  origin: by === 'composer' ? { kind: 'composer' as const } : { kind: 'plugin' as const, name: 'otomatik-devir', asUser: true as const },
+  origin: by === 'composer' ? { kind: 'composer' as const } : { kind: 'plugin' as const, name: 'handoff-plugin', asUser: true as const },
 })
 
 const PLUGIN = 'ilerleme-cubugu'
@@ -562,7 +562,7 @@ test('/clear plan çubuğunu düşürür; ardından devir prompt\'u geri getirir
   await $.prompt.submit(prompt(HANDOFF))
   expect(await toggleText($)).toBe(KURAN_LINE)
 
-  // otomatik-devir's chain: /clear (new session id) → prompt.submit of the handoff text
+  // a plugin's chain: /clear (new session id) → prompt.submit of the handoff text
   session.id = 's2'
   await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as never)
   expect(await toggleText($)).toBeUndefined()

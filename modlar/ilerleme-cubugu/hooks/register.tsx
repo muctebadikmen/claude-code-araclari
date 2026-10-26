@@ -364,7 +364,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // A /clear (e.g. otomatik-devir's switch) or a resume goes on in this process as
+  // A /clear or a resume goes on in this process as
   // another conversation, with no session.start: nothing of the old one carries over.
   on('session.end', async ($, e, next) => {
     seen = ''
@@ -377,7 +377,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // AbovePrompt is one band shared with otomatik-devir and blast-radius (its narrow-
+  // AbovePrompt is one band shared with other plugins such as blast-radius (its narrow-
   // terminal fallback). Nothing to show: pass with next(e) untouched. Otherwise compose,
   // never replace: whatever the plugins beneath drew comes FIRST (a handoff question, a
   // held command), then this mod's rows, so an opened step list can never push another

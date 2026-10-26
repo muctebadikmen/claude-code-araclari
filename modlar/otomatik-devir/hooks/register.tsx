@@ -356,9 +356,10 @@ const finish = async ($: EngineInterface, sid: string, text: string): Promise<vo
     const file = await fileOf($, sid, chat)
     const before = await contextPercent($).catch(() => undefined)
     pending = { sid, text, isUsed: false }
-    let compacted: Awaited<ReturnType<EngineInterface['session']['compact']>>
+    // `/compact` run as if typed: `$.session.compact` is refused in the desktop app's
+    // SDK sessions ("not available in a headless (-p / SDK) session"); the command works there.
     try {
-      compacted = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS })
+      await $.command.run({ command: 'compact', args: COMPACT_INSTRUCTIONS })
     } catch (error) {
       pending = undefined
       debug($, error)
@@ -372,10 +373,6 @@ const finish = async ($: EngineInterface, sid: string, text: string): Promise<vo
     const handed = pending
     pending = undefined
     const isUsed = handed?.isUsed === true
-    if (compacted.skip !== undefined) {
-      debug($, `compaction skipped: ${compacted.skip}`)
-      return giveUp($, sid)
-    }
     // `/devir kapat` during the compaction wins: nothing more.
     const now = await load($, sid)
     if (epoch !== started || now?.isOn !== true || now.phase !== 'winding') return

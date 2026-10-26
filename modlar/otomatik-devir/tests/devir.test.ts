@@ -94,7 +94,17 @@ const setup = (on: any) => {
     world.commands.push(e)
     return { value: { command: e.name } }
   })
-  on('command.run', () => ({}))
+  on('command.run', async (_: any, e: any) => {
+    if (e.command !== 'compact') return {}
+    if (world.compactMode === 'reject') {
+      if (world.onCompact !== undefined) await world.onCompact()
+      throw new Error('a turn is running')
+    }
+    world.compacts.push({ instructions: e.args })
+    world.order.push('compact')
+    if (world.onCompact !== undefined) await world.onCompact()
+    return { text: '' }
+  })
   on('agent.list', () => ({ value: world.agents }))
   on('tool.call', () => ({ result: {}, text: 'ok' }))
   on('prompt.submit', (_: any, e: any) => {
@@ -561,7 +571,7 @@ describe('otomatik-devir v2', () => {
     expect(world.order).toEqual(['compact', 'submit'])
   })
 
-  test('sıkıştırma reddedilirse sınırlı dener, sonra vazgeçer; atlanırsa göndermez', async ($, on) => {
+  test('sıkıştırma reddedilirse sınırlı dener, sonra vazgeçer', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
     await windDownMidTurn($, world)
@@ -574,15 +584,6 @@ describe('otomatik-devir v2', () => {
     expect(world.toasts).toContain(TOAST_GAVE_UP)
     expect(chat(world).phase).toBe('idle')
     expect(continuations(world)).toEqual([])
-
-    world.compactMode = 'skip'
-    await devir($, 'simdi')
-    await bash($)
-    writeFile(world, clock)
-    await turnEnd($, clock)
-    expect(world.compacts).toHaveLength(1)
-    expect(continuations(world)).toEqual([])
-    expect(chat(world).phase).toBe('idle')
   })
 
   test('ayarlar sohbete aittir ve yeniden başlatmada (sıkıştırma, yeniden yükleme) kalır', async ($, on) => {

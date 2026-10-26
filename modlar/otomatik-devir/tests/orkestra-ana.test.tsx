@@ -77,6 +77,7 @@ const setup = (on: any, store: Record<string, unknown> = { esik: 40 }) => {
     // start_session's count over all chains.
     k: 0,
     percent: 10 as number | undefined,
+    window: 100,
     store: {} as Record<string, unknown>,
     typed: [] as { text: string; context: readonly string[]; command?: unknown }[],
     toasts: [] as string[],
@@ -113,7 +114,7 @@ const setup = (on: any, store: Record<string, unknown> = { esik: 40 }) => {
   on('session.root', () => ({ value: '/proj' }))
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.usage', () => ({
-    value: { startedAt: 0, context: { window: 100, percent: world.percent }, rateLimits: [] },
+    value: { startedAt: 0, context: { window: world.window, percent: world.percent }, rateLimits: [] },
   }))
   on('session.measure', ($: any, e: any) => ({ changed: e.changed }))
   on('session.messages', () => ({ value: [] }))
@@ -1060,5 +1061,47 @@ describe('orkestra ana', () => {
     await turnBegin($)
     expect((await stop($, [])).block).toBeUndefined()
     expect(await devir($, 'otonom')).toContain('Bu sohbet orkestra modunda değil')
+  })
+
+  test('(B-T5) yapıştırma sarmalayıcısı görevden, başlıktan, alt sohbet prompt\'undan ve bölümden ayıklanır', async ($, on) => {
+    const { world } = setup(on)
+    const wrapped = '<pasted_content id="3d51">\nContinue the work in this repo. First read the handoff.\nSecond line.\n</pasted_content id="3d51">'
+    chat(world, 'main')
+    await as($, world, 'main')
+    await go($, wrapped)
+    await turnBegin($)
+    expect((await startSession($, { prompt: 'Adım listesini uygula' })).deny).toBeUndefined()
+    const main = rec(world, 'local_main')
+    expect(main.task.startsWith('Continue the work')).toBe(true)
+    expect(main.task).not.toContain('pasted_content')
+    expect(main.title).toBe('Continue the work in this repo. First re')
+    const [sent] = callsOf(world, START)
+    expect(sent.title).toBe('Continue the work in this repo. First re · 1')
+    expect(sent.prompt).not.toContain('pasted_content')
+    expect(sent.prompt).toContain('## Kullanıcının asıl isteği\nContinue the work')
+  })
+
+  test('(B-T5b) yalnızca etiket satırı olan görev ilk gerçek satırı başlık yapar; düz görev değişmez', async ($, on) => {
+    expect(childTitle('<pasted_content id="1">\n\nGerçek satır\n</pasted_content id="1">', 2)).toBe('Gerçek satır · 2')
+    expect(childTitle('<a>\n</a>\nSon', 1)).toBe('Son · 1')
+    expect(childTitle('<pasted_content id="1">', 1)).toBe('Orkestra · 1')
+    expect(childTitle(TASK, 1)).toBe(`${TASK} · 1`)
+    const { world } = setup(on)
+    chat(world, 'm2')
+    await as($, world, 'm2')
+    await typed($, `orkestra: <pasted_content>\n${TASK}\n</pasted_content>`)
+    expect(rec(world, 'local_m2').task).toBe(TASK)
+    chat(world, 'm3')
+    await as($, world, 'm3')
+    await go($, TASK)
+    expect(rec(world, 'local_m3').task).toBe(TASK)
+  })
+
+  test('(B-T8) /devir otonom ana sohbette zincir eşiğinin token karşılığını gösterir (1M, %60 → ≈ 600k)', async ($, on) => {
+    const { world } = setup(on)
+    world.window = 1_000_000
+    await chainUp($, world, 'main')
+    expect(await devir($, 'esik 60')).toBe(chainEsikText(60))
+    expect(await devir($, 'otonom')).toContain(' · eşik %60 ≈ 600k')
   })
 })

@@ -126,6 +126,7 @@ const setup = (
   const world = {
     sid: 's1',
     percent: 10 as number | undefined,
+    window: 100,
     store: {} as Record<string, unknown>,
     typed: [] as { text: string; context: readonly string[] }[],
     toasts: [] as string[],
@@ -178,7 +179,7 @@ const setup = (
   on('session.root', () => ({ value: '/proj' }))
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.usage', () => ({
-    value: { startedAt: 0, context: { window: 100, percent: world.percent }, rateLimits: [] },
+    value: { startedAt: 0, context: { window: world.window, percent: world.percent }, rateLimits: [] },
   }))
   on('session.measure', ($: any, e: any) => ({ changed: e.changed }))
   on('session.messages', () => ({ value: [] }))
@@ -1012,6 +1013,19 @@ describe('T8 review', () => {
     expect(await phase($)).toContain('Devir: 1 alt ajan bitiyor')
     world.agents = []
     expect(await phase($)).toContain('Devir: %50 / eşik %40')
+  })
+
+  test('(B-T8) durum satırı ve /devir eşiğin token karşılığını gösterir: 1M pencere, %60 → ≈ 600k; pencere bilinmiyorsa yok', async ($, on) => {
+    const { world } = setup(on, { esik: 60 })
+    world.window = 1_000_000
+    world.percent = 31
+    await start($)
+    expect(await phase($)).toContain('Devir: %31 / eşik %60 ≈ 600k · aşama: idle')
+    expect(world.statuses.at(-1)).toContain('Devir: %31 / eşik %60 ≈ 600k')
+    expect(await devir($, 'dene 5')).toBeDefined()
+    expect(await phase($)).toContain('eşik %5 ≈ 50k (bu sohbet)')
+    world.window = 100
+    expect(await phase($)).toContain('Devir: %31 / eşik %5 (bu sohbet)')
   })
 
   test('(R8, S4/S10) ready iken drain sürer; hazır bandı yönetilen alt sohbette hiç çizilmez', async ($, on) => {

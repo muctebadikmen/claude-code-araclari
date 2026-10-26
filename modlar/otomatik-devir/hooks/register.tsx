@@ -253,7 +253,9 @@ export const orkestraRecordFile = (home: string, localId: string): string => `${
 
 /** The sub-chat title: the task's first line, whitespace collapsed, cut to 40 chars, + ` · n`. */
 export const childTitle = (task: string, n: number): string => {
-  const head = (task.trim().split(/\r?\n/)[0] ?? '').replace(/\s+/g, ' ').slice(0, 40).trim()
+  // Lines that are empty or only an XML-like tag (a paste wrapper) are not a title.
+  const first = task.split(/\r?\n/).find(line => line.trim() !== '' && !/^\s*<\/?[A-Za-z][^>]*>\s*$/.test(line))
+  const head = (first ?? '').replace(/\s+/g, ' ').slice(0, 40).trim()
 
   return `${head === '' ? 'Orkestra' : head} · ${n}`
 }
@@ -320,6 +322,9 @@ export const orkestraResumeNote = (n: number, state: string): string =>
 /** Appended to every child's prompt (O4). */
 export const managedChildNote = (n: number, limit: number): string =>
   `\n\n## otomatik-devir\nBu sohbet otonom bir zincirin yönetilen alt sohbeti (${n}/${limit}). Kullanıcıya soru sorma, onay bekleme: kararları kendin ver ve gerekçesini yaz. Yeni sohbet açma, kendiliğinden devir yapma: bağlam eşiğe ulaşınca mod talimat verir. Çok adımlı işi my-skill-orchestrate becerisiyle alt ajanlara dağıt; model seçimi o becerideki yönlendirmeye göre (varsayılan sonnet). İş bitince sonucu kısaca raporla.`
+
+/** The managed note inside a sub-chat's first prompt (`managedChildNote`). */
+const MANAGED_FIRST_PROMPT = /## otomatik-devir\nBu sohbet otonom bir zincirin yönetilen alt sohbeti \(\d+\/\d+\)/
 
 /** A managed sub-chat's handoff (O12): the file only, the main chat starts the next one. */
 export const managedHandoff = (threshold: number, file: string, hasSkill = true): string =>
@@ -463,6 +468,20 @@ const contextPercent = async ($: EngineInterface): Promise<number | undefined> =
   return undefined
 }
 
+/** The context window in tokens, or undefined while unknown. */
+const contextWindow = async ($: EngineInterface): Promise<number | undefined> => {
+  const { window } = (await $.session.usage()).context
+
+  return typeof window === 'number' && window > 0 ? window : undefined
+}
+
+/** D1: what a threshold percent means in tokens (`≈ 600k` on a 1M window); empty when unknown or under 1k. */
+const tokenEquivalent = (window: number | undefined, percent: number): string => {
+  const k = window === undefined ? 0 : Math.round((window * percent) / 100 / 1000)
+
+  return k > 0 ? ` ≈ ${k}k` : ''
+}
+
 const isDrainPhase = (phase: OtomatikDevirPhase): boolean => phase === 'handoff_running' || phase === 'ready'
 
 /** This chat's part in a chain, for the status line (O9). */
@@ -486,9 +505,10 @@ const statusText = (
   held: OtomatikDevirConv | null,
   running: number,
   orkestra?: OrkestraStatus,
+  window?: number,
 ): string => {
   if (orkestra?.role === 'ana') return mainStatusText(orkestra)
-  const text = v1StatusText(settings, percent, held, running)
+  const text = v1StatusText(settings, percent, held, running, window)
 
   return orkestra?.role === 'alt' ? `Orkestra alt sohbet ${orkestra.n} · ${text}` : text
 }
@@ -498,12 +518,15 @@ const v1StatusText = (
   percent: number | undefined,
   held: OtomatikDevirConv | null,
   running: number,
+  window?: number,
 ): string => {
   if (!settings.isEnabled) return 'Devir: kapalı'
   if (held?.phase === 'ready') return 'Devir hazır'
   if (held?.phase === 'handoff_running' && running > 0) return `Devir: ${running} alt ajan bitiyor`
 
-  return `Devir: %${percent ?? 0} / eşik %${thresholdOf(settings, held)}${
+  const threshold = thresholdOf(settings, held)
+
+  return `Devir: %${percent ?? 0} / eşik %${threshold}${tokenEquivalent(window, threshold)}${
     held?.testThreshold !== undefined ? ' (bu sohbet)' : ''
   }`
 }
@@ -530,7 +553,9 @@ const refreshStatus = async ($: EngineInterface, percent?: number): Promise<void
   const settings = await readSettings($)
   const running = held.phase === 'handoff_running' ? (await activeAgents($)).length : 0
   const orkestra = await orkestraStatusOf($, held)
-  $.ui.status(statusText(settings, percent ?? (await contextPercent($)), held, running, orkestra))
+  $.ui.status(
+    statusText(settings, percent ?? (await contextPercent($)), held, running, orkestra, await contextWindow($)),
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,8 +1315,27 @@ const noteTyper = (e: PromptSubmitInput, isPerson: boolean): void => {
   }
 }
 
+/** The app delivers a pasted task inside `<pasted_content …>…</pasted_content …>`; the task is what is inside. */
+export const unwrapPaste = (text: string): string => {
+  let out = text.trim()
+  for (;;) {
+    const next = out
+      .replace(/^<pasted_content[^>]*>[ \t]*\r?\n?/, '')
+      .replace(/\r?\n?[ \t]*<\/pasted_content[^>]*>$/, '')
+      .trim()
+    if (next === out) return out
+    out = next
+  }
+}
+
 /** The start trigger (O1, Decision 17): `/devir-otonom` (cmd) or `orkestra:` (pfx), with its task. */
 const otonomStart = (e: PromptSubmitInput): { entry: 'cmd' | 'pfx'; task: string } | undefined => {
+  const raw = rawOtonomStart(e)
+
+  return raw === undefined ? undefined : { ...raw, task: unwrapPaste(raw.task) }
+}
+
+const rawOtonomStart = (e: PromptSubmitInput): { entry: 'cmd' | 'pfx'; task: string } | undefined => {
   if (e.command !== undefined) {
     return OTONOM_COMMANDS.includes(e.command.name) ? { entry: 'cmd', task: e.command.args.trim() } : undefined
   }
@@ -2030,6 +2074,14 @@ const bandRow = async ($: EngineInterface, held: OtomatikDevirConv): Promise<str
   return held.phase === 'ready' && held.role !== 'alt' ? READY_BAND : undefined
 }
 
+/** D1: ` · eşik %60 ≈ 600k` for `/devir otonom`; empty while the window is unknown. */
+const esikTail = async ($: EngineInterface, held: OtomatikDevirConv): Promise<string> => {
+  const threshold = thresholdOf(await readSettings($), held)
+  const equivalent = tokenEquivalent(await contextWindow($), threshold)
+
+  return equivalent === '' ? '' : ` · eşik %${threshold}${equivalent}`
+}
+
 /** `/devir otonom [dur | limit <n>]` (O8; the limit is the chain's, Decision 22). */
 const otonomVerb = async (
   $: EngineInterface,
@@ -2061,7 +2113,7 @@ const otonomVerb = async (
     const child = main.n >= 1 ? await readChild($, main.childId) : undefined
     const state = main.ended !== undefined ? `bitti: ${main.ended}` : main.isHeld ? 'tutuluyor' : 'duraklatıldı'
 
-    return `Orkestra: ana sohbet · görev "${main.title}" · alt sohbet ${main.n}/${limit} · alt durum ${child?.status ?? 'yok'} · ${state}`
+    return `Orkestra: ana sohbet · görev "${main.title}" · alt sohbet ${main.n}/${limit} · alt durum ${child?.status ?? 'yok'} · ${state}${await esikTail($, held)}`
   }
   if (role === 'alt' && chainId !== undefined) {
     if (sub === 'dur') return 'Bu bir alt sohbet; zinciri ana sohbette /devir otonom dur ile durdur.'
@@ -2071,7 +2123,7 @@ const otonomVerb = async (
     const n = own?.role === 'alt' ? own.n : (held.childN ?? 1)
     const status = own?.role === 'alt' ? own.status : 'working'
 
-    return `Orkestra: alt sohbet ${n}/${limit} (ana: ${chainId}) · durum ${status}`
+    return `Orkestra: alt sohbet ${n}/${limit} (ana: ${chainId}) · durum ${status}${await esikTail($, held)}`
   }
 
   return NOT_ORCHESTRATED
@@ -2194,7 +2246,9 @@ export const register: Register = on => {
     if (isPerson) {
       try {
         // O7: a person's prompt also clears the stalled band.
-        await patchConv($, (await currentConv($)).sid, { lastTyped: e.text, stalledN: undefined })
+        // T9: a managed sub-chat's first prompt (start_session) is the main chat's brief, not the person's ask.
+        const patch = MANAGED_FIRST_PROMPT.test(e.text) ? { stalledN: undefined } : { lastTyped: e.text, stalledN: undefined }
+        await patchConv($, (await currentConv($)).sid, patch)
       } catch (error) {
         $.ui.log(`otomatik-devir: son istem kaydedilemedi: ${String(error)}`, { to: 'debug' })
       }
@@ -2532,7 +2586,9 @@ export const register: Register = on => {
 
         const orkestra = await orkestraStatusOf($, held)
 
-        return { text: `${statusText(settings, percent, held, running, orkestra)} · aşama: ${held.phase}` }
+        const window = await contextWindow($)
+
+        return { text: `${statusText(settings, percent, held, running, orkestra, window)} · aşama: ${held.phase}` }
       }
       case 'esik': {
         if (isNormal) return { text: NORMAL_INFO }

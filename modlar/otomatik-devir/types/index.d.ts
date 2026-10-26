@@ -91,6 +91,8 @@ export type OrkestraAyar = {
   limit?: number
   /** `/devir kapat` in this chain: its emergency stop. */
   isClosed?: true
+  /** `/devir otonom devret` in the main chat: the number of the sub-chat that must hand off now; cleared when its handoff starts. */
+  forceN?: number
   /** Clock ms of the last write to this record. */
   at: number
 }

@@ -13,10 +13,13 @@ import {
   managedChildNote,
   NORMAL_INFO,
   normalDeneText,
+  ORKESTRA_DURDU_DENY,
+  ORKESTRA_ENDED_SECTION,
   ORKESTRA_END_DENY,
   ORKESTRA_PAUSED_BAND,
   ORKESTRA_PAUSED_DENY,
   ORKESTRA_PREFIX,
+  ORKESTRA_SECTION,
   ORKESTRA_SECTION_ID,
   orkestraBusyDeny,
   orkestraCapDeny,
@@ -1272,7 +1275,7 @@ describe('orkestra ana v1.1.1', () => {
     await turnBegin($)
     expect((await stop($, [])).block).toBeUndefined()
     expect((await bash($)).context ?? []).toEqual([])
-    expect((await startSession($)).deny).toBe(ORKESTRA_END_DENY)
+    expect((await startSession($)).deny).toBe(ORKESTRA_DURDU_DENY)
     expect(rec(world, 'local_main')).toMatchObject({ ended: 'durdu', n: 1 })
   })
 
@@ -1337,5 +1340,88 @@ describe('orkestra ana v1.1.1', () => {
     expect(main.ended).toBeUndefined()
     expect(main.stallCount).toBeUndefined()
     expect(main.isHeld).toBe(true)
+  })
+
+  test('(T6d) durdu geri alınabilir: metin özet emri ve "yanıt vermiyor" içermez, duraklatıldığını ve devam yolunu söyler; ana sohbet tam bölümü korur', async ($, on) => {
+    const { world, clock } = setup(on)
+    on('prompt.compose', () => ({ sections: [] }))
+    const k = await stallUp($, world, clock, 'main')
+    const text = orkestraEndText('durdu', 1, undefined, undefined, childId(k))
+    expect(text).not.toContain('özet')
+    expect(text).not.toContain('yanıt vermiyor')
+    expect(text).not.toContain('zincir durdu')
+    expect(text).toContain('duraklatıldı')
+    expect(text).toContain('/devir otonom devam')
+    expect(orkestraStalledBand(2)).toBe('Orkestra duraklatıldı: alt sohbet 2 sessiz')
+    expect(ORKESTRA_DURDU_DENY).not.toContain('özet')
+    expect(ORKESTRA_DURDU_DENY).toContain('/devir otonom devam')
+    expect(await composeTexts($)).toEqual([ORKESTRA_SECTION(TASK)])
+    expect((await startSession($)).deny).toBe(ORKESTRA_DURDU_DENY)
+  })
+})
+
+const composeTexts = async ($: any) =>
+  (
+    await $.prompt.compose({
+      model: 'claude-test',
+      promptModel: 'claude-test',
+      surfaces: ['terminal'],
+      tools: [],
+      outputStyle: null,
+      traits: [],
+    })
+  ).sections.filter((s: any) => s.id === ORKESTRA_SECTION_ID).map((s: any) => s.text as string)
+
+// v1.1.1 T6: the main chat's texts (Turkish replies, one summary, quiet after an end, no free-text child control).
+describe('orkestra ana metinleri (T6)', () => {
+  test('(T6a) ORKESTRA_SECTION: Türkçe yanıt, bildirimlere sessizlik, SendMessage yasağı ve devret yönlendirmesi; canlı ana sohbet bunu alır', async ($, on) => {
+    const { world } = setup(on)
+    on('prompt.compose', () => ({ sections: [] }))
+    const text = ORKESTRA_SECTION('görev')
+    expect(text).toContain('Kullanıcıya her zaman Türkçe yaz (görevin dili ne olursa olsun)')
+    expect(text).toContain("yanıt yazma, turu sessizce bitir")
+    expect(text).toContain('finished a turn')
+    expect(text).toContain('SendMessage')
+    expect(text).toContain('/devir otonom devret')
+    await chainUp($, world, 'main')
+    expect(await composeTexts($)).toEqual([ORKESTRA_SECTION(TASK)])
+  })
+
+  test('(T6b) gerçek sondan sonra (bitti) ORKESTRA_ENDED_SECTION gelir, ORKESTRA_SECTION gelmez; sessizlik ve Türkçe kuralı içerir', async ($, on) => {
+    const { world, clock } = setup(on)
+    on('prompt.compose', () => ({ sections: [] }))
+    const k = await chainUp($, world, 'main')
+    seedChild(world, clock, k, 'local_main', 1, 'finished', { report: 'tamam', beatAt: clock.now() })
+    expect((await stop($, [])).block).toBe(orkestraEndText('bitti', 1, 'tamam', undefined, childId(k), 100))
+    await turnEnd($)
+    expect(rec(world, 'local_main')).toMatchObject({ ended: 'bitti' })
+    expect(await composeTexts($)).toEqual([ORKESTRA_ENDED_SECTION])
+    expect(ORKESTRA_ENDED_SECTION).toContain('Türkçe')
+    expect(ORKESTRA_ENDED_SECTION).toContain('yanıt yazma')
+    expect(ORKESTRA_ENDED_SECTION).toContain('SendMessage')
+  })
+
+  test('(T6c) kapatildi ile biten zincir de bitmiş bölümü alır (zincir ayarı kapalı olsa da)', async ($, on) => {
+    const { world, clock } = setup(on)
+    on('prompt.compose', () => ({ sections: [] }))
+    await chainUp($, world, 'main')
+    expect(await devir($, 'kapat')).toContain(KAPAT_CHAIN)
+    await clock.advance(60_000)
+    await turnEnd($)
+    await machine($, 'alt sohbet bir turu bitirdi')
+    await turnBegin($)
+    await stop($, [])
+    expect(rec(world, 'local_main')).toMatchObject({ ended: 'kapatildi' })
+    expect(await composeTexts($)).toEqual([ORKESTRA_ENDED_SECTION])
+  })
+
+  test('(T6e) gerçek sonun tek özet metni özet ister; başlatma notu ve bekleme metni: 540 sn, Bash timeout 570000', async ($, on) => {
+    setup(on)
+    expect(orkestraEndText('bitti', 2)).toContain('Kullanıcıya kısa bir özet yaz')
+    const wait = orkestraWaitText(3)
+    expect(wait).toContain("select(undef,undef,undef,540)")
+    expect(wait).toContain('570000')
+    expect(wait).not.toContain('330000')
+    expect(wait.length).toBeLessThanOrEqual(400)
   })
 })

@@ -277,11 +277,18 @@ export const orkestraStartNote = (title: string): string =>
 
 /** The main chat's system-prompt section (O2). */
 export const ORKESTRA_SECTION = (task: string): string =>
-  `otomatik-devir orkestra modu: bu sohbet otonom bir zincirin ana sohbeti. Burada gerçek iş yapma: işi yönetilen alt sohbetler yapar. Senin işin alt sohbetleri ${START_SESSION} ile açmak, beklemek, sıradakini açmak ve zincir bitince kullanıcıya özet yazmak; mod her adımda ne yapacağını söyler. Kendiliğinden devir yapma. Görev: ${task.slice(0, 1000)}`
+  `otomatik-devir orkestra modu: bu sohbet otonom bir zincirin ana sohbeti. Burada gerçek iş yapma: işi yönetilen alt sohbetler yapar. Senin işin alt sohbetleri ${START_SESSION} ile açmak, beklemek, sıradakini açmak ve zincir bitince kullanıcıya özet yazmak; mod her adımda ne yapacağını söyler. Kendiliğinden devir yapma. Kullanıcıya her zaman Türkçe yaz (görevin dili ne olursa olsun). Alt sohbetin "finished a turn" bildirimleri bilgi içindir: mod notu yoksa ve kullanıcı yazmadıysa yanıt yazma, turu sessizce bitir. Alt sohbete SendMessage ile devir, durma ya da iş talimatı verme; kullanıcı devir isterse ona \`/devir otonom devret\` yazmasını söyle. Görev: ${task.slice(0, 1000)}`
+
+/**
+ * The main chat's system-prompt section once the chain really ended (T6): the
+ * summary is asked for once by the end text; after it, notifications get no reply.
+ */
+export const ORKESTRA_ENDED_SECTION =
+  'otomatik-devir orkestra: bu zincir bitti. Özeti mod notu istediğinde bir kez yaz; sonrasında alt sohbetin bildirimlerine (finished a turn, Waiting vb.) yanıt yazma, turu sessizce bitir. Yalnızca kullanıcı yazarsa ona Türkçe cevap ver. Yeni alt sohbet açma; alt sohbete SendMessage gönderme.'
 
 /** Stop block while the child runs (O5 `wait`, Decision 6); kept short (O22). */
 export const orkestraWaitText = (n: number): string =>
-  `otomatik-devir orkestra: alt sohbet ${n} çalışıyor; turu bitirme. Bash aracıyla \`perl -e 'select(undef,undef,undef,300)'\` çalıştır (5 dakika bekler); Bash aracının timeout parametresini 330000 yap (bu bir araç parametresi, kabuk komutu değil). Sonra turu yeniden bitirmeyi dene; başka iş yapma.`
+  `otomatik-devir orkestra: alt sohbet ${n} çalışıyor; turu bitirme. Bash aracıyla \`perl -e 'select(undef,undef,undef,540)'\` çalıştır (9 dakika bekler); Bash aracının timeout parametresini 570000 yap (bu bir araç parametresi, kabuk komutu değil). Sonra turu yeniden bitirmeyi dene; başka iş yapma.`
 
 /** The relay to the next child (O5/O6 `relay`; n = the next child); kept short (O22). */
 export const orkestraRelayText = (n: number, title: string): string =>
@@ -302,11 +309,15 @@ export const orkestraEndText = (
   childId?: string,
   limit?: number,
 ): string => {
+  // T6: a stalled chain is paused, not over: one status line, no summary, and the way back.
+  if (kind === 'durdu') {
+    return `otomatik-devir orkestra: alt sohbet ${n} uzun süredir sessiz (${childId ?? UNKNOWN_CHILD}); zincir duraklatıldı. Bu zincirde ${n} alt sohbet açıldı.${file === undefined ? '' : ` Son devir dosyası: ${file}.`} Tek satır durum yaz. Alt sohbet yeniden çalışırsa ya da kullanıcı \`/devir otonom devam\` yazarsa zincir sürer; yeni sohbet açma, turu bitir.`
+  }
   const reasons: Record<EndKind, string> = {
     bitti: 'zincir bitti, kalan iş yok',
     sinir: `zincir sınır ${limit ?? DEFAULT_LIMIT} alt sohbete ulaştı`,
     durduruldu: 'zincir kullanıcının isteğiyle durduruldu (/devir otonom dur)',
-    durdu: `alt sohbet ${n} yanıt vermiyor (${childId ?? UNKNOWN_CHILD}); zincir durdu`,
+    durdu: `alt sohbet ${n} uzun süredir sessiz (${childId ?? UNKNOWN_CHILD}); zincir duraklatıldı`,
     kapatildi: 'otomatik devir kapatıldı (/devir kapat); zincir durdu',
     dolu: `ana sohbet dolu (bağlam %${MAIN_FULL_PERCENT} ya da fazlası); zincir burada bitiyor`,
   }
@@ -324,7 +335,11 @@ export const orkestraEndText = (
 }
 
 /** The status line and band of a stalled chain (O19). */
-export const orkestraStalledBand = (n: number): string => `Orkestra durdu: alt sohbet ${n} yanıt vermiyor`
+export const orkestraStalledBand = (n: number): string => `Orkestra duraklatıldı: alt sohbet ${n} sessiz`
+
+/** start_session in a stalled (`durdu`) chain (T6): paused, not over, so no summary is asked for. */
+export const ORKESTRA_DURDU_DENY =
+  'otomatik-devir orkestra: zincir duraklatıldı (alt sohbet sessiz); yeni sohbet açma. Alt sohbet yeniden çalışırsa ya da kullanıcı `/devir otonom devam` yazarsa zincir sürer; turu bitir.'
 
 export const ORKESTRA_END_DENY =
   'otomatik-devir orkestra: zincir bitti; yeni sohbet açma. Kullanıcıya özet yaz ve turu bitir.'
@@ -1675,7 +1690,9 @@ const orkestraStart = async (
     return { deny: ORKESTRA_END_DENY }
   }
   const limit = await orkestraLimit($, localId)
-  if (main.ended !== undefined) return { deny: main.ended === 'sinir' ? orkestraCapDeny(limit) : ORKESTRA_END_DENY }
+  if (main.ended !== undefined) {
+    return { deny: main.ended === 'sinir' ? orkestraCapDeny(limit) : main.ended === 'durdu' ? ORKESTRA_DURDU_DENY : ORKESTRA_END_DENY }
+  }
   if (!main.isHeld) return { deny: ORKESTRA_PAUSED_DENY }
   const now = await $.clock.now()
   if (isLiveStarting(main, now)) return { deny: orkestraBusyDeny(main.n + 1) }
@@ -2353,13 +2370,20 @@ export const register: Register = on => {
       // O2: the main chat's own section (cached role only, never a GET); it never trips, so no long-chat note.
       if (held.role === 'ana') {
         const main = held.localId === undefined ? undefined : await readMain($, held.localId)
-        if (!settings.isEnabled || main === undefined || main.ended !== undefined) return r
+        if (main === undefined) return r
+        // T6: after a real end the section tells the main chat to stay silent (a `durdu` chain may revive: full section).
+        const isOver = isFinalEnd(main.ended)
+        if (!isOver && !settings.isEnabled) return r
 
         return {
           ...r,
           sections: [
             ...r.sections.filter(s => s.id !== ORKESTRA_SECTION_ID && s.id !== LONG_CHAT_SECTION_ID),
-            { id: ORKESTRA_SECTION_ID, text: ORKESTRA_SECTION(main.task), scope: 'session' as const },
+            {
+              id: ORKESTRA_SECTION_ID,
+              text: isOver ? ORKESTRA_ENDED_SECTION : ORKESTRA_SECTION(main.task),
+              scope: 'session' as const,
+            },
           ],
         }
       }

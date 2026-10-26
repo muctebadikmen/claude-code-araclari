@@ -12,13 +12,14 @@ The main chat decides, dispatches, relays and keeps state; sub-agents do the wor
 - **Delegate heavy work.** Reading code, searching, analysing, implementing, testing and reviewing are sub-agent work. The orchestrator reads its own state and plan files and may check something itself when it takes a handful of tool calls; anything bigger is a dispatch.
 - **Right-size, then parallelise.** One agent per independent part or question group, all sent in one message; none for a part the project lacks. Foreground batch when the next step needs every result; background when each result is acted on alone (implement → review → merge).
 - **One deliverable per dispatch**, small enough to finish in one sitting. An agent that outgrows it stops, writes what it has and reports what remains; re-dispatch the rest on the same model with that report. Resume an agent only to answer its question or hand it review findings. Fill `references/dispatch-template.md`.
+- **Batch waiting.** Background agents in flight and nothing else to do: do not end the turn per notification. Wait in the turn with one Bash wait (≤5 min per call, e.g. an until-loop on the expected output files, or `perl -e 'select(undef,undef,undef,240)'`), then handle every result that arrived together. End the turn only when nothing is in flight or a wait has passed 30 min.
 - **Summaries, not dumps.** Heavy output goes to a `.workflow/` file; the agent returns the path plus ≤10 lines.
-- **Caps are hard.** A cap a skill declares (rounds, retries, agents) is exceeded only after a 🛑 where the user chooses. Scope open-ended work in a few lines first, smallest useful version first.
+- **Caps are hard.** A cap a skill or the user declares (rounds, retries, agents) is exceeded only after a 🛑 where the user chooses; before every dispatch count the in-flight agents of the capped kind and dispatch only into free slots. Scope open-ended work in a few lines first, smallest useful version first.
 - **State.** Read `.workflow/STATE.md` first (none: `my-skill-init`); write it from `references/state-template.md` before the first dispatch, at every 🛑 and after every phase. STATE/PLAN/PROGRESS/HANDOFF.md are committed; scratch is not.
 - **Honesty.** Report only what a sub-agent verified; "not run" is valid. Before telling the user to act outside the repo (portal, console), dispatch a diagnosis.
 - **Stop points (🛑).** Write STATE.md, report found / done / next in three lines, wait. Non-stop skills (execute) skip the wait.
 - **Questions policy.** Research and masterplan ask whatever they need: AskUserQuestion, ≤4 per call, more calls allowed, recommended option first, marked "(Recommended)". Execute, ship and handoff never ask.
-- **Long-chat handoff.** With heavy context (≈300K tokens, or after a compaction), finish the phase, invoke `my-skill-handoff`, continue in a new chat. Non-stop skills included.
+- **Long-chat handoff.** With heavy context (≈300K tokens, or after a compaction), finish the phase, invoke `my-skill-handoff`, continue in a new chat. Non-stop skills included. In an otomatik-devir managed sub-chat the mod's threshold replaces this; do not self-handoff there.
 - **Overload fallback.** An agent dying with a 529/5xx is re-dispatched once; a second failure switches it to the other of sonnet/opus, noted in STATE.md.
 
 ## Model routing

@@ -388,9 +388,9 @@ test('my-skill .workflow: STATE.md ilerlemesi, eski plan devreye girmez', async 
 
 // --- engagement: the plan-file bar belongs to the chat that engaged it ---
 
-// kuran-shaped: `- id:` plan, compact Done line of `T<n> <sha>` pairs, a stale
+// real-project-shaped: `- id:` plan, compact Done line of `T<n> <sha>` pairs, a stale
 // In progress (T48 already merged), wave labels and AUD-/K-/D-/S2/X97 noise
-const KURAN_PLAN = [
+const SAMPLE_PLAN = [
   '# PLAN onarim',
   '## Phase 1: Dalga W1 (temel)',
   '- id: T0',
@@ -409,7 +409,7 @@ const KURAN_PLAN = [
   '  goal: Grup sekmesi katılma',
 ].join('\n')
 
-const KURAN_STATE = [
+const SAMPLE_STATE = [
   '# STATE',
   'Updated: 2026-10-05 (handoff)',
   'Active skill: my-skill-execute',
@@ -436,15 +436,15 @@ const KURAN_STATE = [
   '- Plan: .workflow/plans/onarim/PLAN.md',
 ].join('\n')
 
-const KURAN_LINE = '▓▓▓░░░ 3/6 · %50 · Şu an: T2 · Geri al görünümü'
+const SAMPLE_LINE = '▓▓▓░░░ 3/6 · %50 · Şu an: T2 · Geri al görünümü'
 const HANDOFF = 'Devam ediyoruz. First read .workflow/HANDOFF.md and .workflow/STATE.md. Then invoke the `my-skill-execute` skill.'
 
 // a project with an open my-skill job on disk; returns a handle on the session id
-const kuranProject = (on: TestOn) => {
+const sampleProject = (on: TestOn) => {
   const files: Record<string, { source: string; mtimeMs: number }> = {
     '.workflow/plans/eski/PLAN.md': { source: '- id: T1\n  goal: eski\n- id: T2\n', mtimeMs: 5 },
-    '.workflow/plans/onarim/PLAN.md': { source: KURAN_PLAN, mtimeMs: 20 },
-    '.workflow/STATE.md': { source: KURAN_STATE, mtimeMs: 30 },
+    '.workflow/plans/onarim/PLAN.md': { source: SAMPLE_PLAN, mtimeMs: 20 },
+    '.workflow/STATE.md': { source: SAMPLE_STATE, mtimeMs: 30 },
   }
   const session = { id: 's1' }
   const toasts: string[] = []
@@ -495,7 +495,7 @@ const toggleText = async ($: TestEngine, surface: 'terminal' | 'desktop' = 'term
 
 test('yeni chat aynı projede: açık STATE.md olsa da bağlanana kadar çubuk yok', async ($, on) => {
   const clock = mock.clock(on, { now: 10_000_000 })
-  kuranProject(on)
+  sampleProject(on)
 
   await $.session.start(START)
   await clock.advance(5000)
@@ -513,14 +513,14 @@ test('yeni chat aynı projede: açık STATE.md olsa da bağlanana kadar çubuk y
   expect(await toggleText($)).toBe('▓░ 1/2 · %50 · Sıradaki: Adım 2')
 })
 
-test('devir prompt.submit çubuğu hemen gösterir (kuran biçimi: 3/6, şu an T2)', async ($, on) => {
+test('devir prompt.submit çubuğu hemen gösterir (örnek proje biçimi: 3/6, şu an T2)', async ($, on) => {
   mock.clock(on, { now: 11_000_000 })
-  kuranProject(on)
+  sampleProject(on)
   await $.session.start(START)
   expect(await toggleText($)).toBeUndefined()
 
   await $.prompt.submit(prompt(HANDOFF, 'plugin'))
-  for (const surface of ['terminal', 'desktop'] as const) expect(await toggleText($, surface)).toBe(KURAN_LINE)
+  for (const surface of ['terminal', 'desktop'] as const) expect(await toggleText($, surface)).toBe(SAMPLE_LINE)
 
   // the detail list is in plan order: done ✓, current ●, pending ○
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
@@ -533,34 +533,34 @@ test('devir prompt.submit çubuğu hemen gösterir (kuran biçimi: 3/6, şu an T
 
   // hot reload: session.start again, $.state stays, so the bar stays
   await $.session.start(START)
-  expect(await toggleText($)).toBe(KURAN_LINE)
+  expect(await toggleText($)).toBe(SAMPLE_LINE)
 })
 
 test('Read (alt ajan dahil) ve my-skill becerisi bağlar', async ($, on) => {
   mock.clock(on, { now: 12_000_000 })
-  const { session } = kuranProject(on)
+  const { session } = sampleProject(on)
 
   await $.tool.call({ tool: 'Read', file_path: '.workflow/STATE.md', agentId: 'alt-1' } as never)
-  expect(await toggleText($)).toBe(KURAN_LINE)
+  expect(await toggleText($)).toBe(SAMPLE_LINE)
 
   session.id = 's2'
   await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as never)
   expect(await toggleText($)).toBeUndefined()
   await $.tool.call({ tool: 'Read', file_path: '.workflow/STATE.md' } as never)
-  expect(await toggleText($)).toBe(KURAN_LINE)
+  expect(await toggleText($)).toBe(SAMPLE_LINE)
 
   session.id = 's3'
   await $.session.end({ reason: 'clear', sessionId: 's2', resume: { id: 's2' } } as never)
   await $.skill.prompt({ skill: 'my-skill-execute', text: '' })
-  expect(await toggleText($)).toBe(KURAN_LINE)
+  expect(await toggleText($)).toBe(SAMPLE_LINE)
 })
 
 test('/clear plan çubuğunu düşürür; ardından devir prompt\'u geri getirir', async ($, on) => {
   const clock = mock.clock(on, { now: 13_000_000 })
-  const { session } = kuranProject(on)
+  const { session } = sampleProject(on)
   await $.session.start(START)
   await $.prompt.submit(prompt(HANDOFF))
-  expect(await toggleText($)).toBe(KURAN_LINE)
+  expect(await toggleText($)).toBe(SAMPLE_LINE)
 
   // a plugin's chain: /clear (new session id) → prompt.submit of the handoff text
   session.id = 's2'
@@ -570,12 +570,12 @@ test('/clear plan çubuğunu düşürür; ardından devir prompt\'u geri getirir
   expect(await toggleText($)).toBeUndefined()
 
   await $.prompt.submit(prompt(HANDOFF, 'plugin'))
-  expect(await toggleText($)).toBe(KURAN_LINE)
+  expect(await toggleText($)).toBe(SAMPLE_LINE)
 })
 
 test('inceleme: yeni chat bitmiş planı bağlayınca ne çubuk ne "✓ Tamamlandı"', async ($, on) => {
   const clock = mock.clock(on, { now: 14_000_000 })
-  const { files, toasts } = kuranProject(on)
+  const { files, toasts } = sampleProject(on)
   // every plan id merged: the job is over before this chat began
   const state = files['.workflow/STATE.md']
   if (!state) throw new Error('fixture')

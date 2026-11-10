@@ -1,33 +1,34 @@
 ---
 name: my-skill-init
-description: Use when starting or setting up a project for the my-skills workflow, or when another my-skill finds no .workflow/STATE.md. Triggers: "init", "project start", "set up this project", "start a new project", "projeyi başlat", "proje kurulumu".
+description: Use when starting or setting up a project for the my-skills workflow, or when another my-skill finds no .workflow/STATE.md or .workflow/PROJECT.md. Triggers: "init", "project start", "set up this project", "start a new project", "projeyi başlat", "proje kurulumu".
 ---
 
 # Init
 
-Set up the project's workflow files and rules. Idempotent: a second run changes nothing. No sub-agents and no questions, except when the folder is not a git repo and holds several projects: then ask which one.
+Create the project's workflow files and rules yourself, without sub-agents. Idempotent: a second run changes nothing. Ask one question only when the folder is not a git repo and holds several projects: which one.
 
-Project root = `git rev-parse --show-toplevel`, else the current folder. Before editing, note `git status --porcelain -- AGENTS.md CLAUDE.md .gitignore .workflow/STATE.md .workflow/PLAN.md`: a listed path already holds uncommitted user changes.
+Project root = `git rev-parse --show-toplevel`, else the current folder.
 
-1. **State.** Missing `.workflow/STATE.md`: write it from my-skill-orchestrate's state template, `Active skill: none`. Write `.workflow/PLAN.md` (`# PLAN`, `Goal:`, `- [ ] T1 — <step>` lines) only if the user described work to plan; otherwise planning is `my-skill-masterplan`'s job.
-2. **Rules.** In `AGENTS.md` (create if missing) replace everything between the markers with the block below, or append the block if the markers are absent. Never touch text outside the markers.
-3. **CLAUDE.md.** Missing: create it containing `@AGENTS.md`. Present without that line: add it at the top.
-4. **`.gitignore`.** Add each missing entry: `.workflow/research/`, `.workflow/dispatch/`, `.workflow/audit/`, `.workflow/runs/`, `.workflow/plans/*/check-*.md`, `.worktrees/`. A line ignoring all of `.workflow` (`.workflow/`, `.workflow`, `/.workflow/`, `.workflow/*`) is replaced by these. Never ignore the whole folder.
-5. **Commit** (git repo, files changed): stage and commit only the changed paths with `chore: set up my-skills workflow files`, plus an attribution trailer only if this session supplied one. If a changed path held uncommitted user changes before step 1, commit nothing and say so.
-6. **Report** in 3 lines: what changed, commit sha or why none, next step (`my-skill-masterplan`, or the plan's first step).
+1. **Guard.** Run `git status --porcelain -- AGENTS.md CLAUDE.md .gitignore .workflow/STATE.md .workflow/PROJECT.md`. Each listed path holds uncommitted user changes; remember them for step 7.
+2. **State.** `.workflow/STATE.md` missing: write it from my-skill-orchestrate's `state-template.md` with `Active skill: none`.
+3. **Project.** `.workflow/PROJECT.md` missing: detect the stack and write the file per `references/stack-detect.md`. Present: leave it untouched.
+4. **Rules.** In `AGENTS.md` (create if missing) replace the text between the markers with the block below; markers absent: append the block. Leave all text outside the markers as it is.
+5. **CLAUDE.md.** Missing: create it containing `@AGENTS.md`. Present without that line: add it at the top.
+6. **`.gitignore`.** Add each missing entry: `.workflow/research/`, `.workflow/dispatch/`, `.workflow/audit/`, `.workflow/runs/`, `.workflow/vet/`, `.workflow/persona/`, `.workflow/verify-app/`, `.workflow/plans/*/check-*.md`, `.worktrees/`. Replace any line that ignores the whole folder (`.workflow/`, `.workflow`, `/.workflow/`, `.workflow/*`) with these entries.
+7. **Commit** (git repo, files changed): stage only the changed paths and commit with `chore: set up my-skills workflow files`, adding an attribution trailer only if this session supplied one. If a changed path was listed in step 1, commit nothing and say so.
+8. **Report** in 3 lines: what changed plus the detected stack and pack; the commit sha or why there is none; next step (`my-skill-masterplan`). Guard hooks not installed: say so in one clause and install nothing.
 
 ## AGENTS.md block
 
 ```
 <!-- my-skills:start -->
 ## Workflow rules (my-skills)
-- Read `.workflow/STATE.md` before starting work.
-- When a step changes status or a decision is made, update `.workflow/STATE.md` (and tick `.workflow/PLAN.md`) in the same turn, before replying.
+- Read `.workflow/STATE.md` and `.workflow/PROJECT.md` before starting work.
+- When a step changes status or a decision is made, update `.workflow/STATE.md` in the same turn, before replying.
 - A step is done only with evidence: a passing test or a commit.
-- Plans: `my-skill-masterplan` tasks (`- id: T1`), or checkbox steps with ids (`- [ ] T1 — <step>`) for small hand-written plans. No tables.
-- Keep STATE.md ≤80 lines; details go in linked files.
-- Plan task status: `.workflow/plans/<name>/PROGRESS.md` (`[ ]`/`[~]`/`[x]`/`[!]`/`[-]`), never task lists in STATE.md; small `.workflow/PLAN.md` plans keep checkboxes.
-- `.workflow/PLAN.md`, `STATE.md`, `HANDOFF.md` and `.workflow/plans/*/PLAN.md`, `PROMPT.md`, `PROGRESS.md` are committed. Scratch (`.workflow/research/`, `dispatch/`, `audit/`, `runs/`, plan `check-*.md`, `.worktrees/`) is not.
+- Bug fix: failing test first.
+- Before debugging or planning, grep `.workflow/LEARNINGS.md`.
+- Committed: `.workflow/STATE.md`, `PROJECT.md`, `LEARNINGS.md`, `HANDOFF.md`, `debug/*.md`, `plans/*/PLAN.md`, `PROMPT.md`, `PROGRESS.md`. Scratch is git-ignored.
 - For multi-step work, follow the `my-skill-orchestrate` skill.
 <!-- my-skills:end -->
 ```

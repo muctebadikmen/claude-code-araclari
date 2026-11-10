@@ -1,7 +1,7 @@
 {
   "name": "my-skills",
-  "version": "0.1.0",
-  "description": "Mustafa Dikmen'in iş akışı skill'leri: init, audit, research, masterplan, execute, handoff, ship ve hepsini yöneten orchestrate.",
+  "version": "0.3.0",
+  "description": "Mustafa Dikmen'in iş akışı skill'leri: init, audit, research, masterplan, execute, debug, verify-app, persona-test, release, vet, handoff, ship ve hepsini yöneten orchestrate.",
   "author": {
     "name": "Mustafa Dikmen",
     "url": "https://github.com/muctebadikmen"

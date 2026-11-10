@@ -7,19 +7,24 @@ description: Use when the user wants an implementation plan for a feature, bug-f
 
 REQUIRED SUB-SKILL: my-skill-orchestrate
 
-A plan another chat executes non-stop in parallel lanes. Agents write it; you decide and relay. Models follow orchestrate's model routing.
+Agents write a plan that another chat executes non-stop in parallel lanes; you decide and relay. Model routing per orchestrate.
 
-Fixed paths: `.workflow/plans/<name>/{PLAN,PROMPT,PROGRESS}.md`, `.workflow/STATE.md`.
+Paths: `.workflow/plans/<name>/{PLAN,PROMPT,PROGRESS}.md`, `.workflow/STATE.md`.
 
 ## Inputs
 
-`.workflow/audit/<file>.md`, `.workflow/research/<file>.md`, or a user description. Plan name: ask once. Decisions in the invoking message are final: copy them verbatim into STATE.md `## Decisions` before the first dispatch; never re-ask.
+An audit, research or debug file under `.workflow/`, or a user description. Also read `.workflow/PROJECT.md` and `grep -i` `.workflow/LEARNINGS.md` for the task's keywords. Plan name: slug of Goal; ask only on a clash. Decisions in the invoking message are final: copy them verbatim into STATE.md `## Decisions` before the first dispatch; never re-ask.
+
+## Modes
+
+- **Small** (≤3 tasks, one parallel-group): skip Collect, Verify and Check; sonnet drafts; go to Prompt.
+- **Converge** (input is an existing plan folder, or "check plan vs code"): follow `references/converge-prompt.md`.
 
 ## Phases
 
-1. **Collect** (parallel, sonnet), only when the input lacks `file:line` citations (audit reports and research syntheses with `## Integration points` have them: verify those claims directly). One agent per finding group or feature part writes `collect-<n>.md`: files touched (path, role) and every code claim with file:line.
-2. **Verify** (parallel, sonnet; one per ≤15 claims): check each claim against the file into `verify-<n>.md`: `claim → TRUE/FALSE/PARTIAL, path:line`. Nothing false enters a task. `## Corrections` carries only FALSE/PARTIAL input claims a task relies on; other drift stays in the verify file.
-3. **Decide** (you): list every fork (architecture, naming, scope, edge cases), drop what the invoking message or STATE.md Decisions already answer, ask the rest in as many rounds as answers open new forks. "Do not ask" means take the recommended option and record it. Answers go to STATE.md Decisions; no "TBD" survives.
-4. **Draft** (`Draft plan`, opus: the rest depends on it). Inputs: collect/verify files, Decisions, `references/plan-template.md`. Maximise parallel-groups with disjoint `files:`; sequential edits to one file are ONE task with ordered steps; `depends-on` only for a real data dependency. Each task's `model:` follows orchestrate's model routing (sonnet unless a one-phrase reason justifies opus); an opus task also gets a `risk:` line naming the hazard, which makes execute review it on opus. Task blocks ≤40 lines; code and UI strings obey the repo's rules (CLAUDE.md, lint, sentinel tests), read first. `Global verify`'s expected result comes from running it.
-5. **Check** (≤2 rounds; a third needs a 🛑). `Check plan` per `references/plan-checker-prompt.md`: fresh context, sonnet by default, opus for a big or cross-cutting plan; only defects that would make execution fail. `Fix plan issues` applies every item in task bodies (same model choice). Round 2 rechecks only changed tasks plus round-1 items. Stop at `CLEAN`; otherwise remaining items go to STATE.md `## Gotchas` and into PROMPT.md.
-6. **Prompt** (you): write `PROMPT.md` (`references/prompt-template.md`) and `PROGRESS.md`, all `[ ]` (orchestrate's `progress-template.md`). 🛑 Print phases, task count, parallel groups, paths; update STATE.md; end with "Next: paste PROMPT.md into an empty chat." Never ask whether to execute.
+1. **Collect** (parallel, sonnet), only when the input lacks `file:line` citations (audit, research and debug files have them: Verify checks those directly). One agent per finding group or feature part writes `collect-<n>.md`: files touched (path, role) and every code claim with `file:line`.
+2. **Verify** (parallel, sonnet, one per ≤15 claims): check each claim against the file and write `verify-<n>.md`, one line per claim: `claim → TRUE/FALSE/PARTIAL, path:line`. Only TRUE claims enter a task as facts.
+3. **Decide** (you): list every fork (architecture, naming, scope, edge cases) the message and STATE.md Decisions leave open. Ask them, recommended option first, in rounds until answers open no new forks; agents look up facts. Put low-risk forks in one "Assumptions, recorded unless you object" block. "Do not ask" means take the recommended option. Record every answer in STATE.md Decisions; no TBD survives.
+4. **Draft** (`Draft plan`, opus: the rest depends on it) per `references/plan-template.md`, from the collect/verify files, Decisions and PROJECT.md. Its `decision needed:` items go back to Decide.
+5. **Check** (≤2 rounds; a third needs a 🛑): `Check plan` per `references/plan-checker-prompt.md`. On `ISSUES: <n>`, `Fix plan issues` (opus) applies every item, then round 2 rechecks the changed tasks. Stop at `CLEAN`; items left after round 2 go to STATE.md `## Gotchas` and PROMPT.md.
+6. **Prompt** (you): write `PROMPT.md` (`references/prompt-template.md`) and `PROGRESS.md` with every task `[ ]` (orchestrate's `progress-template.md`). 🛑 Print phases, task count, parallel groups, paths and the checker's summary; update STATE.md; end with "Next: paste PROMPT.md into an empty chat." Never ask whether to execute.

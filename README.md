@@ -39,16 +39,23 @@ Her gün kullandığım iş akışı skill'leri. Ana sohbet işi yönetir, alt a
 
 | Skill | Ne yapar |
 |---|---|
-| **my-skill-orchestrate** | Diğer tüm skill'lerin uyduğu kurallar: işi alt ajanlara dağıtır, `.workflow/STATE.md`'yi güncel tutar |
-| **my-skill-init** | Projeyi başlatır: `STATE.md`, `AGENTS.md` kuralları, `.gitignore` |
-| **my-skill-audit** | Koddaki gerçek sorunları bulur ve önem sırasına dizer |
+| **my-skill-orchestrate** | Diğer tüm skill'lerin uyduğu kurallar: işi alt ajanlara paralel dağıtır, `.workflow/STATE.md`'yi güncel tutar |
+| **my-skill-init** | Projeyi başlatır: stack'i algılar (`PROJECT.md`), `STATE.md`, `AGENTS.md` kuralları, `.gitignore` |
+| **my-skill-audit** | Koddaki gerçek sorunları bulur, kanıtlar ve önem sırasına dizer |
 | **my-skill-research** | Kodu ve web'i araştırıp tek bir öneri çıkarır |
-| **my-skill-masterplan** | Doğrulanmış, paralel adımlara bölünmüş plan yazar |
-| **my-skill-execute** | Planı alt ajanlarla uygular, her işi geri dönüşte kontrol eder |
+| **my-skill-masterplan** | Doğrulanmış, paralel görevlere bölünmüş plan yazar |
+| **my-skill-execute** | Planı alt ajanlarla test-first uygular, her işi geri dönüşte inceler |
+| **my-skill-debug** | Tek bir hatayı tekrarlatır, kök nedenini bulur ve testle düzeltir |
+| **my-skill-verify-app** | Değişikliği simülatörde/emülatörde çalıştırıp kanıtla doğrular |
+| **my-skill-persona-test** | Uygulamayı farklı kullanıcı tipleriyle kullanır, UX sorunlarını ve önerileri raporlar |
+| **my-skill-release** | Mağaza öncesi salt okuma kontrolü (sürüm, imza, metadata) |
+| **my-skill-vet** | Başkasının skill'ini/reposunu kullanmadan önce güvenlik kontrolü yapar |
 | **my-skill-handoff** | İlerlemeyi dondurur, yeni sohbet için devam prompt'u yazar |
-| **my-skill-ship** | Gizli bilgi taraması, doğrulama, commit ve push |
+| **my-skill-ship** | Gizli bilgi taraması (gönderilmemiş commit'ler dahil), doğrulama, commit ve push |
 
-**Akışlar:** Hata için `audit → masterplan → execute → ship`. Yeni özellik için `research → masterplan → execute → ship`. `handoff` her an kullanılabilir.
+**Akışlar:** Hata için `audit → debug/masterplan → execute → ship`. Yeni özellik için `research → masterplan → execute → ship`; execute sonunda `verify-app`. `handoff` her an kullanılabilir.
+
+**Koruma hook'ları (isteğe bağlı):** `skilller/my-skills/hooks/` içinde, force-push ve `reset --hard` gibi geri alınamayan git komutlarını ve `.env` gibi gizli dosyaların okunmasını engelleyen iki küçük script var. Otomatik kurulmazlar; kurulum `hooks/README.md` içinde.
 
 Kurmak için:
 

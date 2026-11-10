@@ -1,6 +1,6 @@
 # PROMPT.md template
 
-Write the filled text to `.workflow/plans/<name>/PROMPT.md`. It is pasted into an empty chat: absolute paths, goal, every decision; nothing may depend on this conversation.
+Write the filled block to `.workflow/plans/<name>/PROMPT.md`. It is pasted into an empty chat, so it uses absolute paths and carries the goal and every decision itself. The plan stays in PLAN.md; PROMPT.md points to it.
 
 ```
 Implement the plan at `<abs path>/.workflow/plans/<name>/PLAN.md` for the project at `<abs path>`.
@@ -8,8 +8,9 @@ Implement the plan at `<abs path>/.workflow/plans/<name>/PLAN.md` for the projec
 Goal: <one line from PLAN.md>
 Definition of done: <from PLAN.md>
 Global verify: `<from PLAN.md>` → expected: <from PLAN.md>
+Base: <from PLAN.md>   Verify-app: <from PLAN.md>
 
-Invoke the `my-skill-execute` skill and run non-stop: do not pause for confirmation between tasks; only stop on a blocking failure as defined in that skill. Follow `my-skill-orchestrate`: sub-agents do the work with `model` set, the ledger `.workflow/plans/<name>/PROGRESS.md` and `.workflow/STATE.md` updated after every merge. Implementers run in the background, every runnable task at once, each reviewed on return.
+Invoke the `my-skill-execute` skill and run non-stop: no pause for confirmation between tasks; stop only on a blocking stop defined in that skill. Ledger: `<abs path>/.workflow/plans/<name>/PROGRESS.md`.
 
 Decisions already made (final, do not re-ask):
 <Decisions from PLAN.md, one each: "N. <question> → <answer>">
@@ -20,7 +21,7 @@ Corrections already applied (trust PLAN.md, not the original report):
 Known plan gaps (also STATE.md `## Gotchas`):
 <remaining check items, or "none">
 
-Rules: Do not delete, skip, weaken, or narrow tests to make verification pass. Do not refactor unrelated code or add dependencies the plan does not name. If something is impossible as written, record it under Deviations in STATE.md, take the closest faithful alternative, and continue.
+Rules: Do not delete, skip, weaken, or narrow tests to make verification pass. Do not refactor unrelated code or add dependencies the plan does not name. Something unclear or impossible as written: when it only affects how to implement, take the simplest faithful option, record the deviation on the task's PROGRESS.md line, and continue; when it changes behaviour, data or an interface, mark the task `[!]` with the question and continue the independent tasks.
 
-When finished: run the global verify command, print the summary, and offer the `my-skill-ship` skill.
+When finished: run the full suite once (Global verify), print the summary with every pending decision question, and offer the `my-skill-ship` skill.
 ```

@@ -21,7 +21,7 @@
     {
       "name": "my-skills",
       "source": "./skilller/my-skills",
-      "description": "İş akışı skill'leri: init → audit/research → masterplan → execute → ship, araya handoff; orchestrate hepsini alt ajanlarla yönetir."
+      "description": "İş akışı skill'leri: init → audit/research → masterplan → execute → verify-app → ship; debug, persona-test, release, vet ve handoff; orchestrate hepsini alt ajanlarla yönetir."
     }
   ]
 }

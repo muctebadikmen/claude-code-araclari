@@ -266,3 +266,223 @@ test('güvenlik ağı: execute koşuyor, Done dolu ama planın kimliği yok', as
   expect(ledgerUnread(parseState('Active skill: my-skill-execute\n## Done\n\n## In progress\n', ids))).toBe(false)
   expect(ledgerUnread(parseState('Active skill: none\n## Done\n- (ledger elsewhere)\n', ids))).toBe(false)
 })
+
+// --- 0.4.0 fixes: I1 (plan dir), I3b (ended STATE), I4 (Done crediting), I5 (safety net) ---
+
+test('I1: Plan: satırı süslü parantez biçimi ve çıplak plans/<dizin>/ anışı dizini bulur', async () => {
+  const dirs = ['eski', 'yeni']
+  // a template-shaped STATE: header first, so the header/Goal hint cannot name the dir
+  const at = (body: string) => `# STATE\nActive skill: my-skill-execute\nGoal: bir iş\n\n${body}`
+  expect(planDirsFromState(at('## Files\n- Plan: .workflow/plans/eski/{PLAN,PROMPT,PROGRESS}.md\n'), dirs)).toEqual(['eski'])
+  expect(planDirsFromState(at('## Files\n- Plan: .workflow/plans/eski/\n'), dirs)).toEqual(['eski'])
+  expect(planDirsFromState(at('## Done\n- Progress: .workflow/plans/yeni/PROGRESS.md — 1/3 merged\n'), dirs)).toEqual(['yeni'])
+  expect(planDirsFromState(at('## Gotchas\n- bkz. plans/yeni/ klasörü\n'), dirs)).toEqual(['yeni'])
+  // the Plan: line wins even when another dir is mentioned more often
+  const both = at('## Done\n- Progress: .workflow/plans/yeni/PROGRESS.md\n- yeni: plans/yeni/ \n## Files\n- Plan: .workflow/plans/eski/{PLAN,PROGRESS}.md\n')
+  expect(planDirsFromState(both, dirs)[0]).toBe('eski')
+  // dirs that do not exist are still ignored
+  expect(planDirsFromState(at('- Plan: .workflow/plans/yok/{PLAN,PROGRESS}.md\n'), dirs)).toEqual([])
+})
+
+test('I3b: biten iş başlığı olan STATE.md genel merdivenden adım vermez', async () => {
+  const boxes = '## Done\n- [x] a\n## Remaining\n- [ ] b\n- [ ] c\n'
+  expect(genericSteps(boxes, true)).toHaveLength(3)
+  for (const header of [
+    'Phase: T21 bitti\nActive skill: none',
+    'Phase: DONE (3/3)',
+    'Phase: SAMPLE BUILD DONE 2026-11-10',
+    'Phase: SAMPLE BUILD DONE 2026-11-10 (alan açık, 38 kayıt eklendi). Next: onay',
+    'Active skill: none — shipped',
+    'Active skill: none (waiting on client)',
+    'Phase: Tamamlandı',
+    'Phase: v3 COMPLETE',
+    'Phase: yayında, PUBLISHED',
+  ]) {
+    expect(genericSteps(`${header}\n${boxes}`, true), header).toEqual([])
+  }
+  // still open: a running phase, orchestrate, a fraction that is not full, "done" inside prose
+  for (const header of [
+    'Phase: Execute (1/3)',
+    'Active skill: none (orchestrate)\nPhase: Diagnose (1/3)',
+    'Active skill: my-skill-execute\nPhase: Execute',
+    'Phase: W1 TAMAM ama kapısı kırmızı',
+    'Phase: 2 (done 1/3)',
+  ]) {
+    expect(genericSteps(`${header}\n${boxes}`, true), header).toHaveLength(3)
+  }
+  // other files are never judged by this header rule
+  expect(genericSteps(`Phase: DONE (3/3)\n${boxes}`, false)).toHaveLength(3)
+})
+
+test('I4: Done iç içe maddeleri, aralıklar (T2–T19) ve In progress altındaki [x]', async () => {
+  const ids = new Set(Array.from({ length: 30 }, (_, i) => `T${i + 1}`))
+  const state = parseState(
+    [
+      '## Done',
+      '- T1 spike PASS',
+      '  - T2–T4, T6-T8 merged',
+      '      - T10..T12 merged (nested deeper)',
+      '        - T20 too deep to count',
+      '- T14 → T15 ve T28—T30 tamam',
+      '## In progress',
+      '- [x] T22 — SIGNED OFF',
+      '- [ ] T23 — koşuyor',
+      '  - T24 nested notes under In progress stay out',
+    ].join('\n'),
+    ids,
+  )
+  expect([...state.done].sort((a, b) => Number(a.slice(1)) - Number(b.slice(1))).join(' ')).toBe(
+    'T1 T2 T3 T4 T6 T7 T8 T10 T11 T12 T14 T15 T22 T28 T29 T30',
+  )
+  expect([...state.inProgress]).toEqual(['T23'])
+  // a range outside the plan's ids credits only what the plan has; the expansion is capped
+  const wide = parseState('## Done\n- T1–T99999 merged\n', new Set(['T1', 'T500', 'T501']))
+  expect([...wide.done].sort()).toEqual([])
+  // different prefixes are no range
+  expect(parseState('## Done\n- T1–U3 x\n', new Set(['T1', 'T2', 'U3'])).done.has('T2')).toBe(false)
+  // nested bullets are not extra steps for the generic STATE reader
+  expect(genericSteps('## Done\n- a\n  - sub\n## Remaining\n- b\n', true)).toHaveLength(2)
+})
+
+test('I5: yalnız kimliksiz kurulum satırı olan Done güvenlik ağını tetiklemez', async () => {
+  const ids = new Set(['T1', 'T2'])
+  const head = 'Active skill: my-skill-execute\n'
+  // a checked setup line with no task id (branch, base) is no ledger the bar failed to read
+  expect(ledgerUnread(parseState(`${head}## Done\n- [x] Branch + BASE kaydı (1a2b3c4d)\n## In progress\n- T2 — x\n`, ids))).toBe(false)
+  // ids that are not the plan's: unreadable
+  expect(ledgerUnread(parseState(`${head}## Done\n- [x] Branch + BASE (1a2b3c4d)\n- [x] Z9 — başka plan\n`, ids))).toBe(true)
+  // a plan id present: read, no warning
+  expect(ledgerUnread(parseState(`${head}## Done\n- [x] Branch (1a2b3c4d)\n- [x] T1 — abc1234\n`, ids))).toBe(false)
+})
+
+// --- round 2 (review): bounded ranges, open-when-in-doubt headers, plan-dir order, nested Done ---
+
+test('R2-1: aralık genişletme sınırlı: dev sayılar, ters aralık, 500\'den geniş aralık hiçbir şey saymaz', async () => {
+  const ids = new Set(['T1', 'T2', 'T3', 'T500'])
+  const credited = (done: string) => [...parseState(`## Done\n- ${done}\n`, ids).done].sort()
+  expect(credited('T9007199254740993-T9007199254741999 merged')).toEqual([])
+  expect(credited(`T${'9'.repeat(320)}-T${'9'.repeat(320)} merged`)).toEqual([])
+  expect(credited('T3-T1 merged')).toEqual([])
+  expect(credited('T2-T2 merged')).toEqual([])
+  expect(credited('T1–T99999 merged')).toEqual([])
+  expect(credited('T1–T500 merged')).toEqual(['T1', 'T2', 'T3', 'T500'])
+  expect(credited('T1..T3 merged')).toEqual(['T1', 'T2', 'T3'])
+})
+
+test('R2-2: şüphede iş AÇIK sayılır; yalnız gerçekten biten başlık çubuğu gizler', async () => {
+  const boxes = '## Done\n- [x] a\n## Remaining\n- [ ] b\n- [ ] c\n'
+  const steps = (header: string) => genericSteps(`${header}\n${boxes}`, true).length
+  for (const header of [
+    'Phase: Complete the migration',
+    'Phase: done-criteria review (1/4)',
+    'Phase: done-criteria review',
+    'Phase: published checklist',
+    'Phase: shipping prep (2/3)',
+    'Phase: Faz 3 tamamlandı (Faz 4 sürüyor)',
+    'Active skill: my-skill-execute\nPhase: Execute — T12 DONE',
+    'Phase: Execute T21 done (T22 next)',
+    'Phase: Execute (3/5)',
+    'Phase: site-v2 build (2/4)',
+    'Active skill: my-skill-audit\nPhase: mods audit — report delivered (6/6)',
+    'Active skill: none\nPhase: Execute (2/5)',
+    'Active skill: none-yet',
+    'Phase: v1 shipped 2026-11-10 (v2 in progress)',
+  ]) {
+    expect(steps(header), header).toBe(3)
+  }
+  for (const header of [
+    'Active skill: none',
+    'Active skill: none — shipped',
+    'Active skill: none (waiting on client)',
+    'Active skill: none (orchestrate)',
+    'Phase: DONE (3/3)',
+    'Active skill: none\nPhase: T21 bitti',
+    'Active skill: orchestrate (örnek)\nPhase: SAMPLE BUILD DONE 2026-11-10 (alan açık)',
+  ]) {
+    expect(steps(header), header).toBe(0)
+  }
+})
+
+// --- round 3: a done word next to a running word, or after a part label, ends only that part ---
+
+test('R3-1: bitti kelimesinin yanında süren iş sözü ya da parça etiketi işi AÇIK tutar', async () => {
+  const boxes = '## Done\n- [x] a\n## Remaining\n- [ ] b\n- [ ] c\n'
+  const steps = (header: string) => genericSteps(`${header}\n${boxes}`, true).length
+  const orch = 'Active skill: my-skill-orchestrate\n'
+  for (const header of [
+    // N1: a running word after the done word (before the first `.` or `(`) or before it
+    `${orch}Phase: tamamlandı — Faz 4 başlıyor`,
+    'Active skill: orchestrate\nPhase: Audit DONE 2026-11-12, fixes next',
+    `${orch}Phase: Review done, verifying`,
+    'Active skill: orchestrate\nPhase: next: deploy; build done',
+    `${orch}Phase: DONE — sıradaki T4`,
+    `${orch}Phase: shipped, 2 remaining`,
+    // N1: the done word right after a part label finishes only that part
+    `${orch}Phase: Execute — Faz 2 tamamlandı`,
+    'Active skill: orchestrate\nPhase: Execute — T3 bitti',
+    `${orch}Phase: Faz 1 DONE`,
+    'Active skill: orchestrate (site build)\nPhase: Wave A done',
+    'Active skill: my-skill-ship\nPhase: Wave 2 shipped',
+    'Active skill: orchestrate\nPhase: F1b done',
+    'Active skill: orchestrate\nPhase: Step 3 complete',
+    // the review's required-open lines and its adversarial lines, still open
+    'Phase: Complete the migration',
+    'Phase: done-criteria review (1/4)',
+    'Phase: done-criteria review',
+    'Phase: published checklist',
+    'Phase: shipping prep (2/3)',
+    'Phase: Faz 3 tamamlandı (Faz 4 sürüyor)',
+    'Active skill: my-skill-execute\nPhase: Execute — T12 DONE',
+    'Phase: Execute T21 done (T22 next)',
+    'Phase: Execute (3/5)',
+    'Phase: site-v2 build (2/4)',
+    'Active skill: my-skill-audit\nPhase: mods audit — report delivered (6/6)',
+    'Active skill: orchestrate\nPhase: wave 1 DONE, wave 2 running',
+    'Active skill: my-skill-ship\nPhase: Build done; deploy pending',
+    'Active skill: orchestrate\nPhase: Review completed (fixes todo)',
+    'Active skill: my-skill-ship\nPhase: done · now verifying',
+    'Active skill: none-yet\nPhase: Execute (5/5) done, verify next',
+  ]) {
+    expect(steps(header), header).toBe(3)
+  }
+  for (const header of [
+    'Active skill: none',
+    'Active skill: none — shipped',
+    'Active skill: none (waiting on client)',
+    'Phase: DONE (3/3)',
+    'Active skill: none\nPhase: T21 bitti',
+    // "Active skill: none" alone ends the job, part label or not
+    'Active skill: none\nPhase: Wave 2 shipped',
+    // `Next` after the first `.` is a note about later work, not this job
+    'Active skill: orchestrate\nPhase: REBUILD DONE 2026-11-10 (details here). Next: owner to-dos',
+    'Phase: v3 COMPLETE',
+    'Active skill: orchestrate\nPhase: v3 COMPLETE',
+  ]) {
+    expect(steps(header), header).toBe(0)
+  }
+})
+
+test('R2-3: plan dizini sırası: Plan: satırı, sonra başlıktaki anış, sonra gövde; sayıma bakılmaz', async () => {
+  const dirs = ['eski', 'guncel']
+  const state = [
+    '# STATE',
+    'Progress: .workflow/plans/guncel/PROGRESS.md — 4 [x]',
+    '## Done',
+    '- bitti: plans/guncel/PROGRESS.md',
+    '## Files',
+    '- Arşiv: .workflow/plans/eski/PLAN.md',
+    '- eski notlar: plans/eski/tools/ ve plans/eski/PROMPT.md',
+  ].join('\n')
+  expect(planDirsFromState(state, dirs)).toEqual(['guncel', 'eski'])
+  // a Plan: line still wins over the header
+  expect(planDirsFromState(`${state}\n- Plan: .workflow/plans/eski/{PLAN,PROGRESS}.md`, dirs)[0]).toBe('eski')
+})
+
+test('R2-4: iç içe Done maddesi "T2 blocked" T2\'yi bitirmez; I5: sayısal kimlikli defter uyarır', async () => {
+  const ids = new Set(['T1', 'T2', 'T3'])
+  const state = parseState('## Done\n- T1 merged\n  - T2 blocked on owner\n  - T3 merged\n', ids)
+  expect([...state.done].sort()).toEqual(['T1', 'T3'])
+  const head = 'Active skill: my-skill-execute\n'
+  expect(ledgerUnread(parseState(`${head}## Done\n- [x] 12 — abc1234\n- [x] 13 — bcd2345\n`, ids))).toBe(true)
+  expect(ledgerUnread(parseState(`${head}## Done\n- [x] Branch + BASE kaydı (1a2b3c4d)\n`, ids))).toBe(false)
+})

@@ -18,6 +18,8 @@ export type OtomatikDevirChat = {
    * the first): the next wind-down needs the fill at max(threshold, floor + gap).
    */
   floor?: number
+  /** The fill when the latest wind-down began: past the trigger cap the next needs CAP_STEP more. */
+  triggerPercent?: number
   /** When the running wind-down began (epoch ms). */
   startedAt?: number
   /** The handoff file's absolute path, fixed when the wind-down began. */

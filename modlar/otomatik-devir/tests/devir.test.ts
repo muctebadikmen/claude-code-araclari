@@ -43,6 +43,17 @@ const setup = (on: any) => {
     order: [] as string[],
     compactMode: 'ok' as 'ok' | 'reject' | 'skip',
     onCompact: undefined as undefined | (() => Promise<void>),
+    /** `/compact` raises `session.compact` (trigger manual), as the host's command does; false: no event seen. */
+    compactEvent: true,
+    /** Once, when `/compact` is asked for and before the compaction starts (it waits for a running turn). */
+    onCompactRequest: undefined as undefined | (() => Promise<void>),
+    /** Once, after the compaction completed and before `/compact` resolves. */
+    afterCompact: undefined as undefined | (() => Promise<void>),
+    /** The conversation's size by the local estimate (`usage({ breakdown })`); undefined: no breakdown. */
+    tokens: undefined as number | undefined,
+    dropped: [] as string[],
+    /** The host rejects (throws on) the mod's own prompts. */
+    throwPlugin: false,
     dropPlugin: false,
     dropTyped: false,
     onSet: undefined as undefined | ((key: string, value: any) => Promise<void>),
@@ -67,7 +78,10 @@ const setup = (on: any) => {
   on('session.id', () => ({ value: world.sid }))
   on('session.root', () => ({ value: world.root }))
   on('session.cwd', () => ({ value: world.root }))
-  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 100, percent: world.percent }, rateLimits: [] } }))
+  on('session.usage', (_: any, e: any) => {
+    const breakdown = e?.breakdown !== undefined && world.tokens !== undefined ? { totalTokens: world.tokens } : undefined
+    return { value: { startedAt: 0, context: { window: 100, percent: world.percent, breakdown }, rateLimits: [] } }
+  })
   on('session.measure', (_: any, e: any) => ({ changed: e.changed }))
   on('session.compact', async (_: any, e: any) => {
     if (world.compactMode === 'reject') {
@@ -94,8 +108,19 @@ const setup = (on: any) => {
     world.commands.push(e)
     return { value: { command: e.name } }
   })
+  const once = async (key: 'onCompactRequest' | 'afterCompact') => {
+    const work = world[key]
+    world[key] = undefined
+    if (work !== undefined) await work()
+  }
   on('command.run', async (_: any, e: any) => {
     if (e.command !== 'compact') return {}
+    await once('onCompactRequest')
+    if (world.compactEvent) {
+      await engine.session.compact({ trigger: 'manual', instructions: e.args, messages: [{ role: 'user', text: 'konuşma', toolUses: [] }] })
+      await once('afterCompact')
+      return { text: '' }
+    }
     if (world.compactMode === 'reject') {
       if (world.onCompact !== undefined) await world.onCompact()
       throw new Error('a turn is running')
@@ -103,13 +128,21 @@ const setup = (on: any) => {
     world.compacts.push({ instructions: e.args })
     world.order.push('compact')
     if (world.onCompact !== undefined) await world.onCompact()
+    await once('afterCompact')
     return { text: '' }
   })
   on('agent.list', () => ({ value: world.agents }))
   on('tool.call', () => ({ result: {}, text: 'ok' }))
   on('prompt.submit', (_: any, e: any) => {
-    if (world.dropPlugin && e.origin?.kind === 'plugin') return { drop: 'host limit' }
-    if (world.dropTyped && e.origin?.kind === 'composer') return { drop: 'dropped beneath' }
+    if (world.throwPlugin && e.origin?.kind === 'plugin') throw new Error('host refused the prompt')
+    if (world.dropPlugin && e.origin?.kind === 'plugin') {
+      world.dropped.push(e.text)
+      return { drop: 'host limit' }
+    }
+    if (world.dropTyped && e.origin?.kind === 'composer') {
+      world.dropped.push(e.text)
+      return { drop: 'dropped beneath' }
+    }
     world.submitted.push({ text: e.text, asUser: e.origin?.asUser, context: e.context })
     world.order.push('submit')
     return { text: e.text, context: e.context }
@@ -165,7 +198,9 @@ const setup = (on: any) => {
 const devir = async ($: any, args: string): Promise<string> =>
   (await $.command.run({ command: 'devir', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } }))
     .text
-const start = ($: any) => $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+/** The engine's `$` of the running test (set by `start`): the harness raises host events through it. */
+let engine: any
+const start = ($: any) => (engine = $).session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
 let seq = 0
 const turnBegin = ($: any) => $.turn.start({ text: 'iş', turnId: `t${++seq}` })
 const turnEnd = async ($: any, clock: any, extra: Record<string, unknown> = {}) => {
@@ -291,7 +326,7 @@ describe('otomatik-devir v2', () => {
   test('canlı senaryo: dosya alt ajanlar ve shell\'ler sürerken yazıldı → tur sonunda hemen sıkıştır + gönder', async ($, on) => {
     const { world, clock } = setup(on)
     await start($)
-    for (let i = 1; i <= KEEP_DONE + 1; i += 1) writeFile(world, clock, 'eski', `/proj/.workflow/devir/x.done-2026-01-0${i}.md`)
+    for (let i = 1; i <= KEEP_DONE + 1; i += 1) writeFile(world, clock, 'eski', `/proj/.workflow/devir/${SID}.done-2026-01-0${i}.md`)
     await clock.advance(1000)
     expect(await ctx(windDownMidTurn($, world))).toEqual([windDownText(FILE)])
     world.agents = Array.from({ length: 5 }, (_, i) => ({ id: `a${i}`, description: 'iş', type: 'general-purpose', status: 'running' }))
@@ -514,7 +549,13 @@ describe('otomatik-devir v2', () => {
       await typed($, 'ne oluyor?')
     }
     await turnEnd($, clock)
-    expect(world.submitted).toEqual([{ text: 'ne oluyor?', asUser: undefined, context: [continuationText(PROMPT_TEXT)] }])
+    // Fix round 2 (owner decision 1): the prompt entered during the compaction goes through without the
+    // continuation; the continuation arrives once, after the compaction (no turn runs here: the mod's own prompt).
+    // Was: [{ text: 'ne oluyor?', asUser: undefined, context: [continuationText(PROMPT_TEXT)] }]
+    expect(world.submitted).toEqual([
+      { text: 'ne oluyor?', asUser: undefined, context: undefined },
+      { text: continuationText(PROMPT_TEXT), asUser: true, context: undefined },
+    ])
     expect(world.toasts).toContain(TOAST_DONE)
   })
 
@@ -806,5 +847,332 @@ describe('otomatik-devir v2', () => {
     await turnEnd($, clock)
     expect(continuations(world)).toEqual([{ text: continuationText(PROMPT_TEXT), asUser: true, context: undefined }])
     expect(world.toasts).toContain(TOAST_DONE)
+  })
+
+  // Fix list 2026-11-13, lane D: one regression test (or more) per fix.
+
+  const notification = ($: any, text: string, turnId?: string) =>
+    $.prompt.submit({ text, origin: { kind: 'task-notification' }, wait: false, ...(turnId === undefined ? {} : { turnId }) } as never)
+  /** Every place the continuation reached the model: own prompts, prompt context, tool-result context. */
+  const carried = (texts: readonly string[]) => texts.filter(t => t.startsWith(CONTINUE_PREFIX))
+
+  test('D1 (#12): /compact waits for a running turn; its prompts and tool results do not carry the continuation before the compaction', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    const seen: string[] = []
+    world.onCompactRequest = async () => {
+      await turnBegin($) // a task-notification woke the model before the compaction ran
+      seen.push(...(await ctx(bash($))))
+      seen.push(...(await ctx(notification($, '<task-notification>a</task-notification>', `t${seq}`))))
+      await turnEnd($, clock)
+    }
+    await turnEnd($, clock)
+    expect(carried(seen)).toEqual([])
+    expect(world.compacts).toHaveLength(1)
+    // Delivered once, after the compaction: as the mod's own prompt (nothing else was running).
+    expect(continuations(world)).toHaveLength(1)
+    expect(world.order.slice(world.order.indexOf('compact'))).toEqual(['compact', 'submit'])
+    const later = await notification($, '<task-notification>b</task-notification>')
+    expect(carried(later.context ?? [])).toEqual([])
+  })
+
+  test('D1 (#1, #2): a turn woken right after the compaction carries the continuation at its first tool result; no stale prompt follows', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    world.afterCompact = async () => {
+      await turnBegin($) // the task-notification queued during the compaction starts its turn
+    }
+    await turnEnd($, clock)
+    expect(world.compacts).toHaveLength(1)
+    expect(continuations(world)).toEqual([])
+    expect(await ctx(bash($))).toEqual([continuationText(PROMPT_TEXT)])
+    expect(carried(await ctx(bash($)))).toEqual([])
+    await turnEnd($, clock)
+    await clock.advance(1000)
+    expect(continuations(world)).toEqual([])
+    expect(world.toasts).toContain(TOAST_DONE)
+    expect(world.files[FILE]).toBeUndefined()
+  })
+
+  test('D1: a woken turn with no tool call gets the continuation as a prompt at its end, once', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    world.afterCompact = async () => {
+      await turnBegin($)
+    }
+    await turnEnd($, clock)
+    expect(continuations(world)).toEqual([])
+    await turnEnd($, clock)
+    expect(continuations(world)).toEqual([{ text: continuationText(PROMPT_TEXT), asUser: true, context: undefined }])
+    expect(world.toasts).toContain(TOAST_DONE)
+  })
+
+  test('D1: a prompt that enters after the compaction carries the continuation; the mod sends none of its own', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    let got: any
+    world.afterCompact = async () => {
+      got = await notification($, '<task-notification>c</task-notification>')
+    }
+    await turnEnd($, clock)
+    expect(got.context).toEqual([continuationText(PROMPT_TEXT)])
+    expect(continuations(world)).toEqual([])
+    expect(world.toasts).toContain(TOAST_DONE)
+  })
+
+  test('D2: after a give-up at a high fill the next wind-down is still reachable', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    world.percent = 90
+    await turnEnd($, clock)
+    await turnBegin($)
+    await turnEnd($, clock)
+    expect(world.toasts).toContain(TOAST_GAVE_UP)
+    expect(chat(world)).toMatchObject({ phase: 'idle', floor: 90 })
+    await turnBegin($)
+    expect(await ctx(bash($))).toEqual([]) // no loop at the give-up's own fill
+    world.percent = 96
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+  })
+
+  /** A wind-down record whose timers died with the old module: delivered, file written after it. */
+  const seedWinding = (world: any, isFileFresh = true) => {
+    world.store[KEY] = { isOn: true, threshold: 60, phase: 'winding', startedAt: NOW - 60_000, file: FILE, deliveredAt: NOW - 30_000, deliveredPercent: 65, deliveries: 1 }
+    world.files[FILE] = { text: PROMPT_TEXT, mtimeMs: isFileFresh ? NOW - 10_000 : NOW - 3600_000 }
+    world.percent = 70
+  }
+
+  test('D3: after a reload or restart, a winding record is driven on when no turn runs', async ($, on) => {
+    const { world, clock } = setup(on)
+    seedWinding(world)
+    await start($)
+    await clock.advance(10_000)
+    expect(world.order).toEqual(['compact', 'submit'])
+    expect(continuations(world)).toHaveLength(1)
+  })
+
+  test('D3: after a reload inside a running turn, only that turn\'s end drives it (no double drive)', async ($, on) => {
+    const { world, clock } = setup(on)
+    seedWinding(world)
+    await start($)
+    await step($, 'tr')
+    await clock.advance(10_000)
+    expect(world.compacts).toEqual([])
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 'tr', reason: 'answer' })
+    await clock.advance(10_000)
+    expect(world.order).toEqual(['compact', 'submit'])
+  })
+
+  test('D4: a skipped /compact is a failure: no continuation into the full chat, retried, then given up', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    world.compactMode = 'skip'
+    await turnEnd($, clock)
+    expect(world.compacts).toHaveLength(1)
+    expect(continuations(world)).toEqual([])
+    expect(chat(world)).toMatchObject({ phase: 'winding', compactFails: 1 })
+    expect(world.files[FILE]?.text).toBe(PROMPT_TEXT)
+    await clock.advance(COMPACT_RETRY_MS * MAX_COMPACT_FAILS * MAX_COMPACT_FAILS)
+    expect(world.compacts).toHaveLength(MAX_COMPACT_FAILS)
+    expect(world.toasts).toContain(TOAST_GAVE_UP)
+    expect(continuations(world)).toEqual([])
+  })
+
+  test('D4 (round 2): with no compaction event either way, a resolved /compact is trusted as in v2.0.0', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    world.compactEvent = false
+    world.tokens = 120_000 // the local estimate does not move: no longer read
+    await turnEnd($, clock)
+    expect(world.compacts).toHaveLength(1)
+    expect(continuations(world)).toHaveLength(1)
+    expect(chat(world)).toMatchObject({ phase: 'idle', handoffs: 1 })
+    expect(world.toasts).not.toContain(TOAST_GAVE_UP)
+  })
+
+  test('D5: a dropped wind-down prompt leaves no "handoff cancelled" note behind', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await devir($, 'ac')
+    world.dropPlugin = true
+    await devir($, 'simdi')
+    await clock.advance(100)
+    expect(world.toasts).toContain(TOAST_GAVE_UP)
+    world.dropPlugin = false
+    await clock.advance(1000)
+    expect((await typed($, 'devam')).context ?? []).toEqual([])
+    await turnBegin($)
+    expect(await ctx(bash($))).toEqual([])
+    expect([...world.dropped, ...world.submitted.map(s => s.text)]).not.toContain(RESUME_NOTE)
+  })
+
+  test('D6: archiving prunes only this chat\'s used files', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    const other = Array.from({ length: KEEP_DONE + 2 }, (_, i) => `/proj/.workflow/devir/s9.done-2026-02-0${i + 1}.md`)
+    for (const file of other) writeFile(world, clock, 'başka sohbet', file)
+    for (let i = 1; i <= KEEP_DONE + 1; i += 1) writeFile(world, clock, 'eski', `/proj/.workflow/devir/${SID}.done-2026-01-0${i}.md`)
+    await clock.advance(1000)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    await turnEnd($, clock)
+    expect(continuations(world)).toHaveLength(1)
+    for (const file of other) expect(world.files[file]).toBeDefined()
+    expect(Object.keys(world.files).filter(p => p.includes(`/${SID}.done-`))).toHaveLength(KEEP_DONE)
+  })
+
+  test('D7: parallel tool results carry the cancel note once', async ($, on) => {
+    const { world } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    await devir($, 'kapat')
+    const got = await Promise.all([bash($), bash($), bash($)])
+    expect(got.flatMap(r => r.context ?? [])).toEqual([RESUME_NOTE])
+  })
+
+  test('D7: parallel tool results after the end note each count toward the abort', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    const turnId = await toEndNote($, world, clock)
+    await Promise.all([bash($), bash($), bash($)])
+    await clock.advance(100)
+    expect(chat(world).toolsSinceEndNote).toBe(3)
+    expect(world.aborts).toEqual([turnId])
+  })
+
+  // Fix round 2 (review-devir.md): the reviewer's probes, then one test per remaining finding.
+
+  test('PROBE-1: prompt typed during a compaction that is then skipped: continuation reaches the model once, after a compaction', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    world.compactMode = 'skip'
+    let got: any
+    world.onCompact = async () => { world.onCompact = undefined; got = await typed($, 'ne oluyor?') }
+    await turnEnd($, clock)
+    world.compactMode = 'ok'
+    await clock.advance(COMPACT_RETRY_MS * 3)
+    const all = [...(got?.context ?? []), ...continuations(world).map((c: any) => c.text)].filter((t: string) => t.startsWith(CONTINUE_PREFIX))
+    expect(all).toHaveLength(1)
+  })
+
+  test('PROBE-2: a precompute while /compact waits for a running turn does not let that turn carry the continuation', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    const seen: string[] = []
+    world.onCompactRequest = async () => {
+      await turnBegin($)
+      await engine.session.compact({ trigger: 'precompute', messages: [{ role: 'user', text: 'x', toolUses: [] }] })
+      seen.push(...(await ctx(bash($))))
+      await turnEnd($, clock)
+    }
+    await turnEnd($, clock)
+    expect(seen.filter(t => t.startsWith(CONTINUE_PREFIX))).toEqual([])
+  })
+
+  test('R2-2: a compaction that is not the mod\'s own (other instructions) does not count for the handover', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    const seen: string[] = []
+    world.onCompactRequest = async () => {
+      await turnBegin($)
+      await engine.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'x', toolUses: [] }] })
+      seen.push(...(await ctx(bash($))))
+      await turnEnd($, clock)
+    }
+    await turnEnd($, clock)
+    expect(seen.filter(t => t.startsWith(CONTINUE_PREFIX))).toEqual([])
+    expect(continuations(world)).toHaveLength(1)
+  })
+
+  test('R2-4: the re-drive after a reload neither resends nor gives up; a real turn end does', async ($, on) => {
+    const { world, clock } = setup(on)
+    seedWinding(world, false) // delivered, file not written since
+    await start($)
+    await clock.advance(10_000)
+    expect(world.submitted).toEqual([])
+    expect(world.toasts).not.toContain(TOAST_GAVE_UP)
+    expect(chat(world).phase).toBe('winding')
+    expect(chat(world).resends ?? 0).toBe(0)
+    await turnBegin($)
+    await turnEnd($, clock)
+    expect(world.submitted.map(s => s.text)).toEqual([RESEND_PREFIX + windDownText(FILE)])
+  })
+
+  test('R2-4: the re-drive after a reload delivers a wind-down that was never delivered', async ($, on) => {
+    const { world, clock } = setup(on)
+    world.store[KEY] = { isOn: true, threshold: 60, phase: 'winding', startedAt: NOW - 60_000, file: FILE }
+    await start($)
+    await clock.advance(10_000)
+    expect(world.submitted.map(s => s.text)).toEqual([windDownText(FILE)])
+  })
+
+  test('R2-5: the end-turn note does not ride in the tool result that carries the continuation', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    let first: readonly string[] = []
+    world.afterCompact = async () => {
+      await turnBegin($)
+      first = await ctx(bash($)) // before the finish saved the record idle
+    }
+    await turnEnd($, clock)
+    expect(first).toEqual([continuationText(PROMPT_TEXT)])
+    expect(continuations(world)).toEqual([])
+  })
+
+  test('R2-6: when the mod\'s own continuation prompt errors, it goes to the prompt box and is reported undelivered', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await windDownMidTurn($, world)
+    writeFile(world, clock)
+    world.throwPlugin = true
+    await turnEnd($, clock)
+    expect(world.compacts).toHaveLength(1)
+    expect(world.fills).toEqual([continuationText(PROMPT_TEXT)])
+    expect(world.toasts).toContain(toastUndelivered(FILE))
+    expect(world.toasts).not.toContain(TOAST_DONE)
+    expect(world.files[FILE]?.text).toBe(PROMPT_TEXT)
+  })
+
+  test('R2-7: above the 95% cap a new wind-down needs 5 points over the fill at the previous trigger', async ($, on) => {
+    const { world, clock } = setup(on)
+    await start($)
+    await devir($, 'ac 90')
+    await turnBegin($)
+    world.percent = 95
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
+    world.percent = 96
+    await turnEnd($, clock)
+    await turnBegin($)
+    await turnEnd($, clock)
+    expect(world.toasts).toContain(TOAST_GAVE_UP)
+    expect(chat(world)).toMatchObject({ phase: 'idle', floor: 96 })
+    await turnBegin($)
+    world.percent = 97
+    expect(await ctx(bash($))).toEqual([])
+    world.percent = 99
+    expect(await ctx(bash($))).toEqual([])
+    world.percent = 100
+    expect(await ctx(bash($))).toEqual([windDownText(FILE)])
   })
 })

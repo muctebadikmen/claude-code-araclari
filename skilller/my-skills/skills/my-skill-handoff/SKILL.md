@@ -14,6 +14,7 @@ Run on request, or when a message gives a target path for the continuation promp
 ## Steps
 
 1. **Reconcile.** Dispatch the agent in `references/reconcile.md`; it does all the inspecting.
+   - Target path given: no sub-agents: dispatch nothing. Check PROGRESS.md / STATE.md against `git status --short`, `git log -15 --oneline`, `git worktree list` only; same four facts.
 2. **Fix state.** Rewrite `.workflow/STATE.md` from the agent's delta, keeping its headings.
    - No ledger: Done = verification passed or a commit exists; otherwise In progress with the reason.
    - Ledger plan (orchestrate's `progress-template.md`): in PROGRESS.md set merge commit → `[x]`, unmerged dispatch → `[~]` with a note, keep `[!]`; make STATE's `Progress:` count match.

@@ -27,7 +27,7 @@ You are the orchestrator: decide, dispatch, relay results, keep state. Sub-agent
 - **Stop point (🛑).** Write STATE.md, report found / done / next in three lines, wait. Non-stop skills (execute) skip the wait.
 - **Questions.** Agents look up facts and follow dispatch-template's ambiguity rule; ask the user only for decisions: AskUserQuestion, ≤4 per call, recommended answer first, marked "(Recommended)" and worded so "yes" accepts it. Execute, ship and handoff ask nothing.
 - **Portals.** Before sending the user to a portal or console, dispatch a diagnosis.
-- **Handoff.** On "Context handoff point reached": start nothing new, let running agents finish, run `my-skill-handoff` with the given path, end the turn. Otherwise run it only when the user asks.
+- **Handoff.** On "Context handoff point reached": start nothing new, do not wait for running agents; list them in the continuation prompt (results arrive after compaction), run `my-skill-handoff` with the given path, end the turn. Otherwise run it only when the user asks.
 
 ## Model routing
 

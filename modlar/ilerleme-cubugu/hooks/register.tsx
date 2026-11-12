@@ -21,6 +21,8 @@ const isHidden = atom({ plugin: 'ilerleme-cubugu', key: 'isHidden' } as const, f
 const isExpanded = atom({ plugin: 'ilerleme-cubugu', key: 'isExpanded' } as const, false)
 const engagedSid = atom({ plugin: 'ilerleme-cubugu', key: 'engagedSid' } as const, null)
 const isUnread = atom({ plugin: 'ilerleme-cubugu', key: 'isUnread' } as const, false)
+// when the task list was first seen with every task completed; null while it is open
+const tasksDoneAt = atom({ plugin: 'ilerleme-cubugu', key: 'tasksDoneAt' } as const, null)
 
 const HIDE_MS = 4000
 const TICK_MS = 5000
@@ -111,6 +113,12 @@ const newest = (list: (Found | undefined)[]) =>
   list.filter(one => one !== undefined).sort((a, b) => b.mtimeMs - a.mtimeMs)
 
 let seen = ''
+// last stat of each plan dir's PLAN.md / PROGRESS.md; between full looks only the `hot` dirs
+// (the plan in use and the newest one) are stat'ed again
+const dirStats = new Map<string, { plan?: Found; ledger?: Found }>()
+let hot = new Set<string>()
+let ticks = 0
+const FULL_EVERY = 6
 // one interval per process: a repeated session.start replaces it, never stacks a second one
 let ticker: Timer | undefined
 
@@ -118,11 +126,21 @@ let ticker: Timer | undefined
 // a my-skill plan (the one STATE.md names, else the newest .workflow/plans/*/PLAN.md)
 // with its status from its PROGRESS.md ledger, else from STATE.md; then the generic ladder on PLAN.md,
 // .workflow/PLAN.md, STATE.md and the newest plan, newest first.
-async function refreshPlan($: $) {
+async function refreshPlan($: $, full = true) {
   const entries = await $.fs.list('.workflow/plans').catch(() => [])
   const dirs = entries.filter(entry => entry.kind === 'dir').map(entry => entry.name)
-  const plans = await Promise.all(dirs.map(dir => statFile($, planPath(dir))))
-  const ledgers = await Promise.all(dirs.map(dir => statFile($, progressPath(dir))))
+  for (const dir of dirStats.keys()) if (!dirs.includes(dir)) dirStats.delete(dir)
+  const stats = await Promise.all(
+    dirs.map(async dir => {
+      const known = dirStats.get(dir)
+      if (!full && known && !hot.has(dir)) return known
+      const fresh = { plan: await statFile($, planPath(dir)), ledger: await statFile($, progressPath(dir)) }
+      dirStats.set(dir, fresh)
+      return fresh
+    }),
+  )
+  const plans = stats.map(one => one.plan)
+  const ledgers = stats.map(one => one.ledger)
   const fixed = await Promise.all(['PLAN.md', '.workflow/PLAN.md', STATE_PATH].map(path => statFile($, path)))
 
   // re-read only when any file consulted changed (or appeared, or went away)
@@ -143,42 +161,55 @@ async function refreshPlan($: $) {
   const [active] = newest(plans)
   const named = state ? planDirsFromState(stateText, dirs.filter((_, i) => plans[i] !== undefined)) : []
 
-  let mine: { plan: MsPlan; found: Found; isNamed: boolean; dir: string } | undefined
+  type Mine = { plan: MsPlan; found: Found; isNamed: boolean; dir: string }
+  const stepsOf = async (one: Mine) => {
+    // an unnamed plan newer than STATE.md is not what STATE.md's ids are about
+    const credit = state !== undefined && (one.isNamed || state.mtimeMs >= one.found.mtimeMs)
+    const ids = new Set(one.plan.ids)
+    const status = credit ? parseState(stateText, ids) : undefined
+    // the plan's own ledger always belongs to it, and decides over STATE.md (Decision 6)
+    const ledger = ledgers[dirs.indexOf(one.dir)]
+    if (ledger) return { steps: mySkillSteps(one.plan, mergeProgress(parseProgress(await load(ledger.path), ids), status)), unread: false }
+    const steps = mySkillSteps(one.plan, status)
+    return { steps, unread: status !== undefined && ledgerUnread(status) }
+  }
+
+  // of the plans STATE.md names, in order, the first with a step still open; when every
+  // named plan is complete, the first one (a later plan's files are read only after the
+  // earlier ones turned out complete)
+  let mine: Mine | undefined
+  let result: { steps: Adim[]; unread: boolean } | undefined
   for (const dir of named) {
     const found = plans[dirs.indexOf(dir)]
     const parsed = found && parseMsPlan(await load(found.path))
-    if (found && parsed) {
-      mine = { plan: parsed, found, isNamed: true, dir }
+    if (!found || !parsed) continue
+    const one = { plan: parsed, found, isNamed: true, dir }
+    const got = await stepsOf(one)
+    if (!mine) [mine, result] = [one, got]
+    if (got.steps.some(step => step.status !== 'completed')) {
+      ;[mine, result] = [one, got]
       break
     }
   }
   if (!mine && active) {
     const parsed = parseMsPlan(await load(active.path))
-    if (parsed) mine = { plan: parsed, found: active, isNamed: false, dir: dirs[plans.indexOf(active)] ?? '' }
-  }
-
-  let steps: Adim[] = []
-  let unread = false
-  if (mine) {
-    // an unnamed plan newer than STATE.md is not what STATE.md's ids are about
-    const credit = state !== undefined && (mine.isNamed || state.mtimeMs >= mine.found.mtimeMs)
-    const ids = new Set(mine.plan.ids)
-    const status = credit ? parseState(stateText, ids) : undefined
-    // the plan's own ledger always belongs to it, and decides over STATE.md (Decision 6)
-    const ledger = ledgers[dirs.indexOf(mine.dir)]
-    if (ledger) {
-      steps = mySkillSteps(mine.plan, mergeProgress(parseProgress(await load(ledger.path), ids), status))
-    } else {
-      steps = mySkillSteps(mine.plan, status)
-      unread = status !== undefined && ledgerUnread(status)
+    if (parsed) {
+      mine = { plan: parsed, found: active, isNamed: false, dir: dirs[plans.indexOf(active)] ?? '' }
+      result = await stepsOf(mine)
     }
   }
+
+  hot = new Set([mine?.dir ?? '', active ? (dirs[plans.indexOf(active)] ?? '') : ''])
+  let steps: Adim[] = result?.steps ?? []
+  let unread = result?.unread ?? false
   // an all-done my-skill plan yields to anything else open; kept, it lets reconcile
   // flash "✓ Tamamlandı" for a job it saw run
   if (steps.every(one => one.status === 'completed')) {
     const skip = new Set([mine?.found.path, mine?.isNamed ? STATE_PATH : undefined])
-    for (const { path } of newest([...fixed, active])) {
-      if (skip.has(path)) continue
+    // after a finished plan only a file written since then is new work (an ended STATE.md never is)
+    const since = mine && steps.length > 0 ? Math.max(mine.found.mtimeMs, ledgers[dirs.indexOf(mine.dir)]?.mtimeMs ?? 0) : 0
+    for (const { path, mtimeMs } of newest([...fixed, active])) {
+      if (skip.has(path) || mtimeMs <= since) continue
       const found = genericSteps(await load(path), path === STATE_PATH)
       if (found.length > 0 && (steps.length === 0 || found.some(one => one.status !== 'completed'))) {
         steps = found
@@ -210,8 +241,26 @@ async function engage($: $) {
   await reconcile($)
 }
 
+// A task list whose every task is completed, once the "✓ Tamamlandı" delay has passed, is a
+// finished job: it no longer stands in for the plan files. A new task starts a fresh list.
+async function liveTasks($: $) {
+  const list = await read($, tasks)
+  const at = await read($, tasksDoneAt)
+  if (list.length === 0 || !list.every(isDone)) {
+    if (at !== null) await update($, tasksDoneAt, () => null).catch(() => undefined)
+    return list
+  }
+  const now = await $.clock.now()
+  if (at === null) {
+    // also called while rendering: a failed write must never escape
+    await update($, tasksDoneAt, () => now).catch(() => undefined)
+    return list
+  }
+  return now - at > HIDE_MS ? [] : list
+}
+
 async function activeSteps($: $) {
-  const fromTasks = await read($, tasks)
+  const fromTasks = await liveTasks($)
   if (fromTasks.length > 0) return fromTasks
   return (await isEngaged($)) ? await read($, plan) : []
 }
@@ -235,8 +284,9 @@ async function reconcile($: $) {
   if (after !== before) await update($, job, () => after)
 }
 
-async function tick($: $) {
-  if ((await read($, tasks)).length === 0 && (await isEngaged($))) await refreshPlan($)
+// `timer` ticks look at every plan dir only each FULL_EVERY-th time
+async function tick($: $, timer = false) {
+  if ((await liveTasks($)).length === 0 && (await isEngaged($))) await refreshPlan($, !timer || ++ticks % FULL_EVERY === 0)
   await reconcile($)
 }
 
@@ -254,7 +304,7 @@ export const register: Register = on => {
       immediate: true,
     })
     ticker?.cancel()
-    ticker = $.clock.every(TICK_MS, () => void tick($).catch(() => undefined))
+    ticker = $.clock.every(TICK_MS, () => void tick($, true).catch(() => undefined))
     await tick($).catch(() => undefined)
 
     return next(e)
@@ -294,6 +344,8 @@ export const register: Register = on => {
     try {
       if (tool === 'TodoWrite') {
         await update($, tasks, () => fromTodos(args.todos))
+        // a list that arrives already complete gets its own hide delay
+        await update($, tasksDoneAt, () => null)
       } else if (tool === 'TaskCreate') {
         const id = createdId(ran) ?? `tu:${e.tool_use_id}`
         const step: Adim = {
@@ -368,7 +420,11 @@ export const register: Register = on => {
   // another conversation, with no session.start: nothing of the old one carries over.
   on('session.end', async ($, e, next) => {
     seen = ''
+    dirStats.clear()
+    hot.clear()
+    ticks = 0
     await update($, tasks, () => [])
+    await update($, tasksDoneAt, () => null)
     await update($, plan, () => [])
     await update($, job, () => ({ startedAt: null, doneAt: null }))
     await update($, engagedSid, () => null)
@@ -412,7 +468,7 @@ async function ownRows($: $, e: RenderInput<'AbovePrompt'>): Promise<RenderEleme
 
   const total = steps.length
   // the safety net speaks for the plan files only, never for a task list
-  const warn = (await read($, tasks)).length === 0 && (await read($, isUnread)) ? UNREAD : ''
+  const warn = (await liveTasks($)).length === 0 && (await read($, isUnread)) ? UNREAD : ''
   const head = `${bar(done, total)} ${done}/${total} · %${Math.round((done / total) * 100)} · ${warn}`
   const running = steps.filter(isRunning)
   const next = steps.find(one => !isDone(one))

@@ -21,6 +21,8 @@ declare module 'claude-code' {
       engagedSid: string | null
       /** execute runs a plan whose STATE.md Done names no plan id and that has no PROGRESS.md */
       isUnread: boolean
+      /** when the task list was first seen with every task completed; null while it is open */
+      tasksDoneAt: number | null
     }
   }
 }

@@ -725,3 +725,199 @@ test('/ilerleme GİZLE ve GIZLE de çubuğu gizler, GÖSTER geri getirir', async
     expect(await bar()).toBeDefined()
   }
 })
+
+// --- 0.4.0 fixes: I2 (finished task list), I3a (finished plan hands nothing over) ---
+
+type Fake = Record<string, { source: string; mtimeMs: number }>
+
+// a mocked project: plan dirs + files, ids T1..T3 in `ornek-plan`
+const fakeProject = (on: TestOn, dirs: string[], files: Fake) => {
+  const calls = { stats: 0, reads: [] as string[] }
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text key="engine">engine</Text>
+  })
+  on('fs.list', (_, e) =>
+    e.path.endsWith('/.workflow/plans')
+      ? { value: dirs.map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })) }
+      : Promise.reject(new Error('ENOENT')),
+  )
+  const fileAt = (path: string) => Object.entries(files).find(([name]) => path.endsWith(`/${name}`))?.[1]
+  on('fs.stat', (_, e) => {
+    calls.stats++
+    const file = fileAt(e.path)
+    return file
+      ? { value: { kind: 'file' as const, size: file.source.length, mtimeMs: file.mtimeMs, isLink: false } }
+      : Promise.reject(new Error('ENOENT'))
+  })
+  on('fs.read', (_, e) => {
+    calls.reads.push(e.path)
+    const file = fileAt(e.path)
+    return file ? { value: file.source } : Promise.reject(new Error('ENOENT'))
+  })
+  on('session.id', () => ({ value: 's1' }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('command.register', () => ({ value: undefined }) as never)
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('tool.call', () => ({ result: {}, text: 'ok' }))
+  return calls
+}
+
+const ORNEK_PLAN = ['# PLAN ornek', '- id: T1', '  goal: Bir', '- id: T2', '  goal: İki', '- id: T3', '  goal: Üç'].join('\n')
+const touch = async ($: TestEngine, files: Fake, name: string, change: (source: string) => string, at?: number) => {
+  const file = files[name]
+  if (!file) throw new Error(name)
+  file.source = change(file.source)
+  file.mtimeMs = at ?? file.mtimeMs + 10
+  await $.tool.call({ tool: 'Edit', file_path: name, old_string: 'a', new_string: 'b' } as never)
+}
+
+test('I2: biten görev listesi, bekleme süresinden sonra plan çubuğunu gizlemez', async ($, on) => {
+  const clock = mock.clock(on, { now: 20_000_000 })
+  const files: Fake = {
+    '.workflow/plans/ornek-plan/PLAN.md': { source: ORNEK_PLAN, mtimeMs: 10 },
+    '.workflow/plans/ornek-plan/PROGRESS.md': { source: '- [x] T1 — abc1234\n- [~] T2 —\n- [ ] T3 —\n', mtimeMs: 20 },
+  }
+  fakeProject(on, ['ornek-plan'], files)
+  await $.session.start(START)
+
+  await $.tool.call(todos(['completed', 'in_progress']) as never)
+  await $.tool.call(todos(['completed', 'completed']) as never)
+  expect(await toggleText($)).toBe('▓▓ 2/2 · %100 · ✓ Tamamlandı')
+  await clock.advance(5000)
+  expect(await toggleText($)).toBeUndefined()
+
+  // the later plan run: the finished list no longer stands in for it
+  await $.prompt.submit(prompt('PROGRESS.md güncel mi?'))
+  expect(await toggleText($)).toBe('▓░░ 1/3 · %33 · Şu an: T2 · İki')
+  // and the 5-second tick keeps it fresh
+  await touch($, files, '.workflow/plans/ornek-plan/PROGRESS.md', source => source.replace('[~] T2', '[x] T2'))
+  await clock.advance(5000)
+  expect(await toggleText($)).toBe('▓▓░ 2/3 · %67 · Sıradaki: T3 · Üç')
+
+  // a new TaskCreate / TodoWrite still starts a fresh list of its own
+  await $.tool.call(todos(['pending']) as never)
+  expect(await toggleText($)).toBe('░ 0/1 · %0 · Sıradaki: Adım 1')
+})
+
+test('I3a: biten planın çubuğu eski genel dosyaya ya da bitmiş STATE.md\'ye geçmez', async ($, on) => {
+  const clock = mock.clock(on, { now: 21_000_000 })
+  const files: Fake = {
+    '.workflow/plans/ornek-plan/PLAN.md': { source: ORNEK_PLAN, mtimeMs: 100 },
+    '.workflow/plans/ornek-plan/PROGRESS.md': { source: '- [x] T1 — a1b2c3d\n- [x] T2 — b2c3d4e\n- [x] T3 — c3d4e5f\n', mtimeMs: 110 },
+    // older than the finished plan: a leftover checklist
+    'PLAN.md': { source: '- [x] eski\n- [ ] bir\n- [ ] iki\n', mtimeMs: 50 },
+  }
+  fakeProject(on, ['ornek-plan'], files)
+  await $.session.start(START)
+
+  await $.prompt.submit(prompt('PROGRESS.md güncel mi?'))
+  expect(await toggleText($)).toBeUndefined()
+
+  // a checklist edited after the plan finished is new work: it may take over
+  await touch($, files, 'PLAN.md', source => `${source}- [ ] üç\n`, 300)
+  expect(await toggleText($)).toBe('▓░░░ 1/4 · %25 · Sıradaki: bir')
+  delete files['PLAN.md']
+
+  // a newer STATE.md that says the job is over is no new work, whatever boxes it holds
+  files['.workflow/STATE.md'] = {
+    source: 'Active skill: none — shipped\nPhase: ornek (3/3)\n## Done\n- [x] T1 — a1b2c3d\n## Remaining\n- [ ] Sahibi kuracak\n- [ ] Not\n',
+    mtimeMs: 400,
+  }
+  await $.tool.call({ tool: 'Edit', file_path: '.workflow/STATE.md', old_string: 'a', new_string: 'b' } as never)
+  // (the checklist job seen running just before ends with its one "✓ Tamamlandı", then nothing)
+  await clock.advance(5000)
+  expect(await toggleText($)).toBeUndefined()
+})
+
+test('I6: etkin olmayan plan dizinleri her 5 sn değil, 6 tikte bir stat edilir', async ($, on) => {
+  const clock = mock.clock(on, { now: 22_000_000 })
+  const dirs = Array.from({ length: 20 }, (_, i) => `plan-${i + 1}`)
+  const files: Fake = { '.workflow/plans/plan-20/PLAN.md': { source: ORNEK_PLAN, mtimeMs: 100 } }
+  dirs.slice(0, 19).forEach((dir, i) => {
+    files[`.workflow/plans/${dir}/PLAN.md`] = { source: '# eski\n', mtimeMs: 10 + i }
+    files[`.workflow/plans/${dir}/PROGRESS.md`] = { source: '- [x] T1 — eski\n', mtimeMs: 10 + i }
+  })
+  files['.workflow/plans/plan-20/PROGRESS.md'] = { source: '- [x] T1 — a1b2c3d\n- [~] T2 —\n- [ ] T3 —\n', mtimeMs: 101 }
+  const calls = fakeProject(on, dirs, files)
+  await $.session.start(START)
+  await $.prompt.submit(prompt('PROGRESS.md güncel mi?'))
+  expect(await toggleText($)).toBe('▓░░ 1/3 · %33 · Şu an: T2 · İki')
+
+  // five timer ticks look at the active plan only; the sixth looks at every dir again
+  const perTick: number[] = []
+  for (let i = 0; i < 6; i++) {
+    calls.stats = 0
+    await clock.advance(5000)
+    perTick.push(calls.stats)
+  }
+  expect(Math.max(...perTick.slice(0, 5))).toBeLessThanOrEqual(7)
+  expect(perTick[5]).toBe(2 * dirs.length + 3)
+
+  // a change in an old dir is seen within the 6 ticks
+  const old = files['.workflow/plans/plan-1/PLAN.md']
+  if (!old) throw new Error('fixture')
+  old.mtimeMs = 500
+  old.source = ORNEK_PLAN
+  files['.workflow/plans/plan-1/PROGRESS.md'] = { source: '- [x] T1 —\n- [x] T2 —\n- [~] T3 —\n', mtimeMs: 501 }
+  await clock.advance(6 * 5000)
+  expect(await toggleText($)).toBe('▓▓░ 2/3 · %67 · Şu an: T3 · Üç')
+})
+
+test('R2-5: tek TodoWrite ile gelen tamamen bitmiş liste de kendi bekleme süresini alır', async ($, on) => {
+  const clock = mock.clock(on, { now: 23_000_000 })
+  const files: Fake = {
+    '.workflow/plans/ornek-plan/PLAN.md': { source: ORNEK_PLAN, mtimeMs: 10 },
+    '.workflow/plans/ornek-plan/PROGRESS.md': { source: '- [x] T1 — abc1234\n- [~] T2 —\n- [ ] T3 —\n', mtimeMs: 20 },
+  }
+  fakeProject(on, ['ornek-plan'], files)
+  await $.session.start(START)
+  await $.tool.call(todos(['completed', 'in_progress']) as never)
+  await $.tool.call(todos(['completed', 'completed']) as never)
+  await clock.advance(5000)
+  await $.prompt.submit(prompt('PROGRESS.md güncel mi?'))
+  expect(await toggleText($)).toBe('▓░░ 1/3 · %33 · Şu an: T2 · İki')
+
+  // a second list that arrives already complete is a finished list for 4 s too: it holds the band with its own "✓ Tamamlandı"
+  await $.tool.call(todos(['completed']) as never)
+  expect(await toggleText($)).toBe('▓ 1/1 · %100 · ✓ Tamamlandı')
+  await clock.advance(5000)
+  expect(await toggleText($)).toBe('▓░░ 1/3 · %33 · Şu an: T2 · İki')
+})
+
+// --- round 3: STATE.md names a finished plan before a running one ---
+
+test('R3-2: STATE.md iki plan anınca bitmiş olanı geçip açık adımı olan planı gösterir', async ($, on) => {
+  const clock = mock.clock(on, { now: 24_000_000 })
+  const files: Fake = {
+    // the finished plan is the newer one and STATE.md names it first (a stale Plan: line)
+    '.workflow/plans/eski/PLAN.md': { source: ORNEK_PLAN, mtimeMs: 200 },
+    '.workflow/plans/eski/PROGRESS.md': { source: '- [x] T1 — a1b2c3d\n- [x] T2 — b2c3d4e\n- [x] T3 — c3d4e5f\n', mtimeMs: 210 },
+    '.workflow/plans/guncel/PLAN.md': { source: ORNEK_PLAN, mtimeMs: 100 },
+    '.workflow/plans/guncel/PROGRESS.md': { source: '- [x] T1 — abc1234\n- [~] T2 —\n- [ ] T3 —\n', mtimeMs: 110 },
+    '.workflow/STATE.md': {
+      source: '# STATE\nActive skill: my-skill-execute\nProgress: .workflow/plans/guncel/PROGRESS.md\n## Files\n- Plan: .workflow/plans/eski/PLAN.md\n',
+      mtimeMs: 120,
+    },
+  }
+  const { reads } = fakeProject(on, ['eski', 'guncel'], files)
+  await $.session.start(START)
+  await $.prompt.submit(prompt('PROGRESS.md güncel mi?'))
+  expect(await toggleText($)).toBe('▓░░ 1/3 · %33 · Şu an: T2 · İki')
+
+  // when the first named plan is the running one, the later named plan is not read at all
+  const eski = files['.workflow/plans/eski/PROGRESS.md']
+  if (!eski) throw new Error('fixture')
+  eski.source = '- [x] T1 — a1b2c3d\n- [ ] T2 —\n- [ ] T3 —\n'
+  reads.length = 0
+  await touch($, files, '.workflow/plans/eski/PROGRESS.md', source => source)
+  expect(await toggleText($)).toBe('▓░░ 1/3 · %33 · Sıradaki: T2 · İki')
+  expect(reads.some(path => path.includes('/plans/guncel/'))).toBe(false)
+
+  // every named plan complete: the first one stays chosen, so no bar (as before)
+  await touch($, files, '.workflow/plans/eski/PROGRESS.md', source => source.replace(/\[ \]/g, '[x]'))
+  await touch($, files, '.workflow/plans/guncel/PROGRESS.md', source => source.replace(/\[[~ ]\]/g, '[x]'))
+  await clock.advance(5000)
+  expect(await toggleText($)).toBeUndefined()
+})
